@@ -362,12 +362,17 @@ fn doctor_registered_home_passes_settings_checks() {
         pick(&findings, "port-admin")[0].fix_hint,
         "rust-agents-proxy serve"
     );
-    assert!(pick(&findings, "port-gateway").is_empty());
+    assert_eq!(pick(&findings, "port-gateway")[0].level, "warn");
     assert_eq!(pick(&findings, "relay-target")[0].level, "warn");
     assert_eq!(pick(&findings, "hook-registration")[0].level, "ok");
     assert_eq!(pick(&findings, "http-allowlist")[0].level, "ok");
     assert_eq!(pick(&findings, "telemetry")[0].level, "ok");
     assert_eq!(pick(&findings, "gateway")[0].level, "ok");
+    assert!(
+        pick(&findings, "gateway")[0]
+            .message
+            .contains("게이트웨이 활성")
+    );
     assert_eq!(pick(&findings, "projects-dir")[0].level, "ok");
 }
 
@@ -375,11 +380,12 @@ fn doctor_registered_home_passes_settings_checks() {
 #[test]
 fn doctor_legacy_home_prints_exact_settings_snippets() {
     let data_dir = temp_data_dir("legacy");
-    let config = doctor_config("home_legacy", data_dir.clone(), None);
+    let mut config = doctor_config("home_legacy", data_dir.clone(), None);
     let _cleanup = (
         TempDirGuard(data_dir.clone()),
         TempDirGuard(config.claude_home.clone()),
     );
+    config.gateway.enabled = false;
     let findings = run_doctor_checks(&config).expect("진단");
     let hooks_port = config.ports.hooks;
     let otlp_port = config.ports.otlp;
@@ -437,16 +443,15 @@ fn doctor_accepts_registered_hook_without_allowlist_key() {
     );
 }
 
-// 18. 게이트웨이 사용 + haiku 미지정 ------------------------------------------
+// 18. 게이트웨이 경유 + haiku 미지정 ------------------------------------------
 #[test]
 fn doctor_warns_gateway_without_haiku_model() {
     let data_dir = temp_data_dir("gateway-on");
-    let mut config = doctor_config("home_registered", data_dir.clone(), None);
+    let config = doctor_config("home_no_allowlist", data_dir.clone(), None);
     let _cleanup = (
         TempDirGuard(data_dir.clone()),
         TempDirGuard(config.claude_home.clone()),
     );
-    config.gateway.enabled = true;
     let findings = run_doctor_checks(&config).expect("진단");
     let gateway = pick(&findings, "gateway");
     assert_eq!(gateway.len(), 1);

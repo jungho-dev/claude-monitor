@@ -467,12 +467,12 @@ fn check_gateway(
             message: format!(
                 "ANTHROPIC_BASE_URL 이 게이트웨이 포트 {gateway_port} 를 가리키나 gateway.enabled=false (API 호출 연결 실패)"
             ),
-            fix_hint: "rap.toml 에 [gateway] enabled = true 후 serve 재시작, 또는 settings.json env 의 ANTHROPIC_BASE_URL 제거".to_string(),
+            fix_hint: "rap.toml 의 [gateway] enabled = false 제거(기본 true) 후 serve 재시작, 또는 settings.json env 의 ANTHROPIC_BASE_URL 제거".to_string(),
         });
     }
 
-    // 2. 게이트웨이 사용 시 백그라운드 모델
-    if config.gateway.enabled {
+    // 2. 게이트웨이 경유 시 백그라운드 모델
+    if config.gateway.enabled && points_at_gateway {
         let haiku_set = watched
             .get("ANTHROPIC_DEFAULT_HAIKU_MODEL")
             .is_some_and(|value| !value.is_empty());
@@ -480,14 +480,14 @@ fn check_gateway(
             findings.push(DoctorFinding {
                 level: "ok".to_string(),
                 topic: "gateway".to_string(),
-                message: "게이트웨이 사용, ANTHROPIC_DEFAULT_HAIKU_MODEL 지정됨".to_string(),
+                message: "게이트웨이 경유, ANTHROPIC_DEFAULT_HAIKU_MODEL 지정됨".to_string(),
                 fix_hint: String::new(),
             });
         } else {
             findings.push(DoctorFinding {
                 level: "warn".to_string(),
                 topic: "gateway".to_string(),
-                message: "게이트웨이 사용 중 ANTHROPIC_DEFAULT_HAIKU_MODEL 미지정 (사용자 지정 기본 URL 경유 시 백그라운드 작업이 메인 모델 사용)".to_string(),
+                message: "게이트웨이 경유 중 ANTHROPIC_DEFAULT_HAIKU_MODEL 미지정 (사용자 지정 기본 URL 경유 시 백그라운드 작업이 메인 모델 사용)".to_string(),
                 fix_hint: "settings.json env 에 \"ANTHROPIC_DEFAULT_HAIKU_MODEL\": \"<haiku 모델 ID>\" 추가".to_string(),
             });
         }
@@ -495,7 +495,11 @@ fn check_gateway(
         findings.push(DoctorFinding {
             level: "ok".to_string(),
             topic: "gateway".to_string(),
-            message: "게이트웨이 비활성, 기본 URL 이 게이트웨이를 가리키지 않음".to_string(),
+            message: if config.gateway.enabled {
+                "게이트웨이 활성, 기본 URL 이 게이트웨이를 가리키지 않음".to_string()
+            } else {
+                "게이트웨이 비활성, 기본 URL 이 게이트웨이를 가리키지 않음".to_string()
+            },
             fix_hint: String::new(),
         });
     }

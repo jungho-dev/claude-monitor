@@ -102,7 +102,7 @@ impl Default for PortConfig {
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             upstream: "https://api.anthropic.com".to_string(),
             upstream_timeout_secs: 900,
         }
@@ -287,7 +287,7 @@ mod tests {
         let parsed: ConfigFile = toml::from_str(text).expect("예시 설정 파싱");
         assert_eq!(parsed.ports.hooks, 47333);
         assert_eq!(parsed.hooks.relay_target, "http://127.0.0.1:47321");
-        assert!(!parsed.gateway.enabled);
+        assert!(parsed.gateway.enabled);
     }
 
     // 2. 포트 0·중복 거부 -----------------------------------------------------
@@ -423,13 +423,13 @@ mod tests {
         assert_eq!(names, ["admin", "otlp", "hooks", "gateway"]);
         assert_eq!(planned[0], ("admin", 47330, true));
         assert_eq!(planned[2], ("hooks", 47333, true));
-        assert_eq!(planned[3], ("gateway", 47332, false));
+        assert_eq!(planned[3], ("gateway", 47332, true));
 
         config.hooks.enabled = false;
-        config.gateway.enabled = true;
+        config.gateway.enabled = false;
         let planned = config.planned_ports();
         assert!(!planned[2].2);
-        assert!(planned[3].2);
+        assert!(!planned[3].2);
     }
 
     // 9. 가드 제한 시간 범위 --------------------------------------------------

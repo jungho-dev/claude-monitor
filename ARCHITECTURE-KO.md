@@ -73,11 +73,10 @@ rust-agents-proxy/
 │       ├── win_ctrl.rs : 창 항상 위 고정, 클래식 콘솔 글꼴 적용·복원(Win32 직접 선언)
 │       ├── test_support.rs : 합성 설정과 스냅샷
 │       └── views/
-│           ├── mod.rs : 화면 조립, 앱 바, 탭 바(좋으면 짧은 이름), 하단 줄, 도움말 겹침
+│           ├── mod.rs : 화면 조립, 앱 바(배지만), 탭 바(일곱 탭, 좁으면 간격 제거 후 번호 붙인 압축 이름), 하단 줄, 도움말 겹침
 │           ├── common.rs : 카드 틀, 패널 상태, DB 빈 상태, 스크롤 표·텍스트 카드, 카드 스크롤바, 경계 손잡이
 │           ├── overview.rs : 상태 헤더, KPI 카드, 절약 시간, 분당 추이, 실시간 피드
 │           ├── tables.rs : 도구·훅·모델 탭
-│           ├── gateway.rs : 게이트웨이 지연 백분위, 꺼짐 상태의 활성화 안내
 │           ├── settings.rs : 목록과 진단 결과
 │           └── report.rs : 일일 리포트 뷰어
 ├── tests/
@@ -117,7 +116,7 @@ rust-agents-proxy/
 2. **serve 안의 런타임**
     - 메인 스레드는 `rap-main`이라는 multi-thread tokio 런타임에서 대기
     - 관리, OTLP, 훅(`hooks.enabled`일 때), 기록 색인기(`indexer.enabled`일 때), 리포트 스케줄러(`report.enabled`일 때)가 작업 하나씩으로 돌아감
-    - 게이트웨이는 `gateway.enabled`일 때만 전용 OS 스레드 `rap-gateway`에서 worker 2개짜리 자체 multi-thread 런타임으로 실행
+    - 게이트웨이는 전용 OS 스레드 `rap-gateway`에서 worker 2개짜리 자체 multi-thread 런타임으로 실행하며, 기본 켜짐이고 `gateway.enabled = false`일 때만 생략
     - 이렇게 나누면 긴 스트리밍 중계가 훅·색인 부하와 섞이지 않음
 3. **장애 격리**
     - release 프로필의 `panic = "unwind"`로 panic이 작업 하나 안에 머묾
@@ -163,7 +162,7 @@ flowchart LR
     IDX["색인기<br/>projects 폴더 jsonl"]
     OT["OTLP 47331<br/>/v1/logs"]
     HK["훅 47333<br/>pretool-chain"]
-    GW["게이트웨이 47332<br/>기본 꺼짐"]
+    GW["게이트웨이 47332<br/>기본 켜짐"]
     GD["가드 47321<br/>외부"]
     API["Anthropic API<br/>외부"]
     DB[("rap.sqlite<br/>WAL")]
@@ -197,8 +196,10 @@ flowchart LR
     - 응답 본문을 감싼 tap이 본문이 끝나거나 drop될 때, 중단된 경우도 포함해 시간과 토큰 사용량을 기록
     - `POST /v1/messages`만 계측하며, 첫 `content_block_delta` 이벤트가 첫 토큰 시각
     - 상류 연결 오류는 `502`, 응답 헤더가 `gateway.upstream_timeout_secs` 안에 오지 않으면 `504`를 반환하며, 스트리밍 본문에는 시한이 없음
+    - 작성자의 환경은 `ANTHROPIC_BASE_URL=http://127.0.0.1:47332`와 `ANTHROPIC_DEFAULT_HAIKU_MODEL`로 Claude Code를 게이트웨이로 경유시키므로 Claude Code 자신의 API 트래픽이 이 경로를 지남
 6. **화면**
     - 관리 API, 대시보드, 일일 리포트는 모두 `store/query.rs`의 같은 집계 쿼리를 읽음
+    - 대시보드는 키 `1`-`7`의 일곱 탭(개요, 도구, 훅, 모델, 에이전트, 설정, 리포트)이며 게이트웨이 탭은 없음: 게이트웨이 지연은 `GET /api/gateway`와 리포트로 계속 볼 수 있고, 개요의 서버 상태 카드는 게이트웨이 포트를 상태 점으로 표시
     - 실시간 이벤트는 관리 SSE 스트림이 읽는 broadcast 채널로 흐르며, 실시간 카운터는 별도의 원자적 값
 
 ### 2. pretool-chain

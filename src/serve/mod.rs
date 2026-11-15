@@ -412,11 +412,11 @@ mod tests {
     #[test]
     fn bind_planned_listeners_rejects_busy_hooks_and_skips_busy_optional_ports() {
         // 1. 모두 비어 있음
-        let mut config = build_test_config("serve-ports");
+        let config = build_test_config("serve-ports");
         let bound = bind_planned_listeners(&config).expect("빈 포트 통과");
         assert!(bound.otlp.is_some());
         assert!(bound.hooks.is_some());
-        assert!(bound.gateway.is_none());
+        assert!(bound.gateway.is_some());
         drop(bound);
 
         // 2. 훅 포트 점유는 중단
@@ -439,7 +439,6 @@ mod tests {
         drop(otlp_busy);
 
         // 4. 켜진 게이트웨이 포트 점유도 생략
-        config.gateway.enabled = true;
         let gateway_busy =
             TcpListener::bind(("127.0.0.1", config.ports.gateway)).expect("게이트웨이 포트 점유");
         let bound = bind_planned_listeners(&config).expect("게이트웨이 생략 후 통과");
@@ -456,6 +455,7 @@ mod tests {
     fn bind_skips_disabled_hooks_and_gateway() {
         let mut config = build_test_config("serve-disabled");
         config.hooks.enabled = false;
+        config.gateway.enabled = false;
         let hooks_busy = TcpListener::bind(("127.0.0.1", config.ports.hooks)).expect("포트 점유");
         let gateway_busy =
             TcpListener::bind(("127.0.0.1", config.ports.gateway)).expect("게이트웨이 포트 점유");

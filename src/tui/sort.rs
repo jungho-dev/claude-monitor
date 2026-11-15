@@ -28,7 +28,7 @@ pub const SORTABLE_CARDS: [CardId; 10] = [
 ];
 
 // 1. 정렬 상태 ----------------------------------------------------------------
-// 문자 열은 오름차순, 숫자·시간 열은 내림차순에서 시작
+// 열 종류 (비교 규칙은 아래 타입별 비교 함수가 소유, 새 열은 항상 오름차순에서 시작)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortKind {
     Text,
@@ -57,24 +57,39 @@ pub enum SortChange {
 }
 
 impl SortState {
-    // 열 선택: 같은 열은 방향 반전, 다른 열은 그 열 종류의 기본 방향
+    // 정렬 순환: 다른 열은 오름차순 시작, 같은 열은 오름 -> 내림 -> 카드 기본 정렬 (머리글 클릭·S 공용)
+    // 기본 정렬 열은 기본 방향이 곧 꺼짐 상태라 오름과 내림만 번갈아 바뀜
     pub fn apply_change(&mut self, change: SortChange, spec: SortSpec) {
         let column_count = spec.kinds.len().max(1);
-        match change {
-            SortChange::SelectColumn(column) if column < column_count => {
-                if self.column == column {
-                    self.descending = !self.descending;
-                } else {
-                    self.column = column;
-                    self.descending = spec.kinds[column] == SortKind::Number;
-                }
-            }
-            SortChange::SelectColumn(_) => {}
+
+        // 1. 요청 해석 (s 는 다음 열 오름차순, 클릭·S 는 대상 열의 순환)
+        let column = match change {
             SortChange::NextColumn => {
                 self.column = (self.column + 1) % column_count;
-                self.descending = spec.kinds[self.column] == SortKind::Number;
+                self.descending = false;
+                return;
             }
-            SortChange::ReverseDirection => self.descending = !self.descending,
+            SortChange::SelectColumn(column) => column,
+            SortChange::ReverseDirection => self.column,
+        };
+        if column >= column_count {
+            return;
+        }
+
+        // 2. 다른 열은 오름차순 시작
+        if self.column != column {
+            self.column = column;
+            self.descending = false;
+            return;
+        }
+
+        // 3. 같은 열: 오름 -> 내림, 내림은 기본 정렬로 (이미 기본이면 오름)
+        if !self.descending {
+            self.descending = true;
+        } else if *self == spec.default {
+            self.descending = false;
+        } else {
+            *self = spec.default;
         }
     }
 
@@ -463,7 +478,7 @@ mod tests {
     }
 
     #[test]
-    fn next_column_cycles_with_kind_default_direction_and_wraps() {
+    fn next_column_starts_each_column_ascending_and_wraps() {
         let mut state = SortState {
             column: 1,
             descending: true,
@@ -476,42 +491,88 @@ mod tests {
         assert_eq!(
             visited,
             [
-                (2, true),
-                (3, true),
-                (4, true),
-                (5, true),
+                (2, false),
+                (3, false),
+                (4, false),
+                (5, false),
                 (0, false),
-                (1, true)
+                (1, false)
             ]
         );
     }
 
     #[test]
-    fn reverse_flips_direction_and_arrow() {
+    fn reverse_direction_cycles_ascending_descending_default() {
         let mut state = SortState {
             column: 1,
-            descending: true,
+            descending: false,
         };
-        assert_eq!(state.sort_arrow(), "↓");
-        state.apply_change(SortChange::ReverseDirection, tool_spec());
         assert_eq!(state.sort_arrow(), "↑");
+        state.apply_change(SortChange::ReverseDirection, tool_spec());
+        assert_eq!((state.column, state.descending), (1, true));
+        assert_eq!(state.sort_arrow(), "↓");
+
+        // 세 번째는 카드 기본 정렬 (도구: 합계 내림차순)
+        state.apply_change(SortChange::ReverseDirection, tool_spec());
+        assert_eq!(state, tool_spec().default);
     }
 
     #[test]
-    fn selecting_a_column_twice_toggles_and_other_columns_use_their_kind_default() {
+    fn three_clicks_on_one_header_return_to_the_default_sort() {
+        let spec = tool_spec();
+        let mut state = spec.default;
+        state.apply_change(SortChange::SelectColumn(0), spec);
+        assert_eq!((state.column, state.descending), (0, false));
+        state.apply_change(SortChange::SelectColumn(0), spec);
+        assert_eq!((state.column, state.descending), (0, true));
+        state.apply_change(SortChange::SelectColumn(0), spec);
+        assert_eq!(state, spec.default);
+
+        // 다시 누르면 처음부터
+        state.apply_change(SortChange::SelectColumn(0), spec);
+        assert_eq!((state.column, state.descending), (0, false));
+    }
+
+    #[test]
+    fn a_different_header_always_starts_ascending() {
+        let spec = tool_spec();
         let mut state = SortState {
-            column: 1,
+            column: 0,
             descending: true,
         };
-        state.apply_change(SortChange::SelectColumn(0), tool_spec());
-        assert_eq!((state.column, state.descending), (0, false));
-        state.apply_change(SortChange::SelectColumn(0), tool_spec());
-        assert_eq!((state.column, state.descending), (0, true));
-        state.apply_change(SortChange::SelectColumn(4), tool_spec());
+        state.apply_change(SortChange::SelectColumn(4), spec);
+        assert_eq!((state.column, state.descending), (4, false));
+        state.apply_change(SortChange::SelectColumn(4), spec);
         assert_eq!((state.column, state.descending), (4, true));
+
+        // 순환 중간에 다른 열을 누르면 그 열이 오름차순부터
+        state.apply_change(SortChange::SelectColumn(1), spec);
+        assert_eq!((state.column, state.descending), (1, false));
+
         // 범위 밖 열은 무시
-        state.apply_change(SortChange::SelectColumn(99), tool_spec());
-        assert_eq!((state.column, state.descending), (4, true));
+        state.apply_change(SortChange::SelectColumn(99), spec);
+        assert_eq!((state.column, state.descending), (1, false));
+    }
+
+    #[test]
+    fn default_column_alternates_between_its_two_directions() {
+        // 기본이 내림차순인 열: 기본 방향이 곧 꺼짐 상태라 오름 -> 내림(기본) -> 오름
+        let spec = tool_spec();
+        let mut state = spec.default;
+        state.apply_change(SortChange::SelectColumn(5), spec);
+        assert_eq!((state.column, state.descending), (5, false));
+        state.apply_change(SortChange::SelectColumn(5), spec);
+        assert_eq!(state, spec.default);
+        state.apply_change(SortChange::SelectColumn(5), spec);
+        assert_eq!((state.column, state.descending), (5, false));
+
+        // 기본이 오름차순인 열 (설정 훅 표): 오름(기본) -> 내림 -> 오름(기본)
+        let hooks = sort_spec(CardId::SettingsHooks).unwrap();
+        let mut state = hooks.default;
+        state.apply_change(SortChange::SelectColumn(0), hooks);
+        assert_eq!((state.column, state.descending), (0, true));
+        state.apply_change(SortChange::SelectColumn(0), hooks);
+        assert_eq!(state, hooks.default);
     }
 
     #[test]

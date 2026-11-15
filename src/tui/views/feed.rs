@@ -23,7 +23,7 @@ const DURATION_WIDTH: usize = 7;
 const DETAIL_LABEL_WIDTH: usize = 10;
 const CACHE_BAR_WIDTH: usize = 20;
 const NAME_MIN_WIDTH: usize = 16;
-const NAME_MAX_WIDTH: usize = 40;
+const NAME_BASE_WIDTH: usize = 40;
 // 정렬 열 번호 순서의 머리글 이름 (sort.rs 와 일치)
 pub const FEED_COLUMN_LABELS: [&str; 8] = [
     "시각",
@@ -49,9 +49,10 @@ pub struct FeedColumns {
 }
 
 // 폭 구간별 열 선택: 100 이상 전체, 76 이상 입력 생략, 56 이상 캐시·에이전트도 생략, 미만 출력도 생략
-// 이름 칸 = 가장 긴 이름(16~40)과 남는 폭 중 작은 값
-pub fn derive_feed_columns(width: usize, longest_name: usize) -> FeedColumns {
-    let (fixed, agent, show_agent, show_in, show_cache, show_out) = if width >= 100 {
+// 이름 칸 = 가장 긴 이름(16~40)과 남는 폭 중 작은 값, 그 다음 남는 폭은 에이전트 칸(구간 기본 폭 이상, 최대 자연 폭)이
+// 먼저, 그래도 남으면 40 넘는 이름이 차지해 말줄임 없이 보이도록 함
+pub fn derive_feed_columns(width: usize, longest_name: usize, longest_agent: usize) -> FeedColumns {
+    let (fixed, agent_base, show_agent, show_in, show_cache, show_out) = if width >= 100 {
         (69usize, 18u16, true, true, true, true)
     } else if width >= 76 {
         (58, 14, true, false, true, true)
@@ -60,16 +61,41 @@ pub fn derive_feed_columns(width: usize, longest_name: usize) -> FeedColumns {
     } else {
         (25, 0, false, false, false, false)
     };
-    let name = longest_name
-        .clamp(NAME_MIN_WIDTH, NAME_MAX_WIDTH)
-        .min(width.saturating_sub(fixed));
+    let room = width.saturating_sub(fixed);
+    let name_base = longest_name
+        .clamp(NAME_MIN_WIDTH, NAME_BASE_WIDTH)
+        .min(room);
+    let mut free = room - name_base;
+    let agent_extra = if show_agent {
+        longest_agent
+            .saturating_sub(usize::from(agent_base))
+            .min(free)
+    } else {
+        0
+    };
+    free -= agent_extra;
+    let name = name_base + longest_name.saturating_sub(name_base).min(free);
     FeedColumns {
         name: name as u16,
-        agent,
+        agent: agent_base + agent_extra as u16,
         show_in,
         show_cache,
         show_agent,
         show_out,
+    }
+}
+
+// 1-1. 에이전트 칸 자연 폭 ----------------------------------------------------
+// 이름#id 는 이름 + # 꼬리 5열, 그 밖은 전체 (빈 값은 - 한 칸, 훅·알림은 칸을 쓰지 않음)
+pub fn feed_agent_width(event: &LiveEvent) -> usize {
+    let agent = match event {
+        LiveEvent::Api(row) => row.agent.as_str(),
+        LiveEvent::Tool(row) => row.agent.as_str(),
+        LiveEvent::Hook(_) | LiveEvent::Notice { .. } => return 0,
+    };
+    match agent.rsplit_once('#') {
+        Some((name, _)) => Span::raw(name).width() + 5,
+        None => Span::raw(agent).width().max(1),
     }
 }
 
@@ -394,7 +420,7 @@ pub fn build_feed_line(event: &LiveEvent, columns: &FeedColumns) -> Line<'static
 // 폭만으로 열 배치를 정해 한 줄 생성 (테스트용)
 #[cfg(test)]
 pub fn build_event_line(event: &LiveEvent, width: usize) -> Line<'static> {
-    build_feed_line(event, &derive_feed_columns(width, NAME_MAX_WIDTH))
+    build_feed_line(event, &derive_feed_columns(width, NAME_BASE_WIDTH, 0))
 }
 
 // 7. 이벤트 상세 줄 -----------------------------------------------------------
@@ -653,7 +679,7 @@ pub fn build_event_context_lines(
     ];
 
     // 4. 최근 이벤트 (시각 8, 종류 4, 이름 flex, 소요 7 오른쪽 정렬)
-    let compact_columns = derive_feed_columns(width, 0);
+    let compact_columns = derive_feed_columns(width, 0, 0);
     let name_width = width
         .saturating_sub(
             CLOCK_WIDTH + COLUMN_GAP + TAG_WIDTH + COLUMN_GAP + COLUMN_GAP + DURATION_WIDTH,
@@ -823,7 +849,7 @@ mod tests {
         let first = api_event(340, "main");
         let second = api_event(911_900, "engineer-rdr2#a0a2bf9b");
         for width in [30, 40, 56, 60, 75, 76, 80, 99, 100, 120, 200] {
-            let columns = derive_feed_columns(width, 40);
+            let columns = derive_feed_columns(width, 40, 0);
             let expected = build_feed_header(&columns, TIME_DESCENDING).0.width();
             for event in [&first, &second, &tool, &hook, &notice] {
                 let line = build_feed_line(event, &columns);
@@ -834,7 +860,7 @@ mod tests {
 
         // 숫자 열은 모든 줄에서 같은 x 에서 끝남 (출력 열: 340 / 911.9K)
         for width in [80, 120] {
-            let columns = derive_feed_columns(width, 40);
+            let columns = derive_feed_columns(width, 40, 0);
             let end_of = |event: &LiveEvent, token: &str| {
                 let text = line_text(&build_feed_line(event, &columns));
                 let found = text.find(token).unwrap();
@@ -846,25 +872,49 @@ mod tests {
 
     #[test]
     fn feed_tiers_drop_columns_by_width() {
-        let wide = derive_feed_columns(120, 40);
+        let wide = derive_feed_columns(120, 40, 0);
         assert!(wide.show_in && wide.show_out && wide.show_cache && wide.show_agent);
         assert_eq!((wide.agent, wide.name), (18, 40));
-        let mid = derive_feed_columns(80, 40);
+        let mid = derive_feed_columns(80, 40, 0);
         assert!(!mid.show_in && mid.show_out && mid.show_cache && mid.show_agent);
         assert_eq!(mid.agent, 14);
-        let narrow = derive_feed_columns(60, 40);
+        let narrow = derive_feed_columns(60, 40, 0);
         assert!(narrow.show_out && !narrow.show_cache && !narrow.show_agent);
         assert_eq!(narrow.name, 27);
-        let tiny = derive_feed_columns(40, 40);
+        let tiny = derive_feed_columns(40, 40, 0);
         assert!(!tiny.show_out);
         assert_eq!(tiny.name, 15);
         // 가장 긴 이름이 짧아도 이름 칸은 최소 16
-        assert_eq!(derive_feed_columns(200, 3).name, 16);
+        assert_eq!(derive_feed_columns(200, 3, 0).name, 16);
+    }
+
+    #[test]
+    fn wide_feed_grows_agent_and_name_to_their_natural_width() {
+        let long_agent = "engineer-rdr2-longname#a0a2bf9b";
+        let event = api_event(340, long_agent);
+        assert_eq!(feed_agent_width(&event), 27);
+        assert_eq!(feed_agent_width(&api_event(1, "worker")), 6);
+        assert_eq!(feed_agent_width(&api_event(1, "")), 1);
+
+        // 넓은 카드: 에이전트 자연 폭이 먼저, 남는 폭으로 40 넘는 이름도 말줄임 없음
+        let wide = derive_feed_columns(200, 60, 27);
+        assert_eq!((wide.agent, wide.name), (27, 60));
+        let text = line_text(&build_feed_line(&event, &wide));
+        assert!(text.contains("engineer-rdr2-longname#a0a2"), "{text}");
+        assert!(!text.contains('…'), "{text}");
+
+        // 이름이 남는 폭을 모두 쓰면 에이전트는 구간 기본 폭 유지
+        assert_eq!(derive_feed_columns(100, 40, 27).agent, 18);
+        assert_eq!(derive_feed_columns(120, 40, 27).agent, 27);
+
+        // 훅·알림은 에이전트 칸을 쓰지 않음
+        let hook = LiveEvent::Hook(HookEventRow::default());
+        assert_eq!(feed_agent_width(&hook), 0);
     }
 
     #[test]
     fn api_row_shortens_model_and_agent_and_drops_inline_labels() {
-        let columns = derive_feed_columns(120, 40);
+        let columns = derive_feed_columns(120, 40, 0);
         let text = line_text(&build_feed_line(
             &api_event(340, "engineer-rdr2#a0a2bf9b"),
             &columns,
@@ -880,7 +930,7 @@ mod tests {
     #[test]
     fn header_uses_the_same_columns_as_rows() {
         let header =
-            line_text(&build_feed_header(&derive_feed_columns(120, 40), TIME_DESCENDING).0);
+            line_text(&build_feed_header(&derive_feed_columns(120, 40, 0), TIME_DESCENDING).0);
         for label in [
             "시각",
             "종류",
@@ -893,7 +943,8 @@ mod tests {
         ] {
             assert!(header.contains(label), "{label}");
         }
-        let narrow = line_text(&build_feed_header(&derive_feed_columns(60, 40), TIME_DESCENDING).0);
+        let narrow =
+            line_text(&build_feed_header(&derive_feed_columns(60, 40, 0), TIME_DESCENDING).0);
         assert!(narrow.contains("출력") && narrow.contains("소요"));
         assert!(!narrow.contains("입력") && !narrow.contains("에이전트"));
     }
@@ -955,7 +1006,7 @@ mod tests {
     #[test]
     fn header_arrow_marks_only_the_sorted_column_and_keeps_total_width() {
         for width in [60, 80, 120] {
-            let columns = derive_feed_columns(width, 40);
+            let columns = derive_feed_columns(width, 40, 0);
             let baseline = build_feed_header(&columns, TIME_DESCENDING).0.width();
             for column in 0..8 {
                 for descending in [false, true] {

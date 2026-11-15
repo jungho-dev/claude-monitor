@@ -201,7 +201,12 @@ fn build_tool_detail(
             ])
         })
         .collect();
-    (format!("도구 상세 · {}", tool.tool_name), lines)
+    let title = if tool.tool_name.is_empty() {
+        "도구 상세".to_string()
+    } else {
+        format!("도구 상세 · {}", tool.tool_name)
+    };
+    (title, lines)
 }
 
 // 3. 훅 탭 --------------------------------------------------------------------
@@ -392,7 +397,18 @@ fn build_hook_detail(
             ])
         })
         .collect();
-    (format!("훅 상세 · {}", hook.guard), lines)
+    // 제목 보조값 (가드, 없으면 경로)
+    let subject = if hook.guard.is_empty() {
+        hook.route.as_str()
+    } else {
+        hook.guard.as_str()
+    };
+    let title = if subject.is_empty() {
+        "훅 상세".to_string()
+    } else {
+        format!("훅 상세 · {subject}")
+    };
+    (title, lines)
 }
 
 #[cfg(test)]
@@ -436,6 +452,31 @@ mod tests {
         let (empty_title, empty_lines) = build_tool_detail(None, &tools);
         assert_eq!(empty_title, "도구 상세");
         assert_eq!(empty_lines.len(), 1);
+
+        let nameless = vec![ToolLatencyRow::default()];
+        let (title, _) = build_tool_detail(nameless.first(), &nameless);
+        assert_eq!(title, "도구 상세");
+    }
+
+    #[test]
+    fn hook_detail_title_never_leaves_a_dangling_separator() {
+        let hook = |route: &str, guard: &str| HookStatRow {
+            route: route.to_string(),
+            guard: guard.to_string(),
+            outcome: "allow".to_string(),
+            ..HookStatRow::default()
+        };
+
+        // 가드가 비면 경로를 보조값으로, 둘 다 비면 제목만
+        let no_guard = vec![hook("pretool-chain", "")];
+        let (title, _) = build_hook_detail(no_guard.first(), &no_guard);
+        assert_eq!(title, "훅 상세 · pretool-chain");
+        let nothing = vec![hook("", "")];
+        let (title, _) = build_hook_detail(nothing.first(), &nothing);
+        assert_eq!(title, "훅 상세");
+        let guarded = vec![hook("pretool", "cli-guard")];
+        let (title, _) = build_hook_detail(guarded.first(), &guarded);
+        assert_eq!(title, "훅 상세 · cli-guard");
     }
 
     #[test]

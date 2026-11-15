@@ -1,5 +1,5 @@
 //! tui/mod.rs
-//! ratatui 실시간 관제 화면 (개요, 도구, 훅, 모델, 에이전트, 게이트웨이, 설정, 리포트), 마우스·창·콘솔 글꼴 제어.
+//! ratatui 실시간 관제 화면 (개요, 도구, 훅, 모델, 에이전트, 설정, 리포트), 마우스·창·콘솔 글꼴 제어.
 
 pub mod cards;
 pub mod format;
@@ -181,6 +181,8 @@ fn run_event_loop(
                 // 크기 변경 시 경계 위치가 바뀌므로 강조 해제
                 Event::Resize(_, _) => {
                     app.split_hover = None;
+                    app.column_hover = None;
+                    app.column_drag = None;
                     app.hover_card = None;
                     app.scroll_hover = None;
                     app.scroll_drag = None;
@@ -196,11 +198,21 @@ fn run_event_loop(
     Ok(())
 }
 
-// 마우스 이동으로 바뀔 수 있는 강조 상태: 카드, 경계, 스크롤바 트랙
-fn hover_signature(
-    app: &AppState,
-) -> (Option<CardId>, Option<(SplitGroup, usize)>, Option<CardId>) {
-    (app.hover_card, app.split_hover, app.scroll_hover)
+// 마우스 이동으로 바뀔 수 있는 강조 상태: 카드, 카드 경계, 열 경계, 스크롤바 트랙
+type HoverSignature = (
+    Option<CardId>,
+    Option<(SplitGroup, usize)>,
+    Option<(CardId, usize)>,
+    Option<CardId>,
+);
+
+fn hover_signature(app: &AppState) -> HoverSignature {
+    (
+        app.hover_card,
+        app.split_hover,
+        app.column_hover,
+        app.scroll_hover,
+    )
 }
 
 // 5. 실행 요청 전달 -----------------------------------------------------------

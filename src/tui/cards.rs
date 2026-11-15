@@ -34,9 +34,6 @@ pub enum CardId {
     CacheBreaks,
     AgentTable,
     AgentDetail,
-    GatewayGuide,
-    GatewayLatency,
-    GatewayLive,
     SettingsHooks,
     SettingsMcp,
     SettingsAgents,
@@ -68,8 +65,6 @@ impl CardId {
             | Self::HookDetail
             | Self::ModelDetail
             | Self::AgentDetail
-            | Self::GatewayGuide
-            | Self::GatewayLatency
             | Self::SettingsHooks
             | Self::SettingsMcp
             | Self::SettingsAgents
@@ -158,12 +153,40 @@ pub struct ScrollDrag {
     pub grip: u16,
 }
 
+// 열 폭을 조절할 수 있는 표의 최대 열 수 (카드별 끌어 정한 폭 배열 길이)
+pub const MAX_TABLE_COLUMNS: usize = 14;
+
+// 표 머리글 두 칸 사이 경계 (column = 왼쪽 열 번호, width = 그릴 때 왼쪽 열 폭)
+// grab = 잡는 칸 (머리글 행의 열 사이 한 칸), line = 끄는 동안 그리는 세로선
+// min·max = 끌어서 정할 수 있는 왼쪽 열 폭 범위
+#[derive(Debug, Clone, Copy)]
+pub struct ColumnHit {
+    pub card: CardId,
+    pub column: usize,
+    pub grab: Rect,
+    pub line: Rect,
+    pub width: u16,
+    pub min: u16,
+    pub max: u16,
+}
+
+// 진행 중 열 경계 드래그 (start_x·start_width = 누른 순간 포인터 열과 왼쪽 열 폭, moved = 실제로 끌었는지)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnDrag {
+    pub card: CardId,
+    pub column: usize,
+    pub start_x: u16,
+    pub start_width: u16,
+    pub moved: bool,
+}
+
 // 매 프레임 그리기에서 다시 채우는 클릭 영역
 #[derive(Debug, Default, Clone)]
 pub struct UiHitAreas {
     pub tab_rects: Vec<(ActiveTab, Rect)>,
     pub button_rects: Vec<(UiAction, Rect)>,
     pub header_cells: Vec<HeaderHit>,
+    pub column_hits: Vec<ColumnHit>,
     pub row_hits: Vec<RowHit>,
     pub split_hits: Vec<SplitHit>,
     pub scroll_hits: Vec<ScrollHit>,

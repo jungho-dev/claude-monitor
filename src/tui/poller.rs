@@ -7,7 +7,7 @@ use crate::inventory;
 use crate::net::admin;
 use crate::store::Store;
 use crate::store::query::{
-    AgentStatsRow, CacheBreakRow, GatewayTimingStats, HookStatRow, ModelStatsRow, ToolLatencyRow,
+    AgentStatsRow, CacheBreakRow, HookStatRow, ModelStatsRow, ToolLatencyRow,
 };
 use crate::tui::format::fit_display;
 use crate::tui::state::{DashboardSnapshot, DbState, Panel, ToastLevel, UiMessage, WindowKind};
@@ -102,14 +102,13 @@ pub fn spawn_poller(
 }
 
 // 6. 수집 루프와 무거운 패널 캐시 ---------------------------------------------
-// 무거운 집계 여섯 패널의 마지막 조회 결과
+// 무거운 집계 다섯 패널의 마지막 조회 결과
 #[derive(Default)]
 struct HeavyPanels {
     tools: Panel<Vec<ToolLatencyRow>>,
     hooks: Panel<Vec<HookStatRow>>,
     model_stats: Panel<Vec<ModelStatsRow>>,
     agent_stats: Panel<Vec<AgentStatsRow>>,
-    gateway: Panel<GatewayTimingStats>,
     cache_breaks: Panel<Vec<CacheBreakRow>>,
 }
 
@@ -155,7 +154,7 @@ fn run_poll_loop(config: AppConfig, ui_tx: Sender<UiMessage>, command_rx: Receiv
 }
 
 // 7. 스냅샷 수집 --------------------------------------------------------------
-// refresh_heavy 이면 무거운 여섯 패널을 조회해 캐시 갱신, 아니면 캐시 복사
+// refresh_heavy 이면 무거운 다섯 패널을 조회해 캐시 갱신, 아니면 캐시 복사
 fn collect_snapshot(
     config: &AppConfig,
     window: WindowKind,
@@ -221,7 +220,6 @@ fn collect_snapshot(
         heavy.hooks = guard_panel(|| open_store.query_hook_stats(&since, &until));
         heavy.model_stats = guard_panel(|| open_store.query_model_stats(&since, &until));
         heavy.agent_stats = guard_panel(|| open_store.query_agent_stats(&since, &until));
-        heavy.gateway = guard_panel(|| open_store.query_gateway_timing(&since, &until));
         heavy.cache_breaks =
             guard_panel(|| open_store.query_cache_breaks(&since, &until, CACHE_BREAK_LIMIT));
     }
@@ -229,7 +227,6 @@ fn collect_snapshot(
     snapshot.hooks = heavy.hooks.clone();
     snapshot.model_stats = heavy.model_stats.clone();
     snapshot.agent_stats = heavy.agent_stats.clone();
-    snapshot.gateway = heavy.gateway.clone();
     snapshot.cache_breaks = heavy.cache_breaks.clone();
 
     // 6. 최근 이벤트 최신순 정렬 (조회 순서 가정 제거)

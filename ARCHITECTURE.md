@@ -73,11 +73,10 @@ rust-agents-proxy/
 │       ├── win_ctrl.rs : always-on-top window and classic console font apply and restore (direct Win32 declarations)
 │       ├── test_support.rs : synthetic configuration and snapshots
 │       └── views/
-│           ├── mod.rs : frame assembly, app bar, tab bar (short names when narrow), footer, help overlay
+│           ├── mod.rs : frame assembly, app bar (badge only), tab bar (seven tabs, no gaps then numbered compact labels when narrow), footer, help overlay
 │           ├── common.rs : card frame, panel states, empty database state, scroll table and text card, card scrollbar, boundary handles
 │           ├── overview.rs : status header, KPI cards, saved time, per-minute trend, live feed
 │           ├── tables.rs : tools, hooks, and models tabs
-│           ├── gateway.rs : gateway timing percentiles, enable guide when off
 │           ├── settings.rs : inventory and doctor results
 │           └── report.rs : daily report viewer
 ├── tests/
@@ -117,7 +116,7 @@ rust-agents-proxy/
 2. **Runtimes inside serve**
     - The main thread blocks on a multi-thread tokio runtime named `rap-main`.
     - It runs one task each for admin, OTLP, hooks (when `hooks.enabled`), the transcript indexer (when `indexer.enabled`), and the report scheduler (when `report.enabled`).
-    - The gateway runs on a dedicated OS thread, `rap-gateway`, with its own multi-thread runtime of 2 workers, only when `gateway.enabled`.
+    - The gateway runs on a dedicated OS thread, `rap-gateway`, with its own multi-thread runtime of 2 workers; the gateway is on by default and is skipped only when `gateway.enabled = false`.
     - The split keeps long streaming relays apart from hook and indexing load.
 3. **Failure isolation**
     - The release profile sets `panic = "unwind"` so a panic stays inside one task.
@@ -163,7 +162,7 @@ flowchart LR
     IDX["Indexer<br/>projects folder jsonl"]
     OT["OTLP 47331<br/>/v1/logs"]
     HK["Hooks 47333<br/>pretool-chain"]
-    GW["Gateway 47332<br/>off by default"]
+    GW["Gateway 47332<br/>on by default"]
     GD["Guard 47321<br/>external"]
     API["Anthropic API<br/>external"]
     DB[("rap.sqlite<br/>WAL")]
@@ -197,8 +196,10 @@ flowchart LR
     - A tap around the response body records timing and token usage when the body ends or is dropped, including on abort.
     - Only `POST /v1/messages` is tapped; the first `content_block_delta` event marks the first token.
     - An upstream connection error returns `502`; response headers that miss `gateway.upstream_timeout_secs` return `504`, and the streamed body has no deadline.
+    - The author's setup routes Claude Code through it with `ANTHROPIC_BASE_URL=http://127.0.0.1:47332` and `ANTHROPIC_DEFAULT_HAIKU_MODEL`, so Claude Code's own API traffic passes this path.
 6. **Views**
     - The admin API, the dashboard, and the daily report all read the same aggregate queries in `store/query.rs`.
+    - The dashboard has seven tabs on keys `1`-`7` (overview, tools, hooks, models, agents, settings, report) and no gateway tab; gateway timing stays available through `GET /api/gateway` and the report, and the overview server-status card shows the gateway port as a status dot.
     - Live events travel through a broadcast channel that the admin SSE stream reads; the live counters are separate atomics.
 
 ### 2. pretool-chain

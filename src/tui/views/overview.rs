@@ -17,7 +17,7 @@ use crate::tui::views::common::{
 };
 use crate::tui::views::feed::{
     FEED_COLUMN_LABELS, build_event_context_lines, build_event_detail_lines, build_feed_header,
-    build_feed_line, derive_feed_columns, feed_event_name,
+    build_feed_line, derive_feed_columns, feed_agent_width, feed_event_name,
 };
 use chrono::{DateTime, NaiveDateTime, Utc};
 use ratatui::Frame;
@@ -822,7 +822,8 @@ fn render_feed_row(frame: &mut Frame, state: &mut AppState, area: Rect) {
         .map(|event| Span::raw(feed_event_name(event)).width())
         .max()
         .unwrap_or(0);
-    let feed_columns = derive_feed_columns(line_width, longest_name);
+    let longest_agent = events.iter().map(feed_agent_width).max().unwrap_or(0);
+    let feed_columns = derive_feed_columns(line_width, longest_name, longest_agent);
     let feed_sort = state.card_sorts[CardId::EventFeed as usize];
     let mut sorted = events.clone();
     sort_rows(&mut sorted, feed_sort, compare_event_row);

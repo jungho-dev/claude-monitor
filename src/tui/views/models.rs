@@ -314,7 +314,12 @@ fn build_model_detail(row: Option<&ModelStatsRow>) -> (String, Vec<Line<'static>
             ])
         })
         .collect();
-    (format!("모델 상세 · {}", row.model), lines)
+    let title = if row.model.is_empty() {
+        "모델 상세".to_string()
+    } else {
+        format!("모델 상세 · {}", row.model)
+    };
+    (title, lines)
 }
 
 // 3. 에이전트 탭 --------------------------------------------------------------
@@ -531,7 +536,12 @@ fn build_agent_detail(row: Option<&AgentStatsRow>) -> (String, Vec<Line<'static>
             ])
         })
         .collect();
-    (format!("에이전트 상세 · {}", row.agent), lines)
+    let title = if row.agent.is_empty() {
+        "에이전트 상세".to_string()
+    } else {
+        format!("에이전트 상세 · {}", row.agent)
+    };
+    (title, lines)
 }
 
 #[cfg(test)]
@@ -597,5 +607,16 @@ mod tests {
 
         let (empty_title, _) = build_agent_detail(None);
         assert_eq!(empty_title, "에이전트 상세");
+    }
+
+    #[test]
+    fn detail_titles_drop_the_separator_when_the_name_is_empty() {
+        let nameless_model = ModelStatsRow::default();
+        let (title, _) = build_model_detail(Some(&nameless_model));
+        assert_eq!(title, "모델 상세");
+
+        let nameless_agent = AgentStatsRow::default();
+        let (title, _) = build_agent_detail(Some(&nameless_agent));
+        assert_eq!(title, "에이전트 상세");
     }
 }

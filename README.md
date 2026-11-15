@@ -7,12 +7,12 @@
     - `serve` runs several `127.0.0.1` ports in one process, plus a background transcript indexer and a daily report scheduler.
     - Running the exe with no command starts `serve` as a detached background process when it is not already running, then opens the ratatui live dashboard; closing the dashboard leaves `serve` running.
 2. **What it does**
-    - Collects usage metadata from three sources: session transcripts, OTLP http/json logs, and an optional API gateway.
+    - Collects usage metadata from three sources: session transcripts, OTLP http/json logs, and the API gateway.
     - Stores it in one SQLite file and serves aggregates over a local admin API, the dashboard, and a daily Markdown report.
     - Rewrites legacy CLI calls in Bash hooks (`cat`, `ls`, `git diff`) before the guard denies them, then lets the existing guard re-check the final command.
 3. **Highlights**
     - One binary with a bundled SQLite (WAL); no Node, Python, or database server.
-    - Four localhost ports: admin `47330`, OTLP `47331`, gateway `47332` (off by default), hooks `47333`.
+    - Four localhost ports: admin `47330`, OTLP `47331`, gateway `47332` (on by default), hooks `47333`.
     - Metadata only: names, counts, durations, token counts, and guard labels; no prompt text, command text, file contents, or auth headers.
     - Fail-closed hook chain: when the guard cannot answer, the call is denied.
     - Hot paths (hook chain, intake, indexing, dashboard) spawn no child process; the only spawn is the one-time detached `serve` launch when the exe runs with no command.
@@ -125,10 +125,10 @@ rust-agents-proxy doctor
 }
 ```
 
-5. **Optional gateway**
-    - Set `[gateway] enabled = true` in `rap.toml` and restart `serve` first.
-    - Then add these keys; through a custom base URL, background tasks use the main model, so `ANTHROPIC_DEFAULT_HAIKU_MODEL` pins the small model.
-    - With `ANTHROPIC_BASE_URL` pointing at a disabled or stopped gateway, API calls fail to connect, and `doctor` reports `fail` for the disabled case.
+5. **Gateway routing**
+    - The gateway is on by default, so `serve` already takes port `47332` and relays to `gateway.upstream`; no `rap.toml` change is needed.
+    - The author's setup routes Claude Code through it: add these keys to the `env` block; through a custom base URL, background tasks use the main model, so `ANTHROPIC_DEFAULT_HAIKU_MODEL` pins the small model.
+    - With `ANTHROPIC_BASE_URL` pointing at a stopped gateway, or at one turned off with `[gateway] enabled = false`, API calls fail to connect, and `doctor` reports `fail` for the turned-off case.
 
 ```json
 "env": {
@@ -173,7 +173,7 @@ rust-agents-proxy status
 ## Commands
 
 1. **serve**
-    - Runs the resident server: admin, OTLP, hooks, optional gateway, transcript indexer, and report scheduler.
+    - Runs the resident server: admin, OTLP, hooks, gateway, transcript indexer, and report scheduler.
 2. **tui**
     - Opens the live dashboard only. With no command at all, the exe first makes sure a detached `serve` is running and then opens the dashboard.
 3. **index**
@@ -198,36 +198,39 @@ rust-agents-proxy status
 ## Dashboard
 
 1. **Tabs**
-    - Eight tabs: overview, tools, hooks, models, agents, gateway, settings, and report.
+    - Seven tabs with keys `1`-`7`: overview, tools, hooks, models, agents, settings (`6`), and report (`7`).
+    - There is no gateway tab; gateway timing (first byte, first token, and total time, p50/p90) is still available through `GET /api/gateway` and in the daily report, and the overview server-status card still shows the gateway port as a status dot.
+    - The app bar holds only the `rust-agents-proxy` badge on the left, with no caption, and the window and freshness on the right.
     - The dashboard reads `rap.sqlite` read-only on a background thread every 2 seconds, so the UI thread does no I/O.
-    - The heavy panels (tools, hooks, model stats, agent stats, gateway, cache breaks) are queried every 10 seconds; the first read, a window change, and `r` refresh them at once.
+    - The heavy panels (tools, hooks, model stats, agent stats, cache breaks) are queried every 10 seconds; the first read, a window change, and `r` refresh them at once.
     - The screen is redrawn only when something changed (new data, input, a notice, or a hover change), and at least once per second.
-    - When the tab labels do not fit the width, the tab bar first switches to short names without gaps and then to numbered compact labels, so all eight tabs stay visible and clickable down to 60 columns.
+    - When the tab labels do not fit the width, the tab bar first removes the gaps between tabs and then switches to numbered compact labels, so all seven tabs stay visible and clickable down to 60 columns.
     - Labels and the daily report text are Korean in this version.
 2. **Keys**
-    - `1`-`8`, `Tab`, `Shift-Tab`: switch tab
+    - `1`-`7`, `Tab`, `Shift-Tab`: switch tab
     - `Up`, `Down`, `PgUp`, `PgDn`, `Home`, `End`: scroll
     - `w`: cycle the window through 1 hour, 24 hours, and 7 days
-    - `s`, `S`: next sort column and reversed direction of the focused table card (the main table of the tab when the focused card has no sort)
+    - `s`, `S`: next sort column (ascending) and the sort cycle of the current column (ascending, descending, card default) of the focused table card (the main table of the tab when the focused card has no sort)
     - `Left`, `Right`: report date, report tab only
     - `g`: generate the report, report tab only
     - `i`: reindex
     - `g` and `i` go through the admin API and need a running `serve`
-    - `t`: toggle always-on-top, `l`: reset the card layout of the current tab
+    - `t`: toggle always-on-top, `l`: reset the card layout and the dragged column widths of the current tab
     - `r`: refresh, `?`: help, `q`, `Esc`, `Ctrl+C`: quit
 3. **Mouse**
     - The layout and interaction follow the sibling `database-monitor`: every tab is a set of bordered cards.
-    - Click a tab to switch, a card to focus it, a table row to select it (details appear in the side card), and a table header to sort by that column (click the same header again to flip ascending and descending; the sorted header shows `↑` or `↓`).
+    - Click a tab to switch, a card to focus it, a table row to select it (details appear in the side card), and a table header to sort by that column (a different header starts ascending, and clicking the same header cycles ascending, descending, and back to the table's default sort; the sorted header shows `↑` or `↓`, and the default column shows its default arrow again after the cycle).
     - The wheel scrolls the card under the pointer; hovering a card or a card boundary highlights it.
     - A scrollable card shows a scrollbar in a gutter column just inside its right border when its content overflows, so the thumb never shares a color with the border: the `░` track is quiet, the gray `█` thumb brightens on hover and turns white while dragged. Drag the thumb to scroll or click the track (gutter or border column) to move one screen; the `a-b / n` position stays at the bottom.
     - The selected row is a full-width band from the left padding to the gutter: bright blue with white text in the focused card, a soft gray in the others.
     - Drag a boundary between cards to resize them; neighbors keep a minimum size, and ratios hold on window resize. Layouts live for the session only. A boundary shows a gray grip only while the pointer is on it or it is dragged; nothing is drawn while idle.
+    - Drag the boundary between two header cells of a table card to resize the left column (minimum 3 columns; numeric columns never go below their content width): the slack column absorbs the change, widths are kept per card for the session, and a double click on a boundary or `l` restores automatic widths. A boundary grabbed by the scrollbar gutter or a card split handle goes to those first, and a drag on a column boundary never sorts. A boundary shows the same gray grip only while hovered or dragged.
     - The bottom bar holds clickable buttons for reindex, window, refresh, top-most, and layout reset on the left and help and quit on the right (the left group shrinks first on a narrow window); the report tab adds previous/next date and generate buttons.
-    - The hint line below the buttons follows the context: the pointer on a boundary or scrollbar, the focused card's kind, and the tab (sort keys on every sortable table, date keys on report).
+    - The hint line below the buttons follows the context: the pointer on a card boundary, column boundary, or scrollbar, the focused card's kind, and the tab (sort keys on every sortable table, date keys on report).
     - The event feed is a column grid with a pinned header (time, kind, name, agent, input, output, cache read, duration); the shown columns shrink with the card width, and long agent ids are shortened to `name#xxxx`.
-    - Every table card sorts by header click or `s`/`S` with a per-card sort state and a sensible default (feed: time descending, tools: total time descending, hooks: count descending, models and agents: requests descending); numbers and durations sort numerically, text by its displayed string, and the selected row stays on the same item after a re-sort.
+    - Every table card sorts by header click or `s`/`S` with a per-card sort state and a sensible default sort that the third click or `S` returns to (feed: time descending, tools: total time descending, hooks: count descending, models and agents: requests descending); numbers and durations sort numerically, text by its displayed string, and the selected row stays on the same item after a re-sort.
     - The models tab shows per-model stats (requests, sessions, agent types, tokens, cache hit ratio, wait p50/p90, estimated cost, last seen) with a detail card and the cache-break candidates; the agents tab shows per-agent-type stats (runs, requests, sessions, tokens, estimated cost, wait p50/p90, tool calls and errors, top model, last seen) with a detail card.
-    - In narrow cards the name columns shrink and ellipsize first, numeric columns keep their full width, and the right-most columns drop before any number is clipped.
+    - Text columns get their natural width (the widest cell or header, Hangul counted as 2) first, so nothing is ellipsized while the card has free width, and the last growing text column (for example hook detail) takes the slack; in narrow cards the widest text columns shrink and ellipsize first, numeric columns keep their full width, and the right-most columns drop before any number is clipped. The event feed grows its name and agent columns the same way.
     - The report view hides the `text` fence lines, shows box tables verbatim in a muted line color with an emphasized header row (clipped, never wrapped), and converts legacy pipe-table reports to box tables when displaying them.
 4. **Console**
     - In a classic console window the dashboard applies the `D2Coding ligature` font while it runs and restores the original font on exit, as `database-monitor` does.
@@ -267,7 +270,7 @@ rust-agents-proxy status
 ### 3. Gateway 47332
 
 1. **Role**
-    - Off by default; a transparent proxy to the Anthropic API (`gateway.upstream`, HTTPS only).
+    - On by default (`gateway.enabled = true`); a transparent proxy to the Anthropic API (`gateway.upstream`, HTTPS only).
     - It measures first byte, first token, total time, status, and token usage for `POST /v1/messages`; every other path is relayed untracked.
 2. **Behavior**
     - Request headers, including credentials, go to the upstream unchanged except hop-by-hop headers and `host`; none are stored.
@@ -386,6 +389,7 @@ rust-agents-proxy status
 
 1. **Keys**
     - Every key is optional; this block shows the defaults, and `rap.example.toml` is the same file.
+    - `gateway.enabled` defaults to `true`; `false` leaves port `47332` untouched.
     - `gateway.upstream_timeout_secs` limits the wait for upstream response headers (504 on timeout); a streamed body has no deadline after the headers arrive. It must be at least 1.
 
 ```toml
@@ -399,7 +403,7 @@ gateway = 47332
 hooks = 47333
 
 [gateway]
-enabled = false
+enabled = true
 upstream = "https://api.anthropic.com"
 upstream_timeout_secs = 900
 

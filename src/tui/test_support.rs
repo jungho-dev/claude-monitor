@@ -10,8 +10,8 @@ use crate::core::model::{
 };
 use crate::inventory::{AgentEntry, DoctorFinding, HookEntry, Inventory, McpEntry};
 use crate::store::query::{
-    AgentStatsRow, CacheBreakRow, GatewayTimingStats, HookStatRow, MinuteBucket, ModelStatsRow,
-    OverviewStats, ToolLatencyRow,
+    AgentStatsRow, CacheBreakRow, HookStatRow, MinuteBucket, ModelStatsRow, OverviewStats,
+    ToolLatencyRow,
 };
 use crate::tui::state::{AppState, DashboardSnapshot, DbState, Panel};
 use chrono::{NaiveDate, Utc};
@@ -59,8 +59,8 @@ pub fn sample_state_with_snapshot() -> AppState {
             PortStatus {
                 name: "gateway".to_string(),
                 port: 47332,
-                enabled: false,
-                listening: false,
+                enabled: true,
+                listening: true,
             },
             PortStatus {
                 name: "hooks".to_string(),
@@ -335,16 +335,6 @@ pub fn sample_state_with_tables() -> AppState {
         gap_secs: 400,
         likely_cause: "TTL 만료".to_string(),
     }]);
-    state.snapshot.gateway = Panel::Ready(GatewayTimingStats {
-        requests: 50,
-        errors: 1,
-        first_byte_p50_ms: Some(420),
-        first_byte_p90_ms: Some(900),
-        first_token_p50_ms: Some(800),
-        first_token_p90_ms: Some(1_700),
-        total_p50_ms: Some(4_200),
-        total_p90_ms: Some(9_000),
-    });
     state.report = Panel::Ready(Some(
         "# 일일 리포트 2026-11-14\n\n## 요약\n- 요청 1,234건\n- 훅 재작성 45건\n\n| 모델 | 요청 |\n|---|---|\n| sonnet | 900 |\n"
             .to_string(),

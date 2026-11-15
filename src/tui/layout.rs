@@ -22,7 +22,6 @@ pub enum SplitGroup {
     HooksRows,
     ModelsRows,
     AgentsRows,
-    GatewayRows,
     SettingsRows,
     ReportCols,
 }

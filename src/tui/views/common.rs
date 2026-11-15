@@ -2,7 +2,10 @@
 //! 탭 공용 그리기: 클릭·마우스 강조 카드, 안내 카드, DB 빈 상태, 표·텍스트 카드, 열 폭 결정, 정렬 머리글.
 
 use crate::core::config::DB_FILE_NAME;
-use crate::tui::cards::{CardId, CardKind, HeaderHit, HeaderSpan, RowHit, ScrollHit, scroll_thumb};
+use crate::tui::cards::{
+    CardId, CardKind, ColumnHit, HeaderHit, HeaderSpan, MAX_TABLE_COLUMNS, RowHit, ScrollHit,
+    scroll_thumb,
+};
 use crate::tui::format::fit_display;
 use crate::tui::layout::SplitAxis;
 use crate::tui::sort::{SortState, sort_spec};
@@ -16,11 +19,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Cell, Padding, Paragraph, Row, Table};
 use unicode_width::UnicodeWidthChar;
 
-// 이름 열이 줄어드는 최소 폭, 열 사이 간격
-const MIN_SHRUNK_WIDTH: u16 = 4;
+// 글자 열이 줄어드는 최소 폭 (드래그 하한 포함), 열 사이 간격
+const MIN_COLUMN_WIDTH: u16 = 3;
 const TABLE_COLUMN_GAP: u16 = 1;
 
-// 표 열 맞춤: 숫자·짧은 열은 고정, 이름 열은 좁아지면 먼저 줄고(Shrink), 남는 폭은 Grow 열이 가짐
+// 표 열 맞춤: 숫자·짧은 열은 고정, 글자 열은 좁아지면 먼저 줄고(Shrink), 남는 폭은 맨 오른쪽 Grow 열이 가짐
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnFit {
     Fixed,
@@ -28,8 +31,18 @@ pub enum ColumnFit {
     Grow,
 }
 
-// 열 명세 (머리글, 선호 폭, 맞춤 규칙, 정렬)
+// 열 명세 (머리글, 고정 열 최소 폭, 맞춤 규칙, 정렬)
+// 글자 열의 폭은 머리글·가장 넓은 칸의 표시 폭(자연 폭)이 정함
 pub type ColumnSpec = (&'static str, u16, ColumnFit, Alignment);
+
+// 열 폭 계획 한 칸 (natural = 자연 폭, floor = 줄일 수 있는 최소 폭, user = 끌어 정한 폭)
+#[derive(Debug, Clone, Copy)]
+pub struct ColumnPlan {
+    pub natural: u16,
+    pub floor: u16,
+    pub fit: ColumnFit,
+    pub user: Option<u16>,
+}
 
 // 한 칸의 글자 조각들
 pub type TableCell = Vec<Span<'static>>;
@@ -198,7 +211,7 @@ pub fn render_db_gate(frame: &mut Frame, state: &mut AppState, area: Rect) -> bo
 }
 
 // 5. 표 카드 ------------------------------------------------------------------
-// 열 폭 결정(이름 열 먼저 축소), 정렬 머리글·본문 행 클릭 영역 등록, 선택 행 띠, 위치 표시, 오른쪽 거터 스크롤바
+// 자연 폭 기반 열 폭 결정, 정렬 머리글·열 경계·본문 행 클릭 영역 등록, 선택 행 띠, 위치 표시, 오른쪽 거터 스크롤바
 pub fn render_card_table(frame: &mut Frame, state: &mut AppState, area: Rect, table: CardTable) {
     let CardTable {
         card,
@@ -230,14 +243,11 @@ pub fn render_card_table(frame: &mut Frame, state: &mut AppState, area: Rect, ta
     view.selected = view.selected.min(total.saturating_sub(1));
     let (scroll, selected) = (view.scroll, view.selected);
 
-    // 3. 열 폭 (고정 열은 머리글·화살표와 내용 최대 폭 보장, 모자라면 이름 열이 먼저 줄고 맨 오른쪽 열부터 숨김)
-    let wanted: Vec<(u16, ColumnFit)> = columns
+    // 3. 열 폭 계획 (자연 폭 = 머리글·가장 넓은 칸, 숫자·고정 열은 선호 폭 이상으로 줄지 않음)
+    let plans: Vec<ColumnPlan> = columns
         .iter()
         .enumerate()
         .map(|(index, spec)| {
-            if spec.2 != ColumnFit::Fixed {
-                return (spec.1, spec.2);
-            }
             let label_width = Span::raw(spec.0).width() + usize::from(sort.is_some());
             let content_width = rows
                 .iter()
@@ -247,21 +257,37 @@ pub fn render_card_table(frame: &mut Frame, state: &mut AppState, area: Rect, ta
                 })
                 .max()
                 .unwrap_or(0);
-            (
-                spec.1.max(label_width.max(content_width) as u16),
-                ColumnFit::Fixed,
-            )
+            let widest = u16::try_from(label_width.max(content_width)).unwrap_or(u16::MAX);
+            let fixed = spec.2 == ColumnFit::Fixed;
+            let natural = if fixed { spec.1.max(widest) } else { widest };
+            ColumnPlan {
+                natural,
+                floor: if fixed {
+                    natural
+                } else {
+                    MIN_COLUMN_WIDTH.min(natural)
+                },
+                fit: spec.2,
+                user: state.column_widths[card as usize]
+                    .get(index)
+                    .copied()
+                    .flatten(),
+            }
         })
         .collect();
-    let widths = resolve_column_widths(&wanted, inner.width);
+    let widths = resolve_column_widths(&plans, inner.width);
     let shown: Vec<usize> = (0..columns.len())
         .filter(|index| widths[*index] > 0)
         .collect();
+    let shown_floors = shown
+        .iter()
+        .fold(0u16, |sum, index| sum.saturating_add(plans[*index].floor));
+    let shown_gaps = (shown.len().saturating_sub(1)) as u16 * TABLE_COLUMN_GAP;
 
-    // 4. 머리글 (정렬 열 화살표 유지, 클릭 영역은 열 좌표와 동일)
+    // 4. 머리글 (정렬 열 화살표 유지, 정렬·열 경계 클릭 영역은 열 좌표와 동일)
     let mut header_cells: Vec<Cell<'static>> = Vec::new();
     let mut cursor = inner.x;
-    for index in &shown {
+    for (position, index) in shown.iter().enumerate() {
         let spec = columns[*index];
         let width = widths[*index];
         let active = sort.is_some_and(|current| current.column == *index);
@@ -271,6 +297,11 @@ pub fn render_card_table(frame: &mut Frame, state: &mut AppState, area: Rect, ta
                 format!("{}{}", head.trim_end(), current.sort_arrow())
             }
             Some(current) if active => format!("{}{}", spec.0, current.sort_arrow()),
+            _ if Span::raw(spec.0).width() > usize::from(width) => {
+                fit_display(spec.0, usize::from(width))
+                    .trim_end()
+                    .to_string()
+            }
             _ => spec.0.to_string(),
         };
         let cell = Cell::from(Line::from(label).alignment(spec.3));
@@ -286,7 +317,24 @@ pub fn render_card_table(frame: &mut Frame, state: &mut AppState, area: Rect, ta
                 rect: Rect::new(cursor, inner.y, width, 1),
             });
         }
-        cursor += width + 1;
+
+        // 열 경계 (마지막 보이는 열 오른쪽은 경계 없음, 폭 범위 = 다른 열 최소 폭을 남긴 만큼)
+        if position + 1 < shown.len() && *index < MAX_TABLE_COLUMNS && inner.height > 0 {
+            let others_floor = (shown_floors - plans[*index].floor).saturating_add(shown_gaps);
+            state.hit_areas.column_hits.push(ColumnHit {
+                card,
+                column: *index,
+                grab: Rect::new(cursor + width, inner.y, TABLE_COLUMN_GAP, 1),
+                line: Rect::new(cursor + width, inner.y, TABLE_COLUMN_GAP, inner.height),
+                width,
+                min: plans[*index].floor,
+                max: inner
+                    .width
+                    .saturating_sub(others_floor)
+                    .max(plans[*index].floor),
+            });
+        }
+        cursor += width + TABLE_COLUMN_GAP;
     }
 
     // 5. 본문 행 클릭 영역 (머리글 1행 제외)
@@ -598,52 +646,59 @@ pub fn render_empty_state(frame: &mut Frame, rect: Rect, headline: Span<'static>
 }
 
 // 11. 표 열 폭 결정 -----------------------------------------------------------
-// 폭이 모자라면 이름 열(축소 가능)이 최소 폭까지 먼저 줄고, 그래도 모자라면 맨 오른쪽 열부터 숨김 (숫자 열은 줄지 않음)
-// 남는 폭은 Grow 열이 균등 분배, 숨긴 열은 폭 0
-pub fn resolve_column_widths(wanted: &[(u16, ColumnFit)], total: u16) -> Vec<u16> {
-    for shown in (1..=wanted.len()).rev() {
-        // 1. 보이는 열의 선호 폭과 사이 간격 합
-        let mut widths: Vec<u16> = wanted[..shown].iter().map(|(width, _)| *width).collect();
-        let gaps = (shown - 1) as u16 * TABLE_COLUMN_GAP;
-        let used: u16 = widths.iter().sum::<u16>().saturating_add(gaps);
+// 자연 폭(또는 끌어 정한 폭)으로 시작, 모자라면 끌지 않은 글자 열부터 가장 넓은 순서로 최소 폭까지 줄이고 끈 열은 마지막
+// 그래도 모자라면 맨 오른쪽 열부터 숨김 (숫자 열은 줄지 않음), 남는 폭은 맨 오른쪽 Grow 열이 가짐 (끌어 정한 열은 받지 않음)
+pub fn resolve_column_widths(plans: &[ColumnPlan], total: u16) -> Vec<u16> {
+    let total = u32::from(total);
+    for shown in (1..=plans.len()).rev() {
+        // 1. 보이는 열의 시작 폭과 사이 간격 합
+        let mut widths: Vec<u16> = plans[..shown]
+            .iter()
+            .map(|plan| match plan.user {
+                Some(user) => user.max(plan.floor),
+                None => plan.natural,
+            })
+            .collect();
+        let gaps = (shown as u32 - 1) * u32::from(TABLE_COLUMN_GAP);
+        let used = widths.iter().map(|width| u32::from(*width)).sum::<u32>() + gaps;
 
-        // 2. 부족분은 가장 넓은 이름 열부터 한 칸씩 줄임, 남는 폭은 Grow 열에 분배
+        // 2. 부족분은 가장 넓은 열부터 한 칸씩 줄임 (끌지 않은 열 먼저)
         if used > total {
             let mut deficit = used - total;
-            while deficit > 0 {
-                let widest = (0..shown)
-                    .filter(|index| {
-                        wanted[*index].1 != ColumnFit::Fixed && widths[*index] > MIN_SHRUNK_WIDTH
-                    })
-                    .max_by_key(|index| widths[*index]);
-                let Some(index) = widest else {
-                    break;
-                };
-                widths[index] -= 1;
-                deficit -= 1;
+            for dragged in [false, true] {
+                while deficit > 0 {
+                    let widest = (0..shown)
+                        .filter(|index| {
+                            plans[*index].user.is_some() == dragged
+                                && widths[*index] > plans[*index].floor
+                        })
+                        .max_by_key(|index| widths[*index]);
+                    let Some(index) = widest else {
+                        break;
+                    };
+                    widths[index] -= 1;
+                    deficit -= 1;
+                }
             }
             if deficit > 0 {
                 continue;
             }
-        } else {
-            let growing: Vec<usize> = (0..shown)
-                .filter(|index| wanted[*index].1 == ColumnFit::Grow)
-                .collect();
-            if !growing.is_empty() {
-                let spare = total - used;
-                let share = spare / growing.len() as u16;
-                let remainder = (spare % growing.len() as u16) as usize;
-                for (rank, index) in growing.iter().enumerate() {
-                    widths[*index] += share + u16::from(rank < remainder);
-                }
-            }
         }
 
-        // 3. 숨긴 열은 폭 0
-        widths.resize(wanted.len(), 0);
+        // 3. 남는 폭은 맨 오른쪽 Grow 열 (끌어 정한 열이면 그대로 둠)
+        let absorber = (0..shown)
+            .rev()
+            .find(|index| plans[*index].fit == ColumnFit::Grow)
+            .filter(|index| plans[*index].user.is_none());
+        if let Some(index) = absorber {
+            widths[index] += total.saturating_sub(used) as u16;
+        }
+
+        // 4. 숨긴 열은 폭 0
+        widths.resize(plans.len(), 0);
         return widths;
     }
-    vec![0; wanted.len()]
+    vec![0; plans.len()]
 }
 
 // 12. 칸 말줄임 ---------------------------------------------------------------
@@ -908,9 +963,38 @@ fn wrap_styled_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
+// 16. 열 경계 손잡이 ----------------------------------------------------------
+// 평소에는 아무것도 그리지 않고, 마우스 아래는 머리글 칸 하나·끌는 동안은 표 높이 전체 세로선
+pub fn render_column_handles(frame: &mut Frame, state: &AppState) {
+    let dragging = state.column_drag.map(|drag| (drag.card, drag.column));
+    let buf = frame.buffer_mut();
+    for hit in &state.hit_areas.column_hits {
+        let key = Some((hit.card, hit.column));
+        let dragged = dragging == key;
+        let hovered = dragging.is_none() && state.column_hover == key;
+        if !dragged && !hovered {
+            continue;
+        }
+        let (color, line) = if dragged {
+            (theme::SPLIT_GRIP_DRAG, hit.line)
+        } else {
+            (theme::SPLIT_GRIP_HOT, hit.grab)
+        };
+        for y in line.y..line.bottom() {
+            buf[(line.x, y)].set_symbol("┃").set_fg(color);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::query::HookStatRow;
+    use crate::tui::state::ActiveTab;
+    use crate::tui::test_support::sample_state_with_tables;
+    use crate::tui::views::render_frame;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn line_text(line: &Line<'_>) -> String {
         line.spans
@@ -989,5 +1073,182 @@ mod tests {
         assert_eq!(starts[1], 1);
         assert!(starts[2] > 2);
         assert_eq!(starts[2], rows.len() - 1);
+    }
+
+    fn plan(natural: u16, fit: ColumnFit, user: Option<u16>) -> ColumnPlan {
+        ColumnPlan {
+            natural,
+            floor: if fit == ColumnFit::Fixed {
+                natural
+            } else {
+                MIN_COLUMN_WIDTH.min(natural)
+            },
+            fit,
+            user,
+        }
+    }
+
+    // 텍스트 열 둘, 끝에 숫자 열 하나 (자연 폭 10, 20, 6)
+    fn sample_plans() -> Vec<ColumnPlan> {
+        vec![
+            plan(10, ColumnFit::Shrink, None),
+            plan(20, ColumnFit::Grow, None),
+            plan(6, ColumnFit::Fixed, None),
+        ]
+    }
+
+    #[test]
+    fn wide_card_gives_text_its_natural_width_and_last_grow_column_takes_the_slack() {
+        let widths = resolve_column_widths(&sample_plans(), 100);
+        // 10 + 20 + 6 + 간격 2 = 38, 남는 62 은 맨 오른쪽 Grow 열이 가짐
+        assert_eq!(widths, vec![10, 82, 6]);
+
+        // 정확히 맞으면 그대로
+        assert_eq!(resolve_column_widths(&sample_plans(), 38), vec![10, 20, 6]);
+    }
+
+    #[test]
+    fn narrow_card_shrinks_widest_text_first_and_never_touches_numbers() {
+        // 38 -> 26: 부족 12 은 글자 열이 가장 넓은 순서로 부담, 숫자 열 6 유지
+        let widths = resolve_column_widths(&sample_plans(), 26);
+        assert_eq!(widths[2], 6);
+        assert_eq!(widths[0] + widths[1] + widths[2] + 2, 26);
+        assert!(widths[1] >= widths[0], "{widths:?}");
+        assert!(widths[0] < 10 || widths[1] < 20, "{widths:?}");
+
+        // 글자 열이 최소 폭에 닿아도 모자라면 맨 오른쪽 열(숫자)부터 숨김
+        let widths = resolve_column_widths(&sample_plans(), 9);
+        assert_eq!(widths[2], 0);
+        assert_eq!(widths[0] + widths[1] + 1, 9);
+        assert!(widths[0] >= 3 && widths[1] >= 3, "{widths:?}");
+    }
+
+    #[test]
+    fn dragged_widths_are_kept_clamped_to_the_floor_and_shrunk_last() {
+        // 끌어 정한 폭은 자연 폭보다 넓어도 유지, 남는 폭은 끌지 않은 Grow 열이 줄여 받음
+        let mut plans = sample_plans();
+        plans[0].user = Some(15);
+        assert_eq!(resolve_column_widths(&plans, 100), vec![15, 77, 6]);
+
+        // 숫자 열은 내용 폭 미만으로 지정해도 내용 폭, 글자 열은 최소 3
+        plans[0].user = Some(1);
+        plans[2].user = Some(2);
+        assert_eq!(resolve_column_widths(&plans, 100), vec![3, 89, 6]);
+
+        // 자동 열이 더 줄일 수 있는 동안 끌어 정한 열은 폭 유지 (자동 열이 최소에 닿으면 그때 줄임)
+        let mut plans = sample_plans();
+        plans[0].user = Some(10);
+        let widths = resolve_column_widths(&plans, 26);
+        assert_eq!(widths, vec![10, 8, 6]);
+        let widths = resolve_column_widths(&plans, 16);
+        assert_eq!(widths.iter().sum::<u16>() + 2, 16);
+        assert!(widths[0] <= 10 && widths[1] == 3, "{widths:?}");
+
+        // Grow 열 자체를 끌어 정했으면 남는 폭을 받지 않아 오른쪽이 비어 있음
+        let mut plans = sample_plans();
+        plans[1].user = Some(12);
+        assert_eq!(resolve_column_widths(&plans, 100), vec![10, 12, 6]);
+    }
+
+    // 긴 글자가 들어 있는 훅 표 한 행 (자연 폭이 큰 경로·가드·상세)
+    fn hooks_state_with_long_text() -> AppState {
+        let mut state = sample_state_with_tables();
+        state.tab = ActiveTab::Hooks;
+        state.snapshot.hooks = Panel::Ready(vec![HookStatRow {
+            route: "PreToolUse:mcp__rust-fs-mcp__file-read".to_string(),
+            guard: "cli-guard-with-a-long-name".to_string(),
+            outcome: "deny".to_string(),
+            detail: "git push origin main --force-with-lease".to_string(),
+            count: 1_234,
+            p50_ms: Some(18),
+            p90_ms: Some(23),
+            saved_ms: 8_400,
+        }]);
+        state
+    }
+
+    // 버퍼를 줄 단위 문자열로 (넓은 글자 뒤 빈 칸은 건너뛀)
+    fn render_rows(state: &mut AppState, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| render_frame(frame, state)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let mut rows = Vec::new();
+        for y in 0..height {
+            let mut row = String::new();
+            let mut skip = 0usize;
+            for x in 0..width {
+                if skip > 0 {
+                    skip -= 1;
+                    continue;
+                }
+                let symbol = buffer.cell((x, y)).map_or(" ", |cell| cell.symbol());
+                skip = Span::raw(symbol).width().saturating_sub(1);
+                row.push_str(symbol);
+            }
+            rows.push(row);
+        }
+        rows
+    }
+
+    #[test]
+    fn wide_table_card_shows_every_text_cell_without_ellipsis() {
+        let mut state = hooks_state_with_long_text();
+        let rows = render_rows(&mut state, 200, 30);
+        let row = rows
+            .iter()
+            .find(|row| row.contains("PreToolUse:"))
+            .unwrap_or_else(|| panic!("행 없음: {rows:#?}"));
+        for text in [
+            "PreToolUse:mcp__rust-fs-mcp__file-read",
+            "cli-guard-with-a-long-name",
+            "git push origin main --force-with-lease",
+            "1,234",
+            "18ms",
+            "23ms",
+            "8.4s",
+        ] {
+            assert!(row.contains(text), "{text}: {row}");
+        }
+        assert!(!row.contains('…'), "{row}");
+    }
+
+    #[test]
+    fn narrow_table_card_truncates_text_before_it_touches_numbers() {
+        let mut state = hooks_state_with_long_text();
+        let rows = render_rows(&mut state, 70, 30);
+        let row = rows
+            .iter()
+            .find(|row| row.contains("18ms"))
+            .unwrap_or_else(|| panic!("행 없음: {rows:#?}"));
+        assert!(row.contains('…'), "{row}");
+        assert!(
+            !row.contains("git push origin main --force-with-lease"),
+            "{row}"
+        );
+        for number in ["1,234", "18ms", "23ms", "8.4s"] {
+            assert!(row.contains(number), "{number}: {row}");
+        }
+        assert!(!state.hit_areas.column_hits.is_empty());
+    }
+
+    #[test]
+    fn table_columns_never_overflow_the_card_at_any_width() {
+        for width in 60..=210u16 {
+            let mut state = hooks_state_with_long_text();
+            render_rows(&mut state, width, 24);
+            let card = state
+                .hit_areas
+                .card_rects
+                .iter()
+                .find(|(id, _)| *id == CardId::HookTable)
+                .map(|(_, rect)| *rect)
+                .unwrap();
+            for hit in &state.hit_areas.header_cells {
+                assert!(hit.rect.right() <= card.right() - 2, "{width}: {hit:?}");
+            }
+            for hit in &state.hit_areas.column_hits {
+                assert!(hit.grab.right() <= card.right() - 2, "{width}: {hit:?}");
+            }
+        }
     }
 }

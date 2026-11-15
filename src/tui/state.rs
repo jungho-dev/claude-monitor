@@ -5,11 +5,12 @@ use crate::core::config::AppConfig;
 use crate::core::model::{LiveEvent, StatusSnapshot};
 use crate::inventory::{DoctorFinding, Inventory};
 use crate::store::query::{
-    AgentStatsRow, CacheBreakRow, GatewayTimingStats, HookStatRow, MinuteBucket, ModelStatsRow,
-    OverviewStats, ToolLatencyRow,
+    AgentStatsRow, CacheBreakRow, HookStatRow, MinuteBucket, ModelStatsRow, OverviewStats,
+    ToolLatencyRow,
 };
 use crate::tui::cards::{
-    CARD_COUNT, CardId, CardKind, CardView, CursorMotion, ScrollDrag, UiAction, UiHitAreas,
+    CARD_COUNT, CardId, CardKind, CardView, ColumnDrag, CursorMotion, MAX_TABLE_COLUMNS,
+    ScrollDrag, UiAction, UiHitAreas,
 };
 use crate::tui::format::{outline_entries, prepare_report_markdown};
 use crate::tui::layout::{CardLayout, SplitDrag, SplitGroup};
@@ -23,7 +24,7 @@ use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::time::{Duration, Instant};
 
-pub const TAB_COUNT: usize = 8;
+pub const TAB_COUNT: usize = 7;
 pub const TOAST_LIFETIME: Duration = Duration::from_secs(4);
 // 정렬해도 같은 행을 따라가는 선택 가능 표 카드
 const SELECTABLE_SORT_CARDS: [CardId; 6] = [
@@ -43,7 +44,6 @@ pub enum ActiveTab {
     Hooks,
     Models,
     Agents,
-    Gateway,
     Settings,
     Report,
 }
@@ -55,7 +55,6 @@ impl ActiveTab {
         Self::Hooks,
         Self::Models,
         Self::Agents,
-        Self::Gateway,
         Self::Settings,
         Self::Report,
     ];
@@ -67,17 +66,8 @@ impl ActiveTab {
             Self::Hooks => "훅",
             Self::Models => "모델",
             Self::Agents => "에이전트",
-            Self::Gateway => "게이트웨이",
             Self::Settings => "설정",
             Self::Report => "리포트",
-        }
-    }
-
-    // 좁은 탭 바용 짧은 이름
-    pub fn short_label(self) -> &'static str {
-        match self {
-            Self::Gateway => "게이트",
-            other => other.tab_label(),
         }
     }
 
@@ -89,9 +79,19 @@ impl ActiveTab {
             Self::Hooks => CardId::HookTable,
             Self::Models => CardId::ModelTable,
             Self::Agents => CardId::AgentTable,
-            Self::Gateway => CardId::GatewayLatency,
             Self::Settings => CardId::SettingsHooks,
             Self::Report => CardId::ReportBody,
+        }
+    }
+
+    // 열 폭을 끌어 조절하는 표 카드 (배치 초기화 대상)
+    pub fn table_cards(self) -> &'static [CardId] {
+        match self {
+            Self::Tools => &[CardId::ToolTable],
+            Self::Hooks => &[CardId::HookTable],
+            Self::Models => &[CardId::ModelTable, CardId::CacheBreaks],
+            Self::Agents => &[CardId::AgentTable],
+            Self::Overview | Self::Settings | Self::Report => &[],
         }
     }
 
@@ -109,7 +109,6 @@ impl ActiveTab {
             Self::Hooks => &[SplitGroup::HooksRows],
             Self::Models => &[SplitGroup::ModelsRows],
             Self::Agents => &[SplitGroup::AgentsRows],
-            Self::Gateway => &[SplitGroup::GatewayRows],
             Self::Settings => &[SplitGroup::SettingsRows],
             Self::Report => &[SplitGroup::ReportCols],
         }
@@ -175,7 +174,6 @@ pub struct DashboardSnapshot {
     pub hooks: Panel<Vec<HookStatRow>>,
     pub model_stats: Panel<Vec<ModelStatsRow>>,
     pub agent_stats: Panel<Vec<AgentStatsRow>>,
-    pub gateway: Panel<GatewayTimingStats>,
     pub cache_breaks: Panel<Vec<CacheBreakRow>>,
     pub minutes: Panel<Vec<MinuteBucket>>,
     pub events: Panel<Vec<LiveEvent>>,
@@ -242,6 +240,12 @@ pub struct AppState {
     pub card_layout: CardLayout,
     pub split_drag: Option<SplitDrag>,
     pub split_hover: Option<(SplitGroup, usize)>,
+    // 카드별 끌어 정한 열 폭 (None 이면 자동 폭, 세션 동안 메모리에만 보관), 열 경계 드래그 중·마우스 아래 경계
+    // last_column_click = 끌지 않고 뗀 직전 경계 클릭 (더블클릭 판정용)
+    pub column_widths: [[Option<u16>; MAX_TABLE_COLUMNS]; CARD_COUNT],
+    pub column_drag: Option<ColumnDrag>,
+    pub column_hover: Option<(CardId, usize)>,
+    pub last_column_click: Option<(CardId, usize, Instant)>,
     // 스크롤바 썸 드래그 중, 마우스가 트랙 위에 있는 카드
     pub scroll_drag: Option<ScrollDrag>,
     pub scroll_hover: Option<CardId>,
@@ -276,6 +280,10 @@ impl AppState {
             card_layout: CardLayout::default(),
             split_drag: None,
             split_hover: None,
+            column_widths: [[None; MAX_TABLE_COLUMNS]; CARD_COUNT],
+            column_drag: None,
+            column_hover: None,
+            last_column_click: None,
             scroll_drag: None,
             scroll_hover: None,
             focused_card: None,
@@ -299,6 +307,8 @@ impl AppState {
         self.tab = tab;
         self.hover_card = None;
         self.split_hover = None;
+        self.column_hover = None;
+        self.column_drag = None;
         self.scroll_hover = None;
         self.scroll_drag = None;
         match tab {
@@ -353,7 +363,7 @@ impl AppState {
                 self.switch_tab(ActiveTab::ALL[(slot + TAB_COUNT - 1) % TAB_COUNT])
             }
             KeyCode::Tab => self.switch_tab(ActiveTab::ALL[(slot + 1) % TAB_COUNT]),
-            KeyCode::Char(digit @ '1'..='8') => {
+            KeyCode::Char(digit @ '1'..='7') => {
                 self.switch_tab(ActiveTab::ALL[digit as usize - '1' as usize])
             }
             KeyCode::Up => self.step_focused_card(card, CursorMotion::Lines(-1)),
@@ -434,9 +444,14 @@ impl AppState {
             }
             UiAction::ResetLayout => {
                 self.card_layout.reset_groups(self.tab.split_groups());
+                for card in self.tab.table_cards() {
+                    self.column_widths[*card as usize] = [None; MAX_TABLE_COLUMNS];
+                }
                 self.split_drag = None;
                 self.split_hover = None;
-                self.show_toast("카드 크기 기본 배치 복원", ToastLevel::Info);
+                self.column_drag = None;
+                self.column_hover = None;
+                self.show_toast("카드 크기·열 폭 기본 배치 복원", ToastLevel::Info);
                 UiCommand::None
             }
             UiAction::ReportPrev => {
@@ -752,15 +767,15 @@ mod tests {
     fn settings_tab_requests_load_once_and_report_tab_every_time() {
         let mut state = sample_state();
         assert_eq!(
-            state.handle_key_event(press(KeyCode::Char('7'))),
+            state.handle_key_event(press(KeyCode::Char('6'))),
             UiCommand::LoadSettings
         );
         assert_eq!(
-            state.handle_key_event(press(KeyCode::Char('6'))),
+            state.handle_key_event(press(KeyCode::Char('5'))),
             UiCommand::None
         );
         assert_eq!(
-            state.handle_key_event(press(KeyCode::Char('7'))),
+            state.handle_key_event(press(KeyCode::Char('6'))),
             UiCommand::None
         );
         // r 은 설정 탭에서 재적재
@@ -771,7 +786,7 @@ mod tests {
 
         let yesterday = NaiveDate::from_ymd_opt(2026, 11, 14).unwrap();
         assert_eq!(
-            state.handle_key_event(press(KeyCode::Char('8'))),
+            state.handle_key_event(press(KeyCode::Char('7'))),
             UiCommand::LoadReport(yesterday)
         );
         assert_eq!(
@@ -783,7 +798,7 @@ mod tests {
     #[test]
     fn report_date_moves_with_arrows_and_stops_at_today() {
         let mut state = sample_state();
-        state.handle_key_event(press(KeyCode::Char('8')));
+        state.handle_key_event(press(KeyCode::Char('7')));
         let today = NaiveDate::from_ymd_opt(2026, 11, 15).unwrap();
 
         let moved = state.handle_key_event(press(KeyCode::Right));
@@ -875,7 +890,7 @@ mod tests {
     #[test]
     fn scrollable_card_keys_and_wheel_move_view_only_within_range() {
         let mut state = sample_state();
-        state.handle_key_event(press(KeyCode::Char('7')));
+        state.handle_key_event(press(KeyCode::Char('6')));
         let hooks = CardId::SettingsHooks as usize;
         state.card_views[hooks].total = 30;
         state.card_views[hooks].visible = 10;
@@ -958,14 +973,15 @@ mod tests {
         assert_eq!(state.card_sorts[tools].column, 1);
 
         // 정렬 표가 없는 탭은 무시
-        state.handle_key_event(press(KeyCode::Char('6')));
+        state.handle_key_event(press(KeyCode::Char('7')));
+        assert_eq!(state.tab, ActiveTab::Report);
         let before = state.card_sorts;
         state.handle_key_event(press(KeyCode::Char('s')));
         assert_eq!(state.card_sorts, before);
     }
 
     #[test]
-    fn eight_tabs_map_to_digits_one_through_eight() {
+    fn seven_tabs_map_to_digits_one_through_seven() {
         let mut state = sample_state();
         let expected = [
             ('1', ActiveTab::Overview),
@@ -973,18 +989,17 @@ mod tests {
             ('3', ActiveTab::Hooks),
             ('4', ActiveTab::Models),
             ('5', ActiveTab::Agents),
-            ('6', ActiveTab::Gateway),
-            ('7', ActiveTab::Settings),
-            ('8', ActiveTab::Report),
+            ('6', ActiveTab::Settings),
+            ('7', ActiveTab::Report),
         ];
         for (digit, tab) in expected {
             state.handle_key_event(press(KeyCode::Char(digit)));
             assert_eq!(state.tab, tab, "{digit}");
         }
-        assert_eq!(TAB_COUNT, 8);
+        assert_eq!(TAB_COUNT, 7);
         assert_eq!(ActiveTab::Models.main_card(), CardId::ModelTable);
         assert_eq!(ActiveTab::Agents.main_card(), CardId::AgentTable);
-        state.handle_key_event(press(KeyCode::Char('9')));
+        state.handle_key_event(press(KeyCode::Char('8')));
         assert_eq!(state.tab, ActiveTab::Report);
     }
 
@@ -1006,15 +1021,19 @@ mod tests {
 
         // 합계 내림차순: Bash, Read, Edit 에서 Read 선택
         state.card_views[table].selected = 1;
-        // 호출 내림차순으로 바꾸면 Read, Edit, Bash 이라 선택은 첫 행
+        // 호출 오름차순으로 바꾸면 Bash, Edit, Read 이라 선택은 셋째 행
         state.change_card_sort(CardId::ToolTable, SortChange::SelectColumn(1));
-        assert_eq!(state.card_views[table].selected, 0);
-        // 이름 오름차순: Bash, Edit, Read 에서 Read 는 셋째 행
+        assert_eq!(state.card_views[table].selected, 2);
+        // 이름 오름차순: Bash, Edit, Read 에서 Read 는 그대로 셋째 행
         state.change_card_sort(CardId::ToolTable, SortChange::SelectColumn(0));
         assert_eq!(state.card_views[table].selected, 2);
-        // 같은 열을 다시 선택하면 방향 반전 (Read, Edit, Bash)
+        // 같은 열을 다시 선택하면 내림차순 (Read, Edit, Bash)
         state.change_card_sort(CardId::ToolTable, SortChange::SelectColumn(0));
         assert_eq!(state.card_views[table].selected, 0);
+        // 세 번째 선택은 기본 정렬 (합계 내림차순: Bash, Read, Edit)이라 Read 는 둘째 행
+        state.change_card_sort(CardId::ToolTable, SortChange::SelectColumn(0));
+        assert_eq!(state.card_sorts[table], default_card_sorts()[table]);
+        assert_eq!(state.card_views[table].selected, 1);
 
         // 이벤트 피드: 시각 내림차순에서 둘째 이벤트 선택 후 시각 오름차순으로
         let (old, _) = feed_with_prepended(5, 0);
@@ -1024,7 +1043,7 @@ mod tests {
         state.change_card_sort(CardId::EventFeed, SortChange::SelectColumn(0));
         assert_eq!(state.card_views[feed].selected, 3);
 
-        // 모델 표: 요청 내림차순에서 둘째 행(세션 많은 쪽이 아님) 선택 후 세션 열로 정렬
+        // 모델 표: 요청 내림차순(a, b, c)에서 둘째 행 b 선택 후 세션 오름차순(a, c, b)으로
         let model = |name: &str, requests: u64, sessions: u64| ModelStatsRow {
             model: name.to_string(),
             requests,
@@ -1039,7 +1058,7 @@ mod tests {
         let models = CardId::ModelTable as usize;
         state.card_views[models].selected = 1;
         state.change_card_sort(CardId::ModelTable, SortChange::SelectColumn(2));
-        assert_eq!(state.card_views[models].selected, 0);
+        assert_eq!(state.card_views[models].selected, 2);
     }
 
     #[test]
@@ -1388,16 +1407,6 @@ mod tests {
 
         state.set_card_scroll(CardId::KpiTools, 5);
         assert_eq!(state.card_views[CardId::KpiTools as usize].scroll, 0);
-    }
-
-    #[test]
-    fn only_the_gateway_tab_has_a_shortened_label() {
-        assert_eq!(ActiveTab::Gateway.short_label(), "게이트");
-        for tab in ActiveTab::ALL {
-            if tab != ActiveTab::Gateway {
-                assert_eq!(tab.short_label(), tab.tab_label());
-            }
-        }
     }
 
     #[test]

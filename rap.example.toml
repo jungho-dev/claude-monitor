@@ -14,7 +14,7 @@ hooks = 47333
 
 # API 게이트웨이 (ANTHROPIC_BASE_URL=http://127.0.0.1:47332 와 함께 사용)
 [gateway]
-enabled = false
+enabled = true
 upstream = "https://api.anthropic.com"
 upstream_timeout_secs = 900
 

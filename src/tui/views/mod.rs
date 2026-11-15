@@ -3,7 +3,6 @@
 
 pub mod common;
 pub mod feed;
-pub mod gateway;
 pub mod models;
 pub mod overview;
 pub mod report;
@@ -16,7 +15,7 @@ use crate::tui::poller::POLL_INTERVAL;
 use crate::tui::sort::sort_spec;
 use crate::tui::state::{ActiveTab, AppState, ToastLevel};
 use crate::tui::theme;
-use crate::tui::views::common::render_split_handles;
+use crate::tui::views::common::{render_column_handles, render_split_handles};
 use chrono::{Local, Utc};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -72,14 +71,14 @@ pub fn render_frame(frame: &mut Frame, state: &mut AppState) {
         ActiveTab::Hooks => tables::render_hooks_tab(frame, chunks[2], state),
         ActiveTab::Models => models::render_models_tab(frame, chunks[2], state),
         ActiveTab::Agents => models::render_agents_tab(frame, chunks[2], state),
-        ActiveTab::Gateway => gateway::render_gateway_tab(frame, chunks[2], state),
         ActiveTab::Settings => settings::render_settings_tab(frame, chunks[2], state),
         ActiveTab::Report => report::render_report_tab(frame, chunks[2], state),
     }
     render_footer(frame, chunks[3], state);
 
-    // 3. 카드 경계 손잡이와 도움말 겹침
+    // 3. 카드·열 경계 손잡이와 도움말 겹침
     render_split_handles(frame, state);
+    render_column_handles(frame, state);
     if state.show_help {
         render_help_overlay(frame, area);
     }
@@ -127,16 +126,13 @@ fn render_app_bar(frame: &mut Frame, area: Rect, state: &AppState) {
         Layout::horizontal([Constraint::Min(0), Constraint::Length(right_width)]).split(area);
 
     // 2. 왼쪽 배지
-    let mut left_spans = vec![
-        Span::styled(
-            " rust-agents-proxy ",
-            Style::default()
-                .fg(theme::FG_ON_ACCENT)
-                .bg(theme::FG_ACCENT)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" Claude Code 관제", theme::STYLE_DIM),
-    ];
+    let mut left_spans = vec![Span::styled(
+        " rust-agents-proxy ",
+        Style::default()
+            .fg(theme::FG_ON_ACCENT)
+            .bg(theme::FG_ACCENT)
+            .add_modifier(Modifier::BOLD),
+    )];
     if state.always_on_top {
         left_spans.push(Span::raw("  "));
         left_spans.push(Span::styled(
@@ -158,23 +154,19 @@ fn render_app_bar(frame: &mut Frame, area: Rect, state: &AppState) {
 }
 
 // 3. 탭 바 --------------------------------------------------------------------
-// 탭마다 클릭 영역 등록, 전체 라벨이 폭을 넘으면 짧은 이름·간격 0, 그래도 넘으면 번호 붙임·여백 없는 압축
+// 탭마다 클릭 영역 등록, 전체 폭을 넘으면 간격 0, 그래도 넘으면 번호 붙임·여백 없는 압축
 fn render_tab_bar(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let row_end = area.x.saturating_add(area.width);
     let mut cursor = area.x.saturating_add(1);
 
-    // 1. 압축 단계 (0 전체, 1 짧은 이름·간격 0, 2 번호 붙임 짧은 이름·간격 1)
+    // 1. 압축 단계 (0 전체, 1 간격 0, 2 번호 붙임·여백 없음·간격 1)
     let tab_count = ActiveTab::ALL.len();
     let full_labels: usize = ActiveTab::ALL
         .iter()
         .map(|tab| Span::raw(tab.tab_label()).width())
         .sum();
-    let short_labels: usize = ActiveTab::ALL
-        .iter()
-        .map(|tab| Span::raw(tab.short_label()).width())
-        .sum();
     let full_width = full_labels + 4 * tab_count + tab_count;
-    let compact_width = short_labels + 4 * tab_count + 1;
+    let compact_width = full_labels + 4 * tab_count + 1;
     let level = if full_width <= area.width as usize {
         0
     } else if compact_width <= area.width as usize {
@@ -203,11 +195,7 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 theme::BG_BASE,
             )
         };
-        let label = if level == 0 {
-            tab.tab_label()
-        } else {
-            tab.short_label()
-        };
+        let label = tab.tab_label();
         let line = match level {
             2 => Line::from(vec![
                 Span::styled(format!("{}", index + 1), key_style),
@@ -388,6 +376,9 @@ fn render_footer_hints(frame: &mut Frame, row: Rect, state: &AppState) {
     if state.split_hover.is_some() || state.split_drag.is_some() {
         context_hints.extend(["드래그 카드 크기", "l 기본 배치"]);
     }
+    if state.column_hover.is_some() || state.column_drag.is_some() {
+        context_hints.extend(["드래그 열 폭", "더블클릭 자동 폭", "l 기본 배치"]);
+    }
     if state.scroll_hover.is_some() || state.scroll_drag.is_some() {
         context_hints.extend(["드래그 스크롤", "트랙클릭 한 화면"]);
     }
@@ -399,7 +390,7 @@ fn render_footer_hints(frame: &mut Frame, row: Rect, state: &AppState) {
         CardKind::Static => {}
     }
     if sort_spec(state.focused_card_id()).is_some() || sort_spec(state.tab.main_card()).is_some() {
-        context_hints.extend(["s 정렬 열", "S 방향"]);
+        context_hints.extend(["s 정렬 열", "S 오름·내림·기본"]);
     }
     if state.tab == ActiveTab::Report {
         context_hints.extend(["←→ 날짜", "g 생성"]);
@@ -456,18 +447,18 @@ fn render_footer_hints(frame: &mut Frame, row: Rect, state: &AppState) {
 // 바깥은 어둡게, 이중선 상자에 키보드·마우스 두 구역
 fn render_help_overlay(frame: &mut Frame, area: Rect) {
     // 1. 도움말 내용 (뜻이 빈 줄 = 구역 제목)
-    let help_rows: [(&str, &str); 19] = [
+    let help_rows: [(&str, &str); 20] = [
         ("키보드", ""),
-        ("1-8, Tab, Shift-Tab", "탭 이동 (개요 ~ 리포트 여덟 탭)"),
+        ("1-7, Tab, Shift-Tab", "탭 이동 (개요 ~ 리포트 일곱 탭)"),
         ("↑ ↓ PgUp PgDn Home End", "선택 카드의 행 이동·스크롤"),
         ("w", "집계 구간 전환 (1시간, 24시간, 7일)"),
-        ("s / S", "선택한 표 정렬 열 변경 / 방향 반전"),
+        ("s / S", "다음 정렬 열 / 오름 → 내림 → 기본 순환"),
         ("←  →", "리포트 날짜 이동"),
         ("g", "리포트 생성 (serve 실행 필요)"),
         ("r", "설정·리포트 다시 불러오기, 그 외 즉시 갱신"),
         ("i", "기록 재색인 요청 (serve 실행 필요)"),
         ("t", "창 최상단 고정 켜기·끄기"),
-        ("l", "현재 탭 카드 크기 기본 배치"),
+        ("l", "현재 탭 카드 크기·열 폭 기본 배치"),
         ("?", "도움말 열기·닫기"),
         ("q, Esc, Ctrl+C", "종료"),
         ("마우스", ""),
@@ -475,7 +466,11 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         ("카드·행 클릭", "카드 선택(굵은 테두리), 표 행 선택"),
         (
             "표 머리글 클릭",
-            "그 열로 정렬, 다시 클릭하면 방향 반전 (↑ ↓ 표시)",
+            "그 열 정렬: 오름(↑) → 내림(↓) → 기본 순환",
+        ),
+        (
+            "열 경계 드래그",
+            "머리글 사이를 끌어 폭 조절, 더블클릭 자동 폭",
         ),
         (
             "휠 / 경계 드래그",
@@ -608,7 +603,7 @@ mod tests {
         assert!(text.contains("rust-agents-proxy"));
         assert!(text.contains("1 개요"));
         assert!(text.contains("serve 실행 중"));
-        assert!(text.contains("게이트웨이 OFF"));
+        assert!(text.contains("게이트웨이 ON"));
         assert!(text.contains("요청"));
         assert!(text.contains("캐시 적중률"));
         assert!(text.contains("87.5%"));
@@ -637,7 +632,7 @@ mod tests {
         assert_eq!(actions.len(), 7);
         assert!(actions.contains(&UiAction::Reindex));
         assert!(actions.contains(&UiAction::Quit));
-        assert_eq!(state.hit_areas.tab_rects.len(), 8);
+        assert_eq!(state.hit_areas.tab_rects.len(), 7);
     }
 
     #[test]
@@ -880,12 +875,6 @@ mod tests {
         assert!(models_text.contains("추정 (API 단가)"));
         assert!(models_text.contains("$12.35"));
         assert!(models_text.contains("TTL 만료"));
-
-        state.tab = ActiveTab::Gateway;
-        state.config.gateway.enabled = true;
-        let gateway_text = render_to_text(&mut state, 100, 30).join("\n");
-        assert!(gateway_text.contains("첫 바이트"));
-        assert!(gateway_text.contains("900ms"));
     }
 
     #[test]
@@ -995,14 +984,12 @@ mod tests {
     }
 
     #[test]
-    fn gateway_tab_explains_how_to_enable_when_disabled() {
+    fn app_bar_shows_only_the_badge_without_a_caption() {
         let mut state = sample_state_with_snapshot();
-        state.tab = ActiveTab::Gateway;
-        let text = render_to_text(&mut state, 130, 30).join("\n");
-        assert!(text.contains("게이트웨이 꺼짐"));
-        assert!(text.contains("[gateway]  enabled = true"));
-        assert!(text.contains("ANTHROPIC_BASE_URL=http://127.0.0.1:47332"));
-        assert!(text.contains("ANTHROPIC_DEFAULT_HAIKU_MODEL"));
+        let app_bar = render_to_text(&mut state, 130, 40)[0].clone();
+        assert!(app_bar.contains("rust-agents-proxy"));
+        assert!(!app_bar.contains("Claude Code 관제"));
+        assert!(!app_bar.contains("관제"));
     }
 
     #[test]
@@ -1181,20 +1168,19 @@ mod tests {
     }
 
     #[test]
-    fn static_gateway_live_never_gets_scrollbar() {
+    fn static_kpi_card_never_gets_scrollbar() {
         let mut state = sample_state_with_tables();
-        state.config.gateway.enabled = true;
-        state.tab = ActiveTab::Gateway;
+        state.tab = ActiveTab::Overview;
         // 보기 상태가 넘치는 값이어도 고정 카드는 그리지 않음
-        let live = &mut state.card_views[CardId::GatewayLive as usize];
-        live.total = 50;
-        live.visible = 5;
+        let kpi = &mut state.card_views[CardId::KpiTools as usize];
+        kpi.total = 50;
+        kpi.visible = 5;
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal
             .draw(|frame| {
                 let area = Rect::new(0, 5, 40, 8);
                 let body = Rect::new(1, 6, 38, 6);
-                common::render_card_scrollbar(frame, &mut state, CardId::GatewayLive, area, body);
+                common::render_card_scrollbar(frame, &mut state, CardId::KpiTools, area, body);
             })
             .unwrap();
         assert!(state.hit_areas.scroll_hits.is_empty());
@@ -1215,15 +1201,15 @@ mod tests {
     }
 
     #[test]
-    fn all_eight_tabs_visible_and_clickable_at_minimum_width() {
+    fn all_seven_tabs_visible_and_clickable_at_minimum_width() {
         let mut state = sample_state_with_snapshot();
         // 탭 바는 둘째 줄
         let tab_row = render_to_text(&mut state, MIN_WIDTH, MIN_HEIGHT)[1].clone();
-        assert_eq!(state.hit_areas.tab_rects.len(), 8);
-        assert!(tab_row.contains("8리포트"));
+        assert_eq!(state.hit_areas.tab_rects.len(), 7);
+        assert!(tab_row.contains("7리포트"));
+        assert!(tab_row.contains("6설정"));
         assert!(tab_row.contains("5에이전트"));
-        assert!(tab_row.contains("6게이트"));
-        assert!(!tab_row.contains("게이트웨이"));
+        assert!(!tab_row.contains("게이트"));
         let last = state.hit_areas.tab_rects.last().unwrap().1;
         assert!(last.right() <= MIN_WIDTH);
     }
@@ -1239,7 +1225,7 @@ mod tests {
                 .iter()
                 .map(|(_, rect)| *rect)
                 .collect();
-            assert_eq!(rects.len(), 8, "{width}");
+            assert_eq!(rects.len(), 7, "{width}");
             for pair in rects.windows(2) {
                 assert!(pair[0].right() <= pair[1].x, "{width}");
             }
@@ -1258,22 +1244,26 @@ mod tests {
     fn wide_terminal_keeps_full_labels() {
         let mut state = sample_state_with_snapshot();
         let tab_row = render_to_text(&mut state, 100, 24)[1].clone();
-        assert_eq!(state.hit_areas.tab_rects.len(), 8);
-        assert!(tab_row.contains("6 게이트웨이"));
+        assert_eq!(state.hit_areas.tab_rects.len(), 7);
         assert!(tab_row.contains("5 에이전트"));
+        assert!(tab_row.contains("6 설정"));
+        assert!(tab_row.contains("7 리포트"));
 
-        // 정확히 전체 라벨이 들어가는 폭(82열)에서는 압축 없음
-        let tab_row = render_to_text(&mut state, 82, 24)[1].clone();
-        assert!(tab_row.contains("6 게이트웨이"));
-        assert_eq!(state.hit_areas.tab_rects.len(), 8);
-        // 한 칸 좁으면 짧은 이름 (간격 0), 더 좁으면 번호 붙임 압축
-        let tab_row = render_to_text(&mut state, 81, 24)[1].clone();
-        assert!(!tab_row.contains("게이트웨이"));
-        assert!(tab_row.contains("6 게이트"));
-        assert_eq!(state.hit_areas.tab_rects.len(), 8);
-        let tab_row = render_to_text(&mut state, 70, 24)[1].clone();
-        assert!(tab_row.contains("6게이트"));
-        assert_eq!(state.hit_areas.tab_rects.len(), 8);
+        // 정확히 전체 라벨이 들어가는 폭(67열)에서는 압축 없음 (탭 사이 간격 1)
+        let tab_row = render_to_text(&mut state, 67, 24)[1].clone();
+        assert!(tab_row.contains("7 리포트"));
+        assert_eq!(state.hit_areas.tab_rects.len(), 7);
+        let rects = &state.hit_areas.tab_rects;
+        assert_eq!(rects[1].1.x, rects[0].1.right() + 1);
+        // 한 칸 좁으면 간격 0, 더 좁으면 번호 붙임 압축
+        let tab_row = render_to_text(&mut state, 66, 24)[1].clone();
+        assert!(tab_row.contains("7 리포트"));
+        assert_eq!(state.hit_areas.tab_rects.len(), 7);
+        let rects = &state.hit_areas.tab_rects;
+        assert_eq!(rects[1].1.x, rects[0].1.right());
+        let tab_row = render_to_text(&mut state, 60, 24)[1].clone();
+        assert!(tab_row.contains("7리포트"));
+        assert_eq!(state.hit_areas.tab_rects.len(), 7);
     }
 
     #[test]
@@ -1358,14 +1348,6 @@ mod tests {
             let text = render_to_text(&mut state, 170, 60).join("\n");
             assert!(text.contains(arrow_label), "{tab:?}: {arrow_label}");
         }
-        // 비정렬 표(게이트웨이 지연)에는 화살표 없음
-        state.config.gateway.enabled = true;
-        state.tab = ActiveTab::Gateway;
-        let rows = render_to_text(&mut state, 100, 30);
-        let latency = card_rect_of(&state, CardId::GatewayLatency);
-        let card_text = rows[usize::from(latency.y)..usize::from(latency.bottom())].join("\n");
-        assert!(card_text.contains("첫 바이트"));
-        assert!(!card_text.contains('↑') && !card_text.contains('↓'));
     }
 
     #[test]
@@ -1550,7 +1532,6 @@ mod tests {
     fn every_tab_renders_at_minimum_size_without_panic() {
         for tab in ActiveTab::ALL {
             let mut state = sample_state_with_tables();
-            state.config.gateway.enabled = true;
             state.tab = tab;
             render_to_text(&mut state, MIN_WIDTH, MIN_HEIGHT);
             render_to_text(&mut state, 200, 60);
