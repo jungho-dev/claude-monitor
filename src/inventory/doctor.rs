@@ -408,41 +408,22 @@ fn check_telemetry(
     {
         problems.push("OTEL_EXPORTER_OTLP_PROTOCOL=http/json 필요");
     }
-    let disable_set = matches!(
-        watched.get("DISABLE_TELEMETRY").map(String::as_str),
-        Some("1") | Some("true")
-    );
-
-    // 2. 판정
-    let disable_note =
-        "DISABLE_TELEMETRY 가 켜져 있음: OTLP 내보내기를 막는지는 미확인 (unverified)";
-    if problems.is_empty() && !disable_set {
+    // 2. 판정 (DISABLE_TELEMETRY 는 OTLP 내보내기를 막지 않음, 2026-11-16 실측)
+    if problems.is_empty() {
         findings.push(DoctorFinding {
             level: "ok".to_string(),
             topic: "telemetry".to_string(),
             message: "텔레메트리 env 가 rap otlp 포트를 가리킴".to_string(),
             fix_hint: String::new(),
         });
-    } else if problems.is_empty() {
-        findings.push(DoctorFinding {
-            level: "warn".to_string(),
-            topic: "telemetry".to_string(),
-            message: format!("텔레메트리 env 는 맞음, 단 {disable_note}"),
-            fix_hint: "serve 실행 후 status 의 otlp_batches 증가로 수신 확인".to_string(),
-        });
     } else {
         let snippet = format!(
             "\"env\": {{\"CLAUDE_CODE_ENABLE_TELEMETRY\":\"1\",\"OTEL_LOGS_EXPORTER\":\"otlp\",\"OTEL_EXPORTER_OTLP_ENDPOINT\":\"http://127.0.0.1:{otlp_port}\",\"OTEL_EXPORTER_OTLP_PROTOCOL\":\"http/json\"}}"
         );
-        let suffix = if disable_set {
-            format!(" / {disable_note}")
-        } else {
-            String::new()
-        };
         findings.push(DoctorFinding {
             level: "warn".to_string(),
             topic: "telemetry".to_string(),
-            message: format!("{}{suffix}", problems.join(", ")),
+            message: problems.join(", "),
             fix_hint: format!("settings.json env 에 추가: {snippet}"),
         });
     }

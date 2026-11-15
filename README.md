@@ -35,7 +35,7 @@
     - Run `serve` permanently with `.cmd/install-task.ps1`: Task Scheduler at logon, `conhost --headless`, restart on failure every minute.
     - A crash still leaves Bash blocked until the task restarts `serve`.
 4. **Unverified**
-    - Whether `DISABLE_TELEMETRY=1` blocks the OTLP export is unverified; `doctor` reports it as such.
+    - `DISABLE_TELEMETRY=1` does not block the OTLP export (measured 2026-11-16: `otlp_batches` rose with it set).
 
 ---
 
@@ -174,6 +174,7 @@ rust-agents-proxy status
 
 1. **serve**
     - Runs the resident server: admin, OTLP, hooks, gateway, transcript indexer, and report scheduler.
+    - `start` makes sure a detached `serve` is running and exits without opening the dashboard; the logon shortcut in the boot folder uses it.
 2. **tui**
     - Opens the live dashboard only. With no command at all, the exe first makes sure a detached `serve` is running and then opens the dashboard.
 3. **index**

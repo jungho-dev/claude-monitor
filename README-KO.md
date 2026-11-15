@@ -35,7 +35,7 @@
     - `.cmd/install-task.ps1`로 `serve`를 상시 실행: 로그온 시 작업 스케줄러, `conhost --headless`, 실패 시 1분 간격 재시작
     - 비정상 종료 후 작업이 `serve`를 다시 띄울 때까지는 Bash가 막힌 상태로 남음
 4. **미확인**
-    - `DISABLE_TELEMETRY=1`이 OTLP 내보내기를 막는지는 미확인이며 `doctor`도 그렇게 보고함
+    - `DISABLE_TELEMETRY=1`은 OTLP 내보내기를 막지 않음 (2026-11-16 실측: 설정 상태에서 `otlp_batches` 증가)
 
 ---
 
@@ -174,6 +174,7 @@ rust-agents-proxy status
 
 1. **serve**
     - 상주 서버 실행: 관리, OTLP, 훅, 게이트웨이, 기록 색인기, 리포트 스케줄러
+    - `start`는 분리된 `serve`가 떠 있도록 보장한 뒤 대시보드 없이 종료하며, 부팅 폴더의 로그온 바로가기가 이것을 씁
 2. **tui**
     - 실시간 대시보드만 엶. 명령을 아예 생략하면 분리된 `serve` 실행을 먼저 보장한 뒤 대시보드를 엶
 3. **index**

@@ -24,6 +24,8 @@ struct CliArgs {
 enum CliCommand {
     /// 상주 서버 실행 (관리·OTLP·훅·게이트웨이 포트)
     Serve,
+    /// serve 분리 상주 보장 후 종료 (로그온 실행용, TUI 없음)
+    Start,
     /// 실시간 관제 TUI 만 실행 (명령 없이 실행하면 serve 자동 상주 + TUI)
     Tui,
     /// 세션 기록 1회 색인
@@ -68,6 +70,9 @@ fn main() -> ExitCode {
 
     let outcome: anyhow::Result<i32> = match command {
         CliCommand::Serve => serve::run_serve(config).map(|_| 0),
+        CliCommand::Start => {
+            serve::ensure_background_serve(&config, args.config.as_deref()).map(|_| 0)
+        }
         CliCommand::Tui => tui::run_tui(&config).map(|_| 0),
         CliCommand::Index => Store::open_store(&config.data_dir.join(DB_FILE_NAME))
             .and_then(|store| transcript::index_transcripts_once(&config, &store))

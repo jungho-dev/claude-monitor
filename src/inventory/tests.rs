@@ -406,8 +406,7 @@ fn doctor_legacy_home_prints_exact_settings_snippets() {
 
     let telemetry = pick(&findings, "telemetry");
     assert_eq!(telemetry[0].level, "warn");
-    assert!(telemetry[0].message.contains("DISABLE_TELEMETRY"));
-    assert!(telemetry[0].message.contains("unverified"));
+    assert!(!telemetry[0].message.contains("DISABLE_TELEMETRY"));
     assert!(telemetry[0].fix_hint.contains(&format!(
         "\"env\": {{\"CLAUDE_CODE_ENABLE_TELEMETRY\":\"1\",\"OTEL_LOGS_EXPORTER\":\"otlp\",\"OTEL_EXPORTER_OTLP_ENDPOINT\":\"http://127.0.0.1:{otlp_port}\",\"OTEL_EXPORTER_OTLP_PROTOCOL\":\"http/json\"}}"
     )));
