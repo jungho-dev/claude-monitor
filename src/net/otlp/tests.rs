@@ -7,6 +7,7 @@ use crate::core::model::{DataSource, HookOutcome, LiveEvent};
 use crate::net::admin::test_support::{
     build_test_config, build_test_context, post_raw, wait_until_listening,
 };
+use crate::transcript::test_support::TempDirGuard;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use rusqlite::params;
@@ -113,6 +114,7 @@ async fn otlp_server_validates_and_stores_logs() {
     // 1. 서버 기동
     let config = build_test_config("otlp");
     let port = config.ports.otlp;
+    let _cleanup = TempDirGuard(config.data_dir.clone());
     let ctx = build_test_context(config);
     let mut live_rx = ctx.live_tx.subscribe();
     let server = tokio::spawn(run_otlp_server(ctx.clone()));
@@ -198,6 +200,7 @@ async fn otlp_server_validates_and_stores_logs() {
     assert_eq!((status, text.as_str()), (200, "{}"));
     assert_eq!(ctx.counters.otlp_batches.load(Ordering::Relaxed), 3);
     server.abort();
+    let _ = server.await;
 }
 
 // 5. 본문 상한과 gzip 폭탄 ----------------------------------------------------
@@ -206,6 +209,7 @@ async fn otlp_rejects_oversized_and_gzip_bomb() {
     // 1. 서버 기동
     let config = build_test_config("otlp-limit");
     let port = config.ports.otlp;
+    let _cleanup = TempDirGuard(config.data_dir.clone());
     let ctx = build_test_context(config);
     let server = tokio::spawn(run_otlp_server(ctx.clone()));
     wait_until_listening(port).await;
@@ -241,4 +245,5 @@ async fn otlp_rejects_oversized_and_gzip_bomb() {
     assert_eq!(status, 413);
     assert_eq!(ctx.counters.otlp_batches.load(Ordering::Relaxed), 0);
     server.abort();
+    let _ = server.await;
 }

@@ -11,6 +11,7 @@ use crate::hooks::client::{blocking_http_request, post_hook_payload};
 use crate::hooks::run_hook_server;
 use crate::hooks::upstream::UpstreamClient;
 use crate::net::admin::test_support::{build_test_config, build_test_context};
+use crate::transcript::test_support::remove_temp_dir;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -740,7 +741,7 @@ async fn hook_server_round_trip_records_events() {
     server.abort();
     let _ = server.await;
     drop(ctx);
-    let _ = std::fs::remove_dir_all(&data_dir);
+    remove_temp_dir(&data_dir);
 }
 
 // 24. 중계 상류 불가 ----------------------------------------------------------
@@ -783,7 +784,7 @@ async fn relay_unreachable_returns_502_and_records_event() {
     server.abort();
     let _ = server.await;
     drop(ctx);
-    let _ = std::fs::remove_dir_all(&data_dir);
+    remove_temp_dir(&data_dir);
 }
 
 // 25. 과대 가드 응답 ----------------------------------------------------------

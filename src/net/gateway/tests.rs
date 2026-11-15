@@ -10,6 +10,7 @@ use crate::net::admin::test_support::{
     build_test_config, build_test_context, pick_free_port, post_raw, wait_until_listening,
 };
 use crate::net::common::{BoxError, ResponseBody};
+use crate::transcript::test_support::TempDirGuard;
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::body::{Body, Frame};
@@ -129,7 +130,9 @@ fn sse_parser_handles_byte_chunks_and_crlf() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tap_body_records_completed_stream() {
     // 1. 준비 (바이트 경계 중간 분할)
-    let ctx = build_test_context(build_test_config("gw-tap"));
+    let config = build_test_config("gw-tap");
+    let _cleanup = TempDirGuard(config.data_dir.clone());
+    let ctx = build_test_context(config);
     let mut live_rx = ctx.live_tx.subscribe();
     let bytes = SSE_SAMPLE.as_bytes();
     let middle = bytes.len() / 2;
@@ -182,7 +185,9 @@ async fn tap_body_records_completed_stream() {
 // 6. 계측 본문 중단 -----------------------------------------------------------
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tap_body_records_aborted_stream() {
-    let ctx = build_test_context(build_test_config("gw-abort"));
+    let config = build_test_config("gw-abort");
+    let _cleanup = TempDirGuard(config.data_dir.clone());
+    let ctx = build_test_context(config);
     let bytes = SSE_SAMPLE.as_bytes();
     let head_end = SSE_SAMPLE
         .find("event: content_block_delta")
@@ -230,6 +235,7 @@ async fn gateway_returns_502_when_upstream_unreachable() {
     let dead_port = pick_free_port();
     config.gateway.upstream = format!("https://127.0.0.1:{dead_port}");
     let port = config.ports.gateway;
+    let _cleanup = TempDirGuard(config.data_dir.clone());
     let ctx = build_test_context(config);
     let server = tokio::spawn(run_gateway_server(Arc::clone(&ctx)));
     wait_until_listening(port).await;
@@ -259,6 +265,7 @@ async fn gateway_returns_502_when_upstream_unreachable() {
         0
     );
     server.abort();
+    let _ = server.await;
 }
 
 // 8. 상류 응답 머리 시간 초과 -------------------------------------------------
@@ -283,15 +290,16 @@ async fn gateway_returns_504_when_upstream_never_answers() {
         config.gateway.upstream = format!("https://127.0.0.1:{silent_port}");
         config.gateway.upstream_timeout_secs = 1;
         let port = config.ports.gateway;
+        let cleanup = TempDirGuard(config.data_dir.clone());
         let ctx = build_test_context(config);
         let server = tokio::spawn(run_gateway_server(Arc::clone(&ctx)));
         tokio::time::sleep(Duration::from_millis(150)).await;
         if !server.is_finished() {
-            started = Some((port, ctx, server));
+            started = Some((cleanup, port, ctx, server));
             break;
         }
     }
-    let (port, ctx, server) = started.expect("게이트웨이 기동");
+    let (_cleanup, port, ctx, server) = started.expect("게이트웨이 기동");
     wait_until_listening(port).await;
 
     // 3. 메시지 요청 (병렬 실행 중 간헐적 연결 오류 502 는 재시도)
@@ -341,6 +349,8 @@ async fn gateway_returns_504_when_upstream_never_answers() {
     );
     server.abort();
     silent_upstream.abort();
+    let _ = server.await;
+    let _ = silent_upstream.await;
 }
 
 // 9. hop-by-hop 판별 ----------------------------------------------------------

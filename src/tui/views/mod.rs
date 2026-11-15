@@ -22,7 +22,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 const MIN_WIDTH: u16 = 60;
@@ -508,6 +508,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         .title_bottom(
             Line::from(Span::styled(" 아무 키·클릭: 닫기 ", theme::STYLE_DIM)).right_aligned(),
         )
+        .padding(Padding::horizontal(1))
         .style(Style::default().bg(theme::BG_PANEL));
     let inner = block.inner(rect);
 
@@ -1401,6 +1402,77 @@ mod tests {
         let agents = render_to_text(&mut state, 150, 40).join("\n");
         assert!(agents.contains("집계 대기 중"));
         assert!(agents.contains("선택한 에이전트 없음"));
+    }
+
+    #[test]
+    fn detail_cards_show_every_line_without_scroll_counter() {
+        let mut state = sample_state_with_tables();
+        state.tab = ActiveTab::Agents;
+        let agents = render_to_text(&mut state, 200, 55).join("\n");
+        assert!(agents.contains("주 모델 / 마지막 요청"), "{agents}");
+        assert!(!agents.contains("1-6 / 7"));
+
+        state.tab = ActiveTab::Models;
+        let models = render_to_text(&mut state, 200, 55).join("\n");
+        assert!(models.contains("마지막 요청"), "{models}");
+        assert!(!models.contains("1-5 / 6"));
+    }
+
+    #[test]
+    fn report_prose_wraps_box_tables_ellipsize_and_outline_jump_follows_rows() {
+        let prose = "가나다라마바사 ".repeat(30);
+        let rule = "─".repeat(150);
+        let markdown = format!(
+            "# 리포트\n\n## 하나\n{prose}\n```text\n┌{rule}┐\n│ {rule} │\n└{rule}┘\n```\n## 둘\n끝 문장\n"
+        );
+        let mut state = sample_state_with_tables();
+        state.report = Panel::Ready(Some(markdown.clone()));
+        state.tab = ActiveTab::Report;
+        let rows = render_to_text(&mut state, 100, 40);
+        let text = rows.join("\n");
+
+        // 일반 문장은 잘림 없이 전부 표시, 박스 표 줄은 끝 …
+        assert_eq!(text.matches("가나다라마바사").count(), 30, "{text}");
+        assert!(rows.iter().any(|row| row.contains("─…")), "{text}");
+
+        // 스크롤 총 행 수는 줄바꿈 반영, 시작 행은 단조 증가
+        let starts = state.report_row_starts.clone();
+        let total = state.card_views[CardId::ReportBody as usize].total;
+        assert!(total > starts.len(), "{total} {}", starts.len());
+        assert!(starts.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(starts.windows(2).any(|pair| pair[1] - pair[0] > 1));
+
+        // 목차 하나를 누르면 줄바꿈 뒤 행으로 이동
+        let entries = crate::tui::format::outline_entries(
+            &crate::tui::format::prepare_report_markdown(&markdown),
+        );
+        let last = entries.last().expect("목차");
+        state.select_card_row(CardId::ReportOutline, entries.len() - 1);
+        let scroll = state.card_views[CardId::ReportBody as usize].scroll;
+        assert_eq!(scroll, starts[last.line]);
+        assert!(scroll > last.line);
+    }
+
+    #[test]
+    fn kpi_values_end_with_ellipsis_instead_of_cutting_digits_at_narrow_width() {
+        let mut state = sample_state_with_snapshot();
+        if let Panel::Ready(stats) = &mut state.snapshot.overview {
+            stats.api_requests = 12_345_678;
+            stats.input_tokens = 2_345_678;
+            stats.output_tokens = 410_000;
+        }
+        let text = render_to_text(&mut state, 60, 16).join("\n");
+        assert!(text.contains('…'), "{text}");
+        assert!(!text.contains("2.3M/41 "), "{text}");
+    }
+
+    #[test]
+    fn help_overlay_keeps_one_column_padding_inside_the_border() {
+        let mut state = sample_state_with_snapshot();
+        state.show_help = true;
+        let text = render_to_text(&mut state, 100, 40).join("\n");
+        assert!(text.contains("║ 키보드"), "{text}");
+        assert!(!text.contains("║키보드"), "{text}");
     }
 
     #[test]

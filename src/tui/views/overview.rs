@@ -12,7 +12,8 @@ use crate::tui::sort::{compare_event_row, sort_rows};
 use crate::tui::state::{AppState, DbState, Panel};
 use crate::tui::theme;
 use crate::tui::views::common::{
-    TextCard, interactive_card, panel_message, render_db_gate, render_notice_card, render_text_card,
+    TextCard, clip_spans_to_width, interactive_card, panel_message, render_db_gate,
+    render_notice_card, render_text_card,
 };
 use crate::tui::views::feed::{
     FEED_COLUMN_LABELS, build_event_context_lines, build_event_detail_lines, build_feed_header,
@@ -458,13 +459,29 @@ fn render_kpi_cards(frame: &mut Frame, state: &mut AppState, area: Rect) {
 
     // 4. 카드 그리기 (캐시 카드는 게이지, 줄은 폭에 맞는 첫 후보)
     let pick_fit = |variants: Vec<Line<'static>>, width: usize| -> Line<'static> {
+        // 4-1. 폭에 맞는 첫 후보
         let last = variants.len() - 1;
-        variants
+        let chosen = variants
             .into_iter()
             .enumerate()
             .find(|(position, line)| line.width() <= width || *position == last)
             .map(|(_, line)| line)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let mut spans = chosen.spans;
+        let mut used: usize = spans.iter().map(Span::width).sum();
+        if used <= width {
+            return Line::from(spans);
+        }
+
+        // 4-2. 넘침 말줄임 (뒤 조각부터 덜어냄)
+        while spans.len() > 1 && used + 1 > width {
+            if let Some(tail) = spans.pop() {
+                used -= tail.width();
+            }
+        }
+        let tail_style = spans.last().map_or(Style::default(), |span| span.style);
+        spans.push(Span::styled("…", tail_style));
+        Line::from(clip_spans_to_width(spans, width))
     };
     for (index, (full_title, short_title, value_lines, detail_lines)) in
         cards.into_iter().enumerate()

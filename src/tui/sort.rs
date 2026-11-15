@@ -7,7 +7,7 @@ use crate::store::query::{
     AgentStatsRow, CacheBreakRow, HookStatRow, ModelStatsRow, ToolLatencyRow,
 };
 use crate::tui::cards::{CARD_COUNT, CardId};
-use crate::tui::format::short_tool;
+use crate::tui::format::{short_model, short_tool};
 use crate::tui::poller::live_event_timestamp;
 use crate::tui::theme;
 use crate::tui::views::feed::feed_event_name;
@@ -296,7 +296,7 @@ pub fn compare_hook_row(left: &HookStatRow, right: &HookStatRow, column: usize) 
 
 pub fn compare_model_row(left: &ModelStatsRow, right: &ModelStatsRow, column: usize) -> Ordering {
     match column {
-        0 => compare_display_text(&left.model, &right.model),
+        0 => compare_display_text(short_model(&left.model), short_model(&right.model)),
         1 => left.requests.cmp(&right.requests),
         2 => left.sessions.cmp(&right.sessions),
         3 => left.agent_types.cmp(&right.agent_types),
@@ -327,7 +327,7 @@ pub fn compare_agent_row(left: &AgentStatsRow, right: &AgentStatsRow, column: us
         9 => left.wait_p90_ms.cmp(&right.wait_p90_ms),
         10 => left.tool_calls.cmp(&right.tool_calls),
         11 => left.tool_errors.cmp(&right.tool_errors),
-        12 => compare_display_text(&left.top_model, &right.top_model),
+        12 => compare_display_text(short_model(&left.top_model), short_model(&right.top_model)),
         13 => left.last_ts.cmp(&right.last_ts),
         _ => Ordering::Equal,
     }
@@ -341,7 +341,7 @@ pub fn compare_cache_break_row(
     match column {
         0 => left.ts.cmp(&right.ts),
         1 => compare_display_text(&left.agent, &right.agent),
-        2 => compare_display_text(&left.model, &right.model),
+        2 => compare_display_text(short_model(&left.model), short_model(&right.model)),
         3 => left.cache_creation_tokens.cmp(&right.cache_creation_tokens),
         4 => left
             .previous_context_tokens
@@ -615,7 +615,7 @@ mod tests {
             ..ModelStatsRow::default()
         };
         let high = ModelStatsRow {
-            model: "Claude-A".to_string(),
+            model: "claude-A".to_string(),
             cost_usd_estimate: 12.0,
             wait_p50_ms: Some(300),
             cache_hit_ratio: 0.9,
@@ -625,6 +625,18 @@ mod tests {
         assert_eq!(compare_model_row(&low, &high, 9), Ordering::Less);
         assert_eq!(compare_model_row(&low, &high, 8), Ordering::Less);
         assert_eq!(compare_model_row(&low, &high, 0), Ordering::Greater);
+
+        // 접두사 유무 혼합 이름
+        let bare = ModelStatsRow {
+            model: "zeta".to_string(),
+            ..ModelStatsRow::default()
+        };
+        let prefixed = ModelStatsRow {
+            model: "claude-zz".to_string(),
+            ..ModelStatsRow::default()
+        };
+        assert_eq!(compare_model_row(&bare, &prefixed, 0), Ordering::Less);
+        assert_eq!(compare_model_row(&prefixed, &bare, 0), Ordering::Greater);
 
         let first = AgentStatsRow {
             agent: "main".to_string(),

@@ -8,16 +8,24 @@ use crate::store::Store;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+// 임시 폴더 삭제 재시도 횟수와 간격 (Windows 파일 잠금 대기, 분리 재시도 포함)
+const REMOVE_ATTEMPTS: u32 = 20;
+const REMOVE_RETRY_MS: u64 = 50;
+const DEFERRED_REMOVE_ATTEMPTS: u32 = 300;
+const DEFERRED_RETRY_MS: u64 = 100;
+
 // 1. 시험 작업 공간 -----------------------------------------------------------
+// _cleanup 은 마지막 필드: store 가 닫힌 뒤 폴더 삭제
 pub struct TestWorkspace {
     pub config: AppConfig,
     pub store: Store,
     pub root: PathBuf,
     pub projects_dir: PathBuf,
+    pub _cleanup: TempDirGuard,
 }
 
 // 2. 고유 임시 폴더 -----------------------------------------------------------
@@ -77,7 +85,43 @@ pub fn prepare_fixture_workspace(label: &str) -> TestWorkspace {
     TestWorkspace {
         config,
         store,
+        _cleanup: TempDirGuard(root.clone()),
         root,
         projects_dir,
+    }
+}
+
+// 열린 파일이 남아 있으면 잠시 뒤 재시도, 그래도 실패하면 분리 스레드가 이어서 재시도 (호출 전 Store 등을 drop)
+pub fn remove_temp_dir(dir: &Path) {
+    // 1. 즉시 재시도 (런타임이 남긴 작업이 상위 함수에서 끝날 때까지)
+    for _ in 0..REMOVE_ATTEMPTS {
+        match fs::remove_dir_all(dir) {
+            Ok(()) => return,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+            Err(_) => std::thread::sleep(Duration::from_millis(REMOVE_RETRY_MS)),
+        }
+    }
+
+    // 2. 분리 스레드 재시도 (시험 런타임 종료 뒤 락 해제 대기)
+    let pending = dir.to_path_buf();
+    std::thread::spawn(move || {
+        for _ in 0..DEFERRED_REMOVE_ATTEMPTS {
+            match fs::remove_dir_all(&pending) {
+                Ok(()) => return,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+                Err(_) => std::thread::sleep(Duration::from_millis(DEFERRED_RETRY_MS)),
+            }
+        }
+        eprintln!("[rap-test] 임시 폴더 삭제 실패 {}", pending.display());
+    });
+}
+
+// 6. 임시 폴더 정리 보증 ------------------------------------------------------
+// Drop 시 폴더 삭제 (이 값보다 뒤에 선언한 Store·컨텍스트가 먼저 닫히도록 맨 앞에 둔다)
+pub struct TempDirGuard(pub PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        remove_temp_dir(&self.0);
     }
 }

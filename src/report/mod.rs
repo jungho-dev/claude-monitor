@@ -14,6 +14,7 @@ use anyhow::Context;
 use chrono::{
     DateTime, Duration, Local, LocalResult, NaiveDate, NaiveTime, SecondsFormat, TimeZone, Utc,
 };
+pub use render::format_count;
 use render::{ReportInput, render_report_markdown};
 use std::fs;
 use std::path::PathBuf;

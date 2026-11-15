@@ -254,6 +254,8 @@ pub struct AppState {
     pub toast: Option<Toast>,
     pub report_date: NaiveDate,
     pub report: Panel<Option<String>>,
+    // 리포트 본문 줄별 화면 시작 행 (줄바꿈 반영, 직전 그리기 기준)
+    pub report_row_starts: Vec<usize>,
     pub inventory: Panel<Inventory>,
     pub doctor: Panel<Vec<DoctorFinding>>,
     pub settings_requested: bool,
@@ -284,6 +286,7 @@ impl AppState {
             toast: None,
             report_date: today.pred_opt().unwrap_or(today),
             report: Panel::Pending,
+            report_row_starts: Vec::new(),
             inventory: Panel::Pending,
             doctor: Panel::Pending,
             settings_requested: false,
@@ -457,6 +460,7 @@ impl AppState {
     // 리포트 날짜가 바뀌면 본문·목차 위치 처음으로
     fn reset_report_view(&mut self) {
         self.report = Panel::Pending;
+        self.report_row_starts.clear();
         self.card_views[CardId::ReportBody as usize] = CardView::default();
         self.card_views[CardId::ReportOutline as usize] = CardView::default();
     }
@@ -546,7 +550,12 @@ impl AppState {
         let entries = outline_entries(&prepare_report_markdown(markdown));
         let selected = self.card_views[CardId::ReportOutline as usize].selected;
         if let Some(entry) = entries.get(selected) {
-            self.card_views[CardId::ReportBody as usize].scroll = entry.line;
+            let row = self
+                .report_row_starts
+                .get(entry.line)
+                .copied()
+                .unwrap_or(entry.line);
+            self.card_views[CardId::ReportBody as usize].scroll = row;
         }
     }
 

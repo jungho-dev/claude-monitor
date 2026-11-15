@@ -5,6 +5,7 @@ use super::{DoctorFinding, Inventory, load_inventory, run_doctor_checks};
 use crate::core::config::{AppConfig, HookConfig, PortConfig};
 use crate::core::model::{PortStatus, StatusSnapshot};
 use crate::net::admin::test_support::build_test_config;
+use crate::transcript::test_support::TempDirGuard;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -292,6 +293,7 @@ fn inventory_reports_broken_and_missing_files_as_warnings() {
 #[test]
 fn inventory_command_target_keeps_only_script_name() {
     let home = temp_data_dir("command-target");
+    let _cleanup = TempDirGuard(home.clone());
     fs::write(
         home.join("settings.json"),
         r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"bun run C:/x/y.ts --token=abc"},{"type":"command","command":"C:/tools/plain.exe --flag value"}]}]}}"#,
@@ -300,13 +302,13 @@ fn inventory_command_target_keeps_only_script_name() {
     let inventory = load_inventory(&home).expect("적재");
     assert_eq!(inventory.hooks[0].target, "bun y.ts");
     assert_eq!(inventory.hooks[1].target, "plain.exe");
-    let _ = fs::remove_dir_all(&home);
 }
 
 // 14. URL 대상 축약 -----------------------------------------------------------
 #[test]
 fn inventory_url_targets_drop_userinfo_query_and_fragment() {
     let home = temp_data_dir("url-target");
+    let _cleanup = TempDirGuard(home.clone());
     fs::write(
         home.join("settings.json"),
         r#"{"hooks":{"Stop":[{"hooks":[{"type":"http","url":"http://user:pw@localhost:9/hook/a?k=v#f"},{"type":"http","url":"http://localhost:9"},{"type":"http","url":"http://localhost:9?k=v"}]}]}}"#,
@@ -333,7 +335,6 @@ fn inventory_url_targets_drop_userinfo_query_and_fragment() {
         .find(|server| server.name == "bare")
         .expect("경로 없는 서버");
     assert_eq!(bare.target, "https://example.test");
-    let _ = fs::remove_dir_all(&home);
 }
 
 // 15. 정상 등록 홈 진단 -------------------------------------------------------
@@ -344,6 +345,10 @@ fn doctor_registered_home_passes_settings_checks() {
         "home_registered",
         data_dir.clone(),
         Some(spawn_health_server()),
+    );
+    let _cleanup = (
+        TempDirGuard(data_dir.clone()),
+        TempDirGuard(config.claude_home.clone()),
     );
     let findings = run_doctor_checks(&config).expect("진단");
     assert!(
@@ -364,8 +369,6 @@ fn doctor_registered_home_passes_settings_checks() {
     assert_eq!(pick(&findings, "telemetry")[0].level, "ok");
     assert_eq!(pick(&findings, "gateway")[0].level, "ok");
     assert_eq!(pick(&findings, "projects-dir")[0].level, "ok");
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = fs::remove_dir_all(&config.claude_home);
 }
 
 // 16. 구형 등록 홈 진단 -------------------------------------------------------
@@ -373,6 +376,10 @@ fn doctor_registered_home_passes_settings_checks() {
 fn doctor_legacy_home_prints_exact_settings_snippets() {
     let data_dir = temp_data_dir("legacy");
     let config = doctor_config("home_legacy", data_dir.clone(), None);
+    let _cleanup = (
+        TempDirGuard(data_dir.clone()),
+        TempDirGuard(config.claude_home.clone()),
+    );
     let findings = run_doctor_checks(&config).expect("진단");
     let hooks_port = config.ports.hooks;
     let otlp_port = config.ports.otlp;
@@ -405,8 +412,6 @@ fn doctor_legacy_home_prints_exact_settings_snippets() {
 
     assert_eq!(pick(&findings, "projects-dir")[0].level, "warn");
     assert_eq!(pick(&findings, "settings")[0].level, "warn");
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = fs::remove_dir_all(&config.claude_home);
 }
 
 // 17. 허용 목록 미지정 --------------------------------------------------------
@@ -414,6 +419,10 @@ fn doctor_legacy_home_prints_exact_settings_snippets() {
 fn doctor_accepts_registered_hook_without_allowlist_key() {
     let data_dir = temp_data_dir("no-allowlist");
     let config = doctor_config("home_no_allowlist", data_dir.clone(), None);
+    let _cleanup = (
+        TempDirGuard(data_dir.clone()),
+        TempDirGuard(config.claude_home.clone()),
+    );
     let findings = run_doctor_checks(&config).expect("진단");
     assert_eq!(pick(&findings, "http-allowlist")[0].level, "ok");
     assert!(
@@ -426,8 +435,6 @@ fn doctor_accepts_registered_hook_without_allowlist_key() {
             .iter()
             .any(|finding| finding.level == "warn" && finding.message.contains("pretool-guard"))
     );
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = fs::remove_dir_all(&config.claude_home);
 }
 
 // 18. 게이트웨이 사용 + haiku 미지정 ------------------------------------------
@@ -435,6 +442,10 @@ fn doctor_accepts_registered_hook_without_allowlist_key() {
 fn doctor_warns_gateway_without_haiku_model() {
     let data_dir = temp_data_dir("gateway-on");
     let mut config = doctor_config("home_registered", data_dir.clone(), None);
+    let _cleanup = (
+        TempDirGuard(data_dir.clone()),
+        TempDirGuard(config.claude_home.clone()),
+    );
     config.gateway.enabled = true;
     let findings = run_doctor_checks(&config).expect("진단");
     let gateway = pick(&findings, "gateway");
@@ -442,8 +453,6 @@ fn doctor_warns_gateway_without_haiku_model() {
     assert_eq!(gateway[0].level, "warn");
     assert!(gateway[0].message.contains("ANTHROPIC_DEFAULT_HAIKU_MODEL"));
     assert_eq!(pick(&findings, "port-gateway").len(), 1);
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = fs::remove_dir_all(&config.claude_home);
 }
 
 // 19. 수신 포트와 중계 대상 응답 ----------------------------------------------
@@ -455,6 +464,10 @@ fn doctor_detects_listening_port_and_healthy_relay_target() {
     // 2. 진단
     let data_dir = temp_data_dir("listening");
     let mut config = doctor_config("home_registered", data_dir.clone(), Some(port));
+    let _cleanup = (
+        TempDirGuard(data_dir.clone()),
+        TempDirGuard(config.claude_home.clone()),
+    );
     config.hooks.relay_target = format!("http://127.0.0.1:{port}/");
     let findings = run_doctor_checks(&config).expect("진단");
     assert_eq!(pick(&findings, "port-hooks")[0].level, "ok");
@@ -468,8 +481,6 @@ fn doctor_detects_listening_port_and_healthy_relay_target() {
         findings.iter().all(|finding| finding.level != "fail"),
         "{findings:?}"
     );
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = fs::remove_dir_all(&config.claude_home);
 }
 
 // 20. 없는 데이터 폴더 --------------------------------------------------------
@@ -482,10 +493,10 @@ fn doctor_warns_when_data_dir_is_missing() {
     ));
     let _ = fs::remove_dir_all(&data_dir);
     let config = doctor_config("home_registered", data_dir, None);
+    let _cleanup = TempDirGuard(config.claude_home.clone());
     let findings = run_doctor_checks(&config).expect("진단");
     assert_eq!(pick(&findings, "data-dir")[0].level, "warn");
     assert!(pick(&findings, "data-dir")[0].fix_hint.contains("serve"));
-    let _ = fs::remove_dir_all(&config.claude_home);
 }
 
 // 21. 체인 등록 + 훅 미수신 ---------------------------------------------------
@@ -494,6 +505,10 @@ fn doctor_fails_when_chain_registered_but_hooks_disabled() {
     // 1. 훅 꺼짐 (훅 포트는 진단 대상 제외)
     let data_dir = temp_data_dir("hooks-disabled");
     let mut config = doctor_config("home_registered", data_dir.clone(), None);
+    let _cleanup = (
+        TempDirGuard(data_dir.clone()),
+        TempDirGuard(config.claude_home.clone()),
+    );
     config.hooks.enabled = false;
     let findings = run_doctor_checks(&config).expect("진단");
     let registration = pick(&findings, "hook-registration");
@@ -514,8 +529,6 @@ fn doctor_fails_when_chain_registered_but_hooks_disabled() {
             .any(|finding| finding.level == "fail")
     );
     assert_eq!(pick(&findings, "port-hooks")[0].level, "warn");
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = fs::remove_dir_all(&config.claude_home);
 }
 
 // 22. 빈 허용 목록 ------------------------------------------------------------
@@ -523,6 +536,10 @@ fn doctor_fails_when_chain_registered_but_hooks_disabled() {
 fn doctor_fails_when_allowlist_is_empty_array() {
     let data_dir = temp_data_dir("empty-allowlist");
     let config = doctor_config("home_empty_allowlist", data_dir.clone(), None);
+    let _cleanup = (
+        TempDirGuard(data_dir.clone()),
+        TempDirGuard(config.claude_home.clone()),
+    );
     let findings = run_doctor_checks(&config).expect("진단");
     let allowlist = pick(&findings, "http-allowlist");
     assert_eq!(allowlist[0].level, "fail");
@@ -531,8 +548,6 @@ fn doctor_fails_when_allowlist_is_empty_array() {
         "{:?}",
         allowlist[0]
     );
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = fs::remove_dir_all(&config.claude_home);
 }
 
 // 23. 불일치 허용 목록 --------------------------------------------------------
@@ -540,6 +555,10 @@ fn doctor_fails_when_allowlist_is_empty_array() {
 fn doctor_fails_when_allowlist_lacks_rap_url() {
     let data_dir = temp_data_dir("mismatched-allowlist");
     let config = doctor_config("home_mismatched_allowlist", data_dir.clone(), None);
+    let _cleanup = (
+        TempDirGuard(data_dir.clone()),
+        TempDirGuard(config.claude_home.clone()),
+    );
     let findings = run_doctor_checks(&config).expect("진단");
     let allowlist = pick(&findings, "http-allowlist");
     assert_eq!(allowlist[0].level, "fail");
@@ -548,8 +567,6 @@ fn doctor_fails_when_allowlist_lacks_rap_url() {
         "{:?}",
         allowlist[0]
     );
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = fs::remove_dir_all(&config.claude_home);
 }
 
 // 24. 상태 응답 서버 ----------------------------------------------------------
@@ -617,6 +634,10 @@ fn doctor_reports_foreign_owned_otlp_port() {
     }]);
     let data_dir = temp_data_dir("foreign-otlp");
     let mut config = doctor_config("home_registered", data_dir.clone(), None);
+    let _cleanup = (
+        TempDirGuard(data_dir.clone()),
+        TempDirGuard(config.claude_home.clone()),
+    );
     config.ports.admin = status_port;
     config.ports.otlp = otlp_port;
 
@@ -626,8 +647,6 @@ fn doctor_reports_foreign_owned_otlp_port() {
     assert_eq!(otlp[0].level, "warn");
     assert!(otlp[0].message.contains("다른 프로세스"), "{:?}", otlp[0]);
     drop(foreign);
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = fs::remove_dir_all(&config.claude_home);
 }
 
 // 27. rap 소유 OTLP 포트 ------------------------------------------------------
@@ -644,6 +663,10 @@ fn doctor_accepts_rap_owned_otlp_port_and_flags_unverified_owner() {
     }]);
     let data_dir = temp_data_dir("rap-otlp");
     let mut config = doctor_config("home_registered", data_dir.clone(), None);
+    let _cleanup = (
+        TempDirGuard(data_dir.clone()),
+        TempDirGuard(config.claude_home.clone()),
+    );
     config.ports.otlp = otlp_port;
     config.ports.admin = status_port;
     let findings = run_doctor_checks(&config).expect("진단");
@@ -656,6 +679,4 @@ fn doctor_accepts_rap_owned_otlp_port_and_flags_unverified_owner() {
     assert_eq!(otlp[0].level, "warn");
     assert!(otlp[0].message.contains("소유 확인 불가"), "{:?}", otlp[0]);
     drop(held);
-    let _ = fs::remove_dir_all(&data_dir);
-    let _ = fs::remove_dir_all(&config.claude_home);
 }

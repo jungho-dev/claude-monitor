@@ -1061,7 +1061,7 @@ fn parse_outcome(text: &str) -> HookOutcome {
 mod tests {
     use super::*;
     use crate::core::model::{IngestBatch, SessionRow};
-    use crate::transcript::test_support::unique_temp_dir;
+    use crate::transcript::test_support::{remove_temp_dir, unique_temp_dir};
 
     fn api_row(key: &str, ts: &str, model: &str, read: i64, create: i64) -> ApiRequestRow {
         ApiRequestRow {
@@ -1239,7 +1239,8 @@ mod tests {
         assert_eq!(recent.len(), 3);
         let counts = store.query_source_counts(since, until).expect("출처");
         assert_eq!((counts.transcript, counts.otlp), (4, 1));
-        std::fs::remove_dir_all(&dir).ok();
+        drop(store);
+        remove_temp_dir(&dir);
     }
 
     const STATS_SINCE: &str = "2026-11-10T00:00:00.000Z";
@@ -1477,7 +1478,8 @@ mod tests {
             (Some(2000), Some(5000))
         );
         assert_eq!(sonnet.last_ts, "2026-11-10T13:01:00.000Z");
-        std::fs::remove_dir_all(&dir).ok();
+        drop(store);
+        remove_temp_dir(&dir);
     }
 
     #[test]
@@ -1521,7 +1523,8 @@ mod tests {
         assert_eq!(explorer.top_model, "claude-sonnet-5");
         assert_eq!((explorer.tool_calls, explorer.tool_errors), (2, 0));
         assert_eq!(explorer.last_ts, "2026-11-10T13:30:00.000Z");
-        std::fs::remove_dir_all(&dir).ok();
+        drop(store);
+        remove_temp_dir(&dir);
     }
 
     #[test]
@@ -1543,6 +1546,7 @@ mod tests {
             .collect();
         assert!(plans[0].contains("idx_api_requests_ts"), "{}", plans[0]);
         assert!(plans[1].contains("idx_tool_calls_ts"), "{}", plans[1]);
-        std::fs::remove_dir_all(&dir).ok();
+        drop(store);
+        remove_temp_dir(&dir);
     }
 }

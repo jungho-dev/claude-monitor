@@ -104,7 +104,6 @@ fn first_run_indexes_main_and_subagent_rows() {
         .expect("붕괴");
     assert_eq!(breaks.len(), 1);
     assert_eq!(breaks[0].likely_cause, "유휴 5분 초과 (TTL)");
-    fs::remove_dir_all(&workspace.root).ok();
 }
 
 // 2. 재실행 -------------------------------------------------------------------
@@ -116,7 +115,6 @@ fn second_run_reads_nothing() {
     assert_eq!(summary.files_changed, 0);
     assert_eq!(summary.bytes_read, 0);
     assert_eq!(summary.counts.api_requests, 0);
-    fs::remove_dir_all(&workspace.root).ok();
 }
 
 // 3. 이어 읽기 ----------------------------------------------------------------
@@ -172,7 +170,6 @@ fn appended_lines_resume_with_saved_trigger() {
     let summary = index_transcripts_once(&workspace.config, &workspace.store).expect("재독");
     assert_eq!(summary.files_changed, 1);
     assert_eq!(summary.counts.api_requests, 0);
-    fs::remove_dir_all(&workspace.root).ok();
 }
 
 // 4. 훅 거부 판독 -------------------------------------------------------------
@@ -214,7 +211,6 @@ async fn indexer_loop_counts_first_run_and_publishes_later_rows() {
         .projects_dir
         .join("demo-project")
         .join("sess-main-0001.jsonl");
-    let root = workspace.root.clone();
     let ctx = Arc::new(AppContext {
         config: workspace.config,
         store: workspace.store,
@@ -254,7 +250,6 @@ async fn indexer_loop_counts_first_run_and_publishes_later_rows() {
     loop_task.abort();
     let _ = loop_task.await;
     drop(ctx);
-    fs::remove_dir_all(&root).ok();
 }
 
 // 6. 크기 역전 재색인 ---------------------------------------------------------
@@ -297,5 +292,4 @@ fn shrunk_file_below_read_offset_is_reindexed_from_start() {
         })
         .expect("msg_S");
     assert_eq!(stored, 1);
-    fs::remove_dir_all(&workspace.root).ok();
 }

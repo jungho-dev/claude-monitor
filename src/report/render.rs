@@ -60,17 +60,38 @@ pub fn format_tokens(tokens: i64) -> String {
     tokens.to_string()
 }
 
-// 4. 증감 표기 ----------------------------------------------------------------
+// 4. 건수 표기 ----------------------------------------------------------------
+// 천 단위 구분 정수 (TUI 와 공용)
+pub fn format_count(amount: i64) -> String {
+    let digits = amount.unsigned_abs().to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3 + 1);
+    if amount < 0 {
+        grouped.push('-');
+    }
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
+// 5. 증감 표기 ----------------------------------------------------------------
 // 건수는 부호 차이와 비율, 이전 0 이면 차이만
 pub fn format_count_delta(current: i64, previous: i64) -> String {
     let diff = current - previous;
+    let signed_diff = format!("{}{}", if diff >= 0 { "+" } else { "" }, format_count(diff));
     if previous == 0 {
-        return format!("{diff:+}");
+        return signed_diff;
     }
-    format!("{diff:+} ({:+.1}%)", diff as f64 * 100.0 / previous as f64)
+    format!(
+        "{signed_diff} ({:+.1}%)",
+        diff as f64 * 100.0 / previous as f64
+    )
 }
 
-// 5. 시각 표기 ----------------------------------------------------------------
+// 6. 시각 표기 ----------------------------------------------------------------
 // RFC 3339 UTC 를 로컬 시:분:초 로 변환, 실패 시 원문 앞부분
 pub fn format_local_time(timestamp: &str) -> String {
     match DateTime::parse_from_rfc3339(timestamp) {
@@ -79,7 +100,7 @@ pub fn format_local_time(timestamp: &str) -> String {
     }
 }
 
-// 6. 규칙 기반 제안 -----------------------------------------------------------
+// 7. 규칙 기반 제안 -----------------------------------------------------------
 pub fn build_suggestions(input: &ReportInput) -> Vec<String> {
     let mut suggestions: Vec<String> = Vec::new();
 
@@ -166,7 +187,7 @@ pub fn build_suggestions(input: &ReportInput) -> Vec<String> {
     suggestions
 }
 
-// 7. 리포트 본문 --------------------------------------------------------------
+// 8. 리포트 본문 --------------------------------------------------------------
 pub fn render_report_markdown(input: &ReportInput) -> String {
     let today = &input.today;
     let previous = &input.previous;
@@ -187,7 +208,8 @@ pub fn render_report_markdown(input: &ReportInput) -> String {
     let _ = writeln!(
         text,
         "- API 요청: {}건 (세션 {}개)",
-        today.api_requests, today.sessions
+        format_count(today.api_requests as i64),
+        format_count(today.sessions as i64)
     );
     let _ = writeln!(
         text,
@@ -207,12 +229,14 @@ pub fn render_report_markdown(input: &ReportInput) -> String {
     let _ = writeln!(
         text,
         "- 도구 호출: {}건 (오류 {}건)",
-        today.tool_calls, today.tool_errors
+        format_count(today.tool_calls as i64),
+        format_count(today.tool_errors as i64)
     );
     let _ = writeln!(
         text,
         "- 훅: 거부 {}건 / 재작성 {}건",
-        today.hook_denials, today.hook_rewrites
+        format_count(today.hook_denials as i64),
+        format_count(today.hook_rewrites as i64)
     );
     let _ = writeln!(
         text,
@@ -223,7 +247,7 @@ pub fn render_report_markdown(input: &ReportInput) -> String {
         text,
         "- 손실 시간: {} (추정, 거부 {}건 x {})",
         format_duration_ms(Some(today.lost_ms_estimate)),
-        today.hook_denials,
+        format_count(today.hook_denials as i64),
         format_duration_ms(Some(DENY_ROUND_TRIP_MS))
     );
 
@@ -264,8 +288,8 @@ pub fn render_report_markdown(input: &ReportInput) -> String {
         for (label, current, before) in count_rows {
             compare_rows.push(vec![
                 label.to_string(),
-                current.to_string(),
-                before.to_string(),
+                format_count(current),
+                format_count(before),
                 format_count_delta(current, before),
             ]);
         }
@@ -330,7 +354,7 @@ pub fn render_report_markdown(input: &ReportInput) -> String {
             usage_rows.push(vec![
                 row.model.clone(),
                 row.agent.clone(),
-                row.requests.to_string(),
+                format_count(row.requests as i64),
                 format_tokens(row.input_tokens),
                 format_tokens(row.output_tokens),
                 format_tokens(row.cache_read_tokens),
@@ -380,8 +404,8 @@ pub fn render_report_markdown(input: &ReportInput) -> String {
             .map(|row| {
                 vec![
                     row.tool_name.clone(),
-                    row.calls.to_string(),
-                    row.errors.to_string(),
+                    format_count(row.calls as i64),
+                    format_count(row.errors as i64),
                     format_duration_ms(row.p50_ms),
                     format_duration_ms(row.p90_ms),
                     format_duration_ms(Some(row.total_ms)),
@@ -418,7 +442,7 @@ pub fn render_report_markdown(input: &ReportInput) -> String {
                     row.route.clone(),
                     row.guard.clone(),
                     row.detail.clone(),
-                    row.count.to_string(),
+                    format_count(row.count as i64),
                     format_duration_ms(row.p90_ms),
                     format_duration_ms(Some(row.saved_ms)),
                 ]
@@ -499,7 +523,8 @@ pub fn render_report_markdown(input: &ReportInput) -> String {
         let _ = writeln!(
             text,
             "- 요청: {}건 (오류 {}건)",
-            gateway.requests, gateway.errors
+            format_count(gateway.requests as i64),
+            format_count(gateway.errors as i64)
         );
         let _ = writeln!(
             text,

@@ -102,7 +102,7 @@ pub fn render_report_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
 
     // 4. 본문 카드
     let body_title = format!("일일 리포트 · {}", state.report_date.format("%Y-%m-%d"));
-    render_text_card(
+    state.report_row_starts = render_text_card(
         frame,
         state,
         panes[1],
@@ -118,7 +118,7 @@ pub fn render_report_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
 }
 
 // 2. 날짜 이동 버튼 줄 --------------------------------------------------------
-// ◄ 이전, 날짜(오늘·어제 표시), 다음 ►, 생성 버튼의 클릭 영역 등록
+// ← 이전, 날짜(오늘·어제 표시), 다음 →, 생성 버튼의 클릭 영역 등록
 fn render_date_bar(frame: &mut Frame, state: &mut AppState, area: Rect) {
     if area.is_empty() {
         return;
@@ -151,7 +151,7 @@ fn render_date_bar(frame: &mut Frame, state: &mut AppState, area: Rect) {
         (
             Some(UiAction::ReportPrev),
             Line::from(vec![
-                Span::styled(" ◄", key_style),
+                Span::styled(" ←", key_style),
                 Span::styled(" 이전 ", name_style),
             ]),
         ),
@@ -169,7 +169,7 @@ fn render_date_bar(frame: &mut Frame, state: &mut AppState, area: Rect) {
             Some(UiAction::ReportNext),
             Line::from(vec![
                 Span::styled(" 다음", next_name),
-                Span::styled(" ► ", next_key),
+                Span::styled(" → ", next_key),
             ]),
         ),
         (
@@ -215,7 +215,7 @@ pub fn style_markdown_line(line: &str) -> Line<'static> {
     // 1. 제목
     if let Some(heading) = trimmed.strip_prefix("### ") {
         return Line::from(Span::styled(
-            format!("{indent}► {heading}"),
+            format!("{indent}· {heading}"),
             Style::default()
                 .fg(theme::COLOR_HOOK)
                 .add_modifier(Modifier::BOLD),
@@ -277,7 +277,7 @@ pub fn style_markdown_line(line: &str) -> Line<'static> {
 }
 
 // 4. 리포트 본문 줄 꾸밈 ------------------------------------------------------
-// Markdown 줄 꾸밈에 박스 표(┌ ├ └ │)를 더함: 선은 뮤트색, 첫 │ 줄(머리글 행)은 강조, 줄은 그대로(줄바꿈 없음)
+// Markdown 줄 꾸밈에 박스 표(┌ ├ └ │)를 더함: 선은 뮤트색, 첫 │ 줄(머리글 행)은 강조, 표 줄은 그대로
 pub fn style_report_lines(markdown: &str) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut header_next = false;
@@ -380,7 +380,7 @@ mod tests {
         let h3 = style_markdown_line("### 세부");
         assert_eq!(h1.spans[0].content, "일일 리포트");
         assert_eq!(h2.spans[0].content, "요약");
-        assert_eq!(h3.spans[0].content, "► 세부");
+        assert_eq!(h3.spans[0].content, "· 세부");
         assert_ne!(h1.spans[0].style, h2.spans[0].style);
 
         let bullet = style_markdown_line("  - 요청 12건");

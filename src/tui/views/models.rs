@@ -19,7 +19,14 @@ use ratatui::layout::{Alignment, Rect};
 use ratatui::text::{Line, Span};
 
 // 상세 항목 이름 칸 폭
-const DETAIL_LABEL_WIDTH: usize = 20;
+const DETAIL_LABEL_WIDTH: usize = 23;
+
+// 상세 카드 줄 수와 높이 (높이 = 줄 수 + 위아래 테두리 2줄)
+const MODEL_DETAIL_LINES: usize = 6;
+const AGENT_DETAIL_LINES: usize = 7;
+const DETAIL_BORDER_ROWS: u16 = 2;
+const MODEL_DETAIL_HEIGHT: u16 = MODEL_DETAIL_LINES as u16 + DETAIL_BORDER_ROWS;
+const AGENT_DETAIL_HEIGHT: u16 = AGENT_DETAIL_LINES as u16 + DETAIL_BORDER_ROWS;
 
 // 모델 표 열 (정렬 열 번호와 순서 일치: sort.rs)
 const MODEL_COLUMNS: [ColumnSpec; 13] = [
@@ -74,7 +81,7 @@ pub fn render_models_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
         return;
     }
     let table_cut = (u32::from(area.height) * 40 / 100) as u16;
-    let detail_cut = table_cut + 8.min(area.height.saturating_sub(table_cut + 3));
+    let detail_cut = table_cut + MODEL_DETAIL_HEIGHT.min(area.height.saturating_sub(table_cut + 3));
     let panes = state.card_layout.split_cards(
         &mut state.hit_areas.split_hits,
         SplitGroup::ModelsRows,
@@ -261,7 +268,7 @@ fn build_model_detail(row: Option<&ModelStatsRow>) -> (String, Vec<Line<'static>
         );
     };
     let wait = |millis: Option<i64>| millis.map_or("-".to_string(), format_duration_ms);
-    let pairs: [(&str, String); 6] = [
+    let pairs: [(&str, String); MODEL_DETAIL_LINES] = [
         (
             "요청 / 세션 / 종류",
             format!(
@@ -316,7 +323,7 @@ pub fn render_agents_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
     if render_db_gate(frame, state, area) {
         return;
     }
-    let detail_height = 8.min(area.height.saturating_sub(5));
+    let detail_height = AGENT_DETAIL_HEIGHT.min(area.height.saturating_sub(5));
     let panes = state.card_layout.split_cards(
         &mut state.hit_areas.split_hits,
         SplitGroup::AgentsRows,
@@ -467,7 +474,7 @@ fn build_agent_detail(row: Option<&AgentStatsRow>) -> (String, Vec<Line<'static>
     } else {
         row.top_model.clone()
     };
-    let pairs: [(&str, String); 7] = [
+    let pairs: [(&str, String); AGENT_DETAIL_LINES] = [
         (
             "실행 / 요청 / 세션",
             format!(

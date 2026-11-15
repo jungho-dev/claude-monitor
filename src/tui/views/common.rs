@@ -368,8 +368,13 @@ pub fn render_card_table(frame: &mut Frame, state: &mut AppState, area: Rect, ta
 }
 
 // 6. 텍스트 카드 --------------------------------------------------------------
-// 줄 단위 스크롤, 고정 머리글 줄(정렬 열 클릭 영역 포함), 선택 카드는 선택 줄 띠와 클릭 영역 등록
-pub fn render_text_card(frame: &mut Frame, state: &mut AppState, area: Rect, spec: TextCard) {
+// 줄 단위 스크롤, 고정 머리글 줄, 선택 줄 띠와 클릭 영역, 일반 문장 줄바꿈 (반환 = 입력 줄별 시작 행)
+pub fn render_text_card(
+    frame: &mut Frame,
+    state: &mut AppState,
+    area: Rect,
+    spec: TextCard,
+) -> Vec<usize> {
     let TextCard {
         card,
         title,
@@ -389,11 +394,15 @@ pub fn render_text_card(frame: &mut Frame, state: &mut AppState, area: Rect, spe
         inner.width,
         inner.height - header_height,
     );
-    let total = lines.len();
-    let visible = body.height as usize;
     let selectable = card.kind() == CardKind::Selectable;
 
-    // 1. 보기 상태 보정
+    // 1. 줄 배치 (선택·머리글 카드는 줄 수 고정, 그 밖은 일반 문장 줄바꿈)
+    let wrap_prose = !selectable && header_line.is_none();
+    let (lines, row_starts) = layout_text_lines(lines, usize::from(body.width), wrap_prose);
+    let total = lines.len();
+    let visible = body.height as usize;
+
+    // 2. 보기 상태 보정
     let view = &mut state.card_views[card as usize];
     view.total = total;
     view.visible = visible;
@@ -401,7 +410,7 @@ pub fn render_text_card(frame: &mut Frame, state: &mut AppState, area: Rect, spe
     view.selected = view.selected.min(total.saturating_sub(1));
     let (scroll, selected) = (view.scroll, view.selected);
 
-    // 2. 행 클릭 영역과 머리글 열 클릭 영역
+    // 3. 행 클릭 영역과 머리글 열 클릭 영역
     if selectable && visible > 0 {
         state.hit_areas.row_hits.push(RowHit {
             card,
@@ -424,7 +433,7 @@ pub fn render_text_card(frame: &mut Frame, state: &mut AppState, area: Rect, spe
         }
     }
 
-    // 3. 줄 그리기
+    // 4. 줄 그리기
     let mut block = block;
     if total > visible && visible > 0 {
         block = block.title_bottom(
@@ -450,15 +459,16 @@ pub fn render_text_card(frame: &mut Frame, state: &mut AppState, area: Rect, spe
     }
     frame.render_widget(Paragraph::new(shown), body);
 
-    // 4. 선택 줄 띠
+    // 5. 선택 줄 띠
     if selectable && total > 0 && (scroll..scroll + visible).contains(&selected) {
         let focused = state.focused_card_id() == card;
         let row_y = body.y + (selected - scroll) as u16;
         paint_selection_band(frame.buffer_mut(), area, row_y, focused);
     }
 
-    // 5. 오른쪽 거터 스크롤바
+    // 6. 오른쪽 거터 스크롤바
     render_card_scrollbar(frame, state, card, area, body);
+    row_starts
 }
 
 // 7. 카드 스크롤바 ------------------------------------------------------------
@@ -758,4 +768,226 @@ pub fn build_sort_header(
         });
     }
     (Line::from(spans), hits)
+}
+
+// 14. 텍스트 줄 배치 ----------------------------------------------------------
+// 박스 표 줄은 끝 말줄임, 일반 줄은 wrap_prose 일 때 줄바꿈 (반환 = 줄 목록, 입력 줄별 시작 행)
+pub fn layout_text_lines(
+    lines: Vec<Line<'static>>,
+    width: usize,
+    wrap_prose: bool,
+) -> (Vec<Line<'static>>, Vec<usize>) {
+    let mut laid_out: Vec<Line<'static>> = Vec::with_capacity(lines.len());
+    let mut row_starts: Vec<usize> = Vec::with_capacity(lines.len());
+    for line in lines {
+        row_starts.push(laid_out.len());
+
+        // 1. 폭 이내 줄
+        if width == 0 || line.width() <= width {
+            laid_out.push(line);
+            continue;
+        }
+
+        // 2. 박스 표 줄 (줄 내용 유지, 오른쪽 끝 …)
+        let first_letter = line
+            .spans
+            .iter()
+            .flat_map(|span| span.content.chars())
+            .find(|letter| !letter.is_whitespace());
+        if matches!(first_letter, Some('\u{2500}'..='\u{257F}')) {
+            let Line {
+                spans,
+                style,
+                alignment,
+            } = line;
+            laid_out.push(Line {
+                spans: clip_spans_to_width(spans, width),
+                style,
+                alignment,
+            });
+            continue;
+        }
+
+        // 3. 일반 줄
+        if wrap_prose {
+            laid_out.extend(wrap_styled_line(line, width));
+        } else {
+            laid_out.push(line);
+        }
+    }
+    (laid_out, row_starts)
+}
+
+// 15. 스타일 유지 줄바꿈 ------------------------------------------------------
+// 공백 뒤 줄나눔, 긴 낱말은 글자 단위, 이어지는 줄은 앞 공백·불릿만큼 들여쓰기
+fn wrap_styled_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let Line {
+        spans,
+        style,
+        alignment,
+    } = line;
+
+    // 1. 글자별 (글자, 스타일, 표시 폭)
+    let letters: Vec<(char, Style, usize)> = spans
+        .iter()
+        .flat_map(|span| {
+            span.content.chars().map(move |letter| {
+                (
+                    letter,
+                    span.style,
+                    UnicodeWidthChar::width(letter).unwrap_or(0),
+                )
+            })
+        })
+        .collect();
+
+    // 2. 이어지는 줄 들여쓰기 (앞 공백 + 불릿, 폭의 절반 이하)
+    let leading_spaces = letters
+        .iter()
+        .take_while(|(letter, _, _)| *letter == ' ')
+        .count();
+    let bullet_extra = match letters.get(leading_spaces) {
+        Some(('\u{2022}', _, _)) => 2,
+        _ => 0,
+    };
+    let hang = (leading_spaces + bullet_extra).min(width / 2);
+    let hang_cells: Vec<(char, Style, usize)> = vec![(' ', Style::default(), 1); hang];
+
+    // 3. 행 채움 (넘치면 마지막 공백 뒤에서, 없으면 현재 위치에서 나눠 다음 줄로)
+    let mut rows: Vec<Vec<(char, Style, usize)>> = Vec::new();
+    let mut row: Vec<(char, Style, usize)> = Vec::new();
+    let mut row_width = 0usize;
+    let mut break_at: Option<usize> = None;
+    for cell in letters {
+        if cell.0 == ' ' && row_width + cell.2 > width && row.len() > hang {
+            rows.push(std::mem::replace(&mut row, hang_cells.clone()));
+            row_width = hang;
+            break_at = None;
+            continue;
+        }
+        while cell.0 != ' ' && row_width + cell.2 > width && row.len() > hang {
+            let split = break_at.filter(|at| *at > hang).unwrap_or(row.len());
+            let carried = row.split_off(split);
+            rows.push(std::mem::replace(&mut row, hang_cells.clone()));
+            row.extend(carried);
+            row_width = row.iter().map(|(_, _, shown)| *shown).sum();
+            break_at = None;
+        }
+        if cell.0 == ' ' && row.len() >= hang {
+            break_at = Some(row.len() + 1);
+        }
+        row_width += cell.2;
+        row.push(cell);
+    }
+    if row.len() > hang || rows.is_empty() {
+        rows.push(row);
+    }
+
+    // 4. 같은 스타일 글자를 조각으로 묶어 줄 생성
+    rows.into_iter()
+        .map(|cells| {
+            let mut pieces: Vec<Span<'static>> = Vec::new();
+            let mut piece = String::new();
+            let mut piece_style = Style::default();
+            for (letter, letter_style, _) in cells {
+                if !piece.is_empty() && letter_style != piece_style {
+                    pieces.push(Span::styled(std::mem::take(&mut piece), piece_style));
+                }
+                piece_style = letter_style;
+                piece.push(letter);
+            }
+            if !piece.is_empty() {
+                pieces.push(Span::styled(piece, piece_style));
+            }
+            Line {
+                spans: pieces,
+                style,
+                alignment,
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn prose_wraps_at_word_boundaries_without_losing_words() {
+        let source = "alpha beta gamma delta epsilon zeta eta theta";
+        let (rows, starts) = layout_text_lines(vec![Line::from(source)], 16, true);
+        assert!(rows.len() > 1);
+        assert_eq!(starts, vec![0]);
+        for row in &rows {
+            assert!(row.width() <= 16, "{}", line_text(row));
+        }
+        let words: Vec<String> = rows
+            .iter()
+            .flat_map(|row| {
+                line_text(row)
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(words.join(" "), source);
+    }
+
+    #[test]
+    fn bullet_lines_wrap_with_hanging_indent_and_keep_styles() {
+        let bullet = Line::from(vec![
+            Span::styled("  \u{2022} ", theme::STYLE_OK),
+            Span::styled("가나다 라마바 사아자 차카타 파하", theme::STYLE_TEXT),
+        ]);
+        let (rows, _) = layout_text_lines(vec![bullet], 20, true);
+        assert!(rows.len() > 1);
+        assert!(line_text(&rows[0]).starts_with("  \u{2022} 가나다"));
+        assert_eq!(rows[0].spans[0].style, theme::STYLE_OK);
+        for row in &rows[1..] {
+            assert!(line_text(row).starts_with("    "), "{}", line_text(row));
+            assert!(!line_text(row).starts_with("     "), "{}", line_text(row));
+            assert!(row.width() <= 20);
+        }
+    }
+
+    #[test]
+    fn box_table_lines_are_clipped_with_ellipsis_not_wrapped() {
+        let rule = format!("┌{}┐", "─".repeat(30));
+        let (rows, starts) =
+            layout_text_lines(vec![Line::from(rule), Line::from("short")], 12, true);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(starts, vec![0, 1]);
+        assert_eq!(rows[0].width(), 12);
+        assert!(line_text(&rows[0]).ends_with('…'));
+        assert_eq!(line_text(&rows[1]), "short");
+    }
+
+    #[test]
+    fn fixed_row_cards_keep_one_row_per_line() {
+        let long = "word ".repeat(20);
+        let (rows, starts) = layout_text_lines(vec![Line::from(long), Line::from("x")], 10, false);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(starts, vec![0, 1]);
+    }
+
+    #[test]
+    fn start_rows_follow_wrapped_row_counts() {
+        let lines = vec![
+            Line::from("short"),
+            Line::from("one two three four five six seven eight nine ten"),
+            Line::from("tail"),
+        ];
+        let (rows, starts) = layout_text_lines(lines, 12, true);
+        assert_eq!(starts[0], 0);
+        assert_eq!(starts[1], 1);
+        assert!(starts[2] > 2);
+        assert_eq!(starts[2], rows.len() - 1);
+    }
 }

@@ -6,20 +6,8 @@ use chrono::{DateTime, Local};
 use ratatui::text::Span;
 
 // 1. 천 단위 구분 정수 --------------------------------------------------------
-pub fn format_count(amount: i64) -> String {
-    let digits = amount.unsigned_abs().to_string();
-    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3 + 1);
-    if amount < 0 {
-        grouped.push('-');
-    }
-    for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
-            grouped.push(',');
-        }
-        grouped.push(digit);
-    }
-    grouped
-}
+// 리포트와 공용 (구현은 report/render.rs)
+pub use crate::report::format_count;
 
 // 2. 토큰 축약 (K, M, B) ------------------------------------------------------
 pub fn format_compact(amount: i64) -> String {
