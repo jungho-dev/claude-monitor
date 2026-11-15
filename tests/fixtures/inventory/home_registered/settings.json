@@ -1,0 +1,69 @@
+{
+  "env": {
+    "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+    "OTEL_LOGS_EXPORTER": "otlp",
+    "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:48381",
+    "OTEL_EXPORTER_OTLP_PROTOCOL": "http/json",
+    "SAMPLE_SECRET_TOKEN": "dummy-secret-value-do-not-leak"
+  },
+  "allowedHttpHookUrls": [
+    "http://127.0.0.1:48383/hook/*"
+  ],
+  "deniedMcpServers": [
+    { "serverName": "blocked-docs" },
+    { "serverName": "web-tool" }
+  ],
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:48383/hook/pretool-chain",
+            "timeout": 10,
+            "onFailure": "block"
+          }
+        ]
+      },
+      {
+        "matcher": "^Grep$",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://user:dummy-hook-secret@127.0.0.1:48383/hook/relay/search-augment?token=dummy-query-secret#frag",
+            "if": "Bash(rg *)",
+            "timeout": 5,
+            "onFailure": "continue"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun",
+            "args": ["C:/dummy/hooks/server/ensure.ts", "--secret-flag", "dummy-arg-secret"],
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "^idle$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "C:/tools/python.exe",
+            "args": ["-u", "C:/dummy/notify/notify.py"],
+            "async": true,
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

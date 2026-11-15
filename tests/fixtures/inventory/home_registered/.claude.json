@@ -1,0 +1,20 @@
+{
+  "numStartups": 3,
+  "mcpServers": {
+    "alpha-fs": {
+      "type": "stdio",
+      "command": "C:/tools/alpha-fs.exe",
+      "args": ["--secret-arg"],
+      "env": { "API_KEY": "dummy-mcp-key" }
+    },
+    "beta-remote": {
+      "type": "http",
+      "url": "https://user:dummy-userinfo-secret@example.test:8443/mcp/path?key=dummy-url-secret#frag",
+      "headers": { "Authorization": "Bearer dummy-header-secret" }
+    },
+    "web-tool": {
+      "command": "C:/tools/web-tool.exe",
+      "args": []
+    }
+  }
+}

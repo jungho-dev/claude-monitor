@@ -1,0 +1,25 @@
+{
+  "env": {
+    "DISABLE_TELEMETRY": "1",
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:48382",
+    "CLAUDE_CODE_ENABLE_TELEMETRY": "0"
+  },
+  "allowedHttpHookUrls": [
+    "http://127.0.0.1:47321/hook/*"
+  ],
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:47321/hook/pretool-guard",
+            "timeout": 10,
+            "onFailure": "block"
+          }
+        ]
+      }
+    ]
+  }
+}

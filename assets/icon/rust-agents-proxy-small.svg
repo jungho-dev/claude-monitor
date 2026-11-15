@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <!-- rust-agents-proxy 소형 원본 (16~32px): 굵은 외곽선, 여백 축소 -->
+  <rect x="0" y="0" width="256" height="256" rx="48" ry="48" fill="#121316"/>
+  <rect x="52" y="52" width="108" height="108" rx="20" ry="20" fill="none" stroke="#f3efe8" stroke-width="24"/>
+  <rect x="96" y="96" width="120" height="120" rx="22" ry="22" fill="#e2572b"/>
+</svg>

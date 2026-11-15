@@ -1,0 +1,38 @@
+{
+  "resourceLogs": [
+    {
+      "scopeLogs": [
+        {
+          "logRecords": [
+            {
+              "attributes": [
+                { "key": "event.name", "value": { "stringValue": "api_request" } },
+                { "key": "event.timestamp", "value": { "stringValue": "2026-11-15T09:30:01+09:00" } },
+                { "key": "event.sequence", "value": { "intValue": "3" } },
+                { "key": "session.id", "value": { "stringValue": "sess-3" } },
+                { "key": "query_source", "value": { "stringValue": "repl_main_thread" } }
+              ]
+            },
+            {
+              "attributes": [
+                { "key": "event.name", "value": { "stringValue": "hook_execution_complete" } },
+                { "key": "event.timestamp", "value": { "stringValue": "2026-11-15T00:30:02Z" } },
+                { "key": "session.id", "value": { "stringValue": "sess-3" } },
+                { "key": "hook_name", "value": { "stringValue": "PostToolUse:Edit" } },
+                { "key": "num_blocking", "value": { "intValue": "0" } },
+                { "key": "num_non_blocking_error", "value": { "intValue": "2" } },
+                { "key": "total_duration_ms", "value": { "intValue": "9" } }
+              ]
+            },
+            {
+              "attributes": [
+                { "key": "event.name", "value": { "stringValue": "tool_result" } },
+                { "key": "session.id", "value": { "stringValue": "sess-3" } }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

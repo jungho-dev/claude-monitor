@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "parent-server": {
+      "command": "C:/tools/parent-server.exe"
+    }
+  }
+}

@@ -1,0 +1,84 @@
+{
+  "resourceLogs": [
+    {
+      "resource": {
+        "attributes": [
+          { "key": "service.name", "value": { "stringValue": "claude-code" } }
+        ]
+      },
+      "scopeLogs": [
+        {
+          "scope": { "name": "com.anthropic.claude_code.events" },
+          "logRecords": [
+            {
+              "timeUnixNano": "1763200000000000000",
+              "body": { "stringValue": "claude_code.api_request" },
+              "attributes": [
+                { "key": "event.name", "value": { "stringValue": "api_request" } },
+                { "key": "event.timestamp", "value": { "stringValue": "2025-11-15T09:46:40.123Z" } },
+                { "key": "event.sequence", "value": { "intValue": "7" } },
+                { "key": "session.id", "value": { "stringValue": "sess-1" } },
+                { "key": "request_id", "value": { "stringValue": "req_abc" } },
+                { "key": "model", "value": { "stringValue": "claude-opus-4-1" } },
+                { "key": "input_tokens", "value": { "intValue": "1200" } },
+                { "key": "output_tokens", "value": { "intValue": 340 } },
+                { "key": "cache_read_tokens", "value": { "intValue": "9000" } },
+                { "key": "cache_creation_tokens", "value": { "intValue": "150" } },
+                { "key": "duration_ms", "value": { "doubleValue": 2345.6 } },
+                { "key": "query_source", "value": { "stringValue": "repl_main_thread" } }
+              ]
+            },
+            {
+              "timeUnixNano": "1763200001000000000",
+              "body": { "stringValue": "claude_code.tool_result" },
+              "attributes": [
+                { "key": "event.name", "value": { "stringValue": "claude_code.tool_result" } },
+                { "key": "event.sequence", "value": { "intValue": "8" } },
+                { "key": "session.id", "value": { "stringValue": "sess-1" } },
+                { "key": "tool_use_id", "value": { "stringValue": "toolu_01ABC" } },
+                { "key": "tool_name", "value": { "stringValue": "Bash" } },
+                { "key": "success", "value": { "stringValue": "false" } },
+                { "key": "duration_ms", "value": { "intValue": "812" } },
+                { "key": "error_type", "value": { "stringValue": "Interrupted" } },
+                { "key": "agent.name", "value": { "stringValue": "worker" } }
+              ]
+            },
+            {
+              "timeUnixNano": "1763200002000000000",
+              "body": { "stringValue": "claude_code.hook_execution_complete" },
+              "attributes": [
+                { "key": "event.name", "value": { "stringValue": "hook_execution_complete" } },
+                { "key": "event.sequence", "value": { "intValue": "9" } },
+                { "key": "session.id", "value": { "stringValue": "sess-1" } },
+                { "key": "hook_name", "value": { "stringValue": "PreToolUse:Bash" } },
+                { "key": "num_blocking", "value": { "intValue": "1" } },
+                { "key": "num_non_blocking_error", "value": { "intValue": "0" } },
+                { "key": "total_duration_ms", "value": { "intValue": "35" } }
+              ]
+            },
+            {
+              "timeUnixNano": "1763200003000000000",
+              "body": { "stringValue": "claude_code.user_prompt" },
+              "attributes": [
+                { "key": "event.name", "value": { "stringValue": "user_prompt" } },
+                { "key": "session.id", "value": { "stringValue": "sess-1" } },
+                { "key": "prompt", "value": { "stringValue": "SECRET PROMPT TEXT" } }
+              ]
+            },
+            {
+              "timeUnixNano": "1763200004000000000",
+              "body": { "stringValue": "claude_code.api_request" },
+              "attributes": [
+                { "key": "session.id", "value": { "stringValue": "sess-2" } },
+                { "key": "client_request_id", "value": { "stringValue": "client-9" } },
+                { "key": "model", "value": { "stringValue": "claude-sonnet-4-5" } },
+                { "key": "input_tokens", "value": { "intValue": "10" } },
+                { "key": "agent.name", "value": { "stringValue": "reviewer" } }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
