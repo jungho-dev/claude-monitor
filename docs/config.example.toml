@@ -1,0 +1,48 @@
+# config.example.toml
+# Copy this file to ~/.config/claude-monitor/config.toml (on Windows %USERPROFILE%\.config\claude-monitor\config.toml) and it loads automatically; --config <path> or CM_CONFIG overrides it.
+# Every key is optional; an omitted key keeps the default shown below
+
+# data_dir holds the database, token, log, and reports; it defaults to ~/.config/claude-monitor (the folder of this file), and CM_DATA_DIR overrides that default
+# data_dir = "C:/Users/<user>/.config/claude-monitor"
+# claude_home = "C:/Users/<user>/.claude"
+
+# Ports (bound to 127.0.0.1 only)
+[ports]
+admin = 47330
+otlp = 47331
+gateway = 47332
+hooks = 47333
+
+# API gateway (use with ANTHROPIC_BASE_URL=http://127.0.0.1:47332)
+[gateway]
+enabled = true
+upstream = "https://api.anthropic.com"
+upstream_timeout_secs = 900
+
+# Hook acceleration (pretool-chain: rewrite, then the existing guard checks again)
+[hooks]
+enabled = true
+relay_target = "http://127.0.0.1:47321"
+rewrite_enabled = true
+guard_deadline_ms = 3000
+
+# Session transcript index
+[indexer]
+enabled = true
+# projects_dir = "C:/Users/<user>/.claude/projects"
+interval_secs = 30
+backfill_days = 7
+
+# Daily report
+[report]
+enabled = true
+# dir = "C:/Users/<user>/.config/claude-monitor/reports"
+run_hour = 0
+
+# Modern Standby handling (sleep postponement, standby gap detection, resume hints)
+[power]
+enabled = true
+keep_awake = true
+awake_grace_secs = 600
+gap_threshold_secs = 60
+hint_window_secs = 1800

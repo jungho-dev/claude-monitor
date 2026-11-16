@@ -239,17 +239,17 @@ impl PowerState {
             HintEvent::ToolFailure {
                 duration_ms: Some(_),
             } => format!(
-                "[rap standby] 이 도구 실행 중 PC 가 최신 대기 모드였음: {span_text}. \
+                "[cm standby] 이 도구 실행 중 PC 가 최신 대기 모드였음: {span_text}. \
                  이 실패는 환경 원인일 가능성이 높음. 접근 방식을 바꾸지 말고 남은 부분 결과를 \
                  확인한 뒤 같은 단계를 한 번 다시 실행할 것."
             ),
             HintEvent::ToolFailure { duration_ms: None } => format!(
-                "[rap standby] 최근 PC 가 최신 대기 모드였음: {span_text}. \
+                "[cm standby] 최근 PC 가 최신 대기 모드였음: {span_text}. \
                  이 실패의 실행 시간은 알 수 없음. 오류가 시간 초과나 연결 끊김일 때만 대기 \
                  원인으로 보고 같은 단계를 한 번 다시 실행하고, 그 밖의 오류는 평소대로 다룰 것."
             ),
             HintEvent::PromptSubmit => format!(
-                "[rap standby] 직전에 PC 가 최신 대기 모드였음: {span_text}. \
+                "[cm standby] 직전에 PC 가 최신 대기 모드였음: {span_text}. \
                  이 구간에 걸친 도구 실행, API 요청, 서브에이전트는 시간 초과나 연결 끊김으로 \
                  끝났을 수 있음. 진행 중이던 작업의 실제 상태를 먼저 확인하고, 대기로 끊긴 단계는 \
                  같은 방법으로 다시 실행할 것."
@@ -260,10 +260,10 @@ impl PowerState {
 }
 
 // 6. 감시 스레드 --------------------------------------------------------------
-/// `rap-power` 스레드 기동 (절전 유예 요청은 스레드 단위).
+/// `cm-power` 스레드 기동 (절전 유예 요청은 스레드 단위).
 pub fn spawn_power_monitor(ctx: Arc<AppContext>) -> io::Result<()> {
     thread::Builder::new()
-        .name("rap-power".to_string())
+        .name("cm-power".to_string())
         .spawn(move || {
             // 1. 시작 상태 (유예 없음, 첫 호출 반환값 0 대비 예비 호출)
             let _exit_guard = MonitorExitGuard { ctx: &ctx };
@@ -304,7 +304,7 @@ pub fn spawn_power_monitor(ctx: Arc<AppContext>) -> io::Result<()> {
                         gap.id,
                         (gap.end_ms - gap.start_ms) / 1000
                     );
-                    let _ = writeln!(io::stderr(), "[rap] {text}");
+                    let _ = writeln!(io::stderr(), "[cm] {text}");
                     let _ = ctx.live_tx.send(LiveEvent::Notice {
                         ts: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
                         level: "warn".to_string(),
@@ -321,7 +321,7 @@ pub fn spawn_power_monitor(ctx: Arc<AppContext>) -> io::Result<()> {
                     } else {
                         let _ = writeln!(
                             io::stderr(),
-                            "[rap] SetThreadExecutionState 실패 (요청 {})",
+                            "[cm] SetThreadExecutionState 실패 (요청 {})",
                             outcome.hold
                         );
                     }
@@ -342,8 +342,8 @@ impl Drop for MonitorExitGuard<'_> {
         let power = &self.ctx.power;
         power.last_tick_ms.store(0, Ordering::Relaxed);
         power.holding.store(false, Ordering::Relaxed);
-        let text = "rap-power 종료: 대기 감시 중단 (serve 계속)".to_string();
-        let _ = writeln!(io::stderr(), "[rap] {text}");
+        let text = "cm-power 종료: 대기 감시 중단 (serve 계속)".to_string();
+        let _ = writeln!(io::stderr(), "[cm] {text}");
         let _ = self.ctx.live_tx.send(LiveEvent::Notice {
             ts: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
             level: "warn".to_string(),

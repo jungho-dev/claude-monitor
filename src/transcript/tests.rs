@@ -186,6 +186,13 @@ fn denial_text_keeps_only_labels() {
         ("PreToolUse:Bash", "cli-guard", "cat")
     );
 
+    let english = parse_denial_text(
+        "PreToolUse:Bash hook error: \n[cli-guard]\nHang/recursive search form blocked (detected: eza). Rewrite",
+        "Bash",
+    )
+    .expect("cli-guard english");
+    assert_eq!(english.command, "eza");
+
     let code = parse_denial_text(" [code-guard] 규칙", "Write").expect("code-guard");
     assert_eq!(
         (

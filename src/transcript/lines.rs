@@ -7,6 +7,7 @@ use std::fmt;
 
 const TEXT_PREFIX_LIMIT: usize = 400;
 const LABEL_LIMIT: usize = 40;
+const DENIAL_NAME_MARKERS: [&str; 2] = ["(detected: ", "(감지: "];
 
 // 1. 기록 한 줄 ---------------------------------------------------------------
 #[derive(Debug, Default, Deserialize)]
@@ -187,8 +188,10 @@ pub fn parse_denial_text(text: &str, fallback_tool: &str) -> Option<DenialMark> 
 
     // 3. 감지 명령 이름
     let mut command = String::new();
-    if let Some(found_at) = rest.find("(감지: ") {
-        let after = &rest["(감지: ".len() + found_at..];
+    let found = DENIAL_NAME_MARKERS
+        .iter()
+        .find_map(|marker| rest.find(marker).map(|at| &rest[at + marker.len()..]));
+    if let Some(after) = found {
         let name = after.split(')').next().unwrap_or("");
         if !name.is_empty()
             && name.len() <= LABEL_LIMIT

@@ -9,7 +9,6 @@ use crate::store::query::{
 use crate::tui::cards::{CARD_COUNT, CardId};
 use crate::tui::format::{short_model, short_tool};
 use crate::tui::poller::live_event_timestamp;
-use crate::tui::theme;
 use crate::tui::views::feed::feed_event_name;
 use std::cmp::Ordering;
 
@@ -28,7 +27,7 @@ pub const SORTABLE_CARDS: [CardId; 10] = [
 ];
 
 // 1. 정렬 상태 ----------------------------------------------------------------
-// 열 종류 (비교 규칙은 아래 타입별 비교 함수가 소유, 새 열은 항상 오름차순에서 시작)
+// 열 종류 (비교 규칙은 아래 타입별 비교 함수가 소유, Number = 숫자·시간 열은 내림차순, Text 는 오름차순에서 시작)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortKind {
     Text,
@@ -57,16 +56,16 @@ pub enum SortChange {
 }
 
 impl SortState {
-    // 정렬 순환: 다른 열은 오름차순 시작, 같은 열은 오름 -> 내림 -> 카드 기본 정렬 (머리글 클릭·S 공용)
-    // 기본 정렬 열은 기본 방향이 곧 꺼짐 상태라 오름과 내림만 번갈아 바뀜
+    // 정렬 순환: 새 열은 숫자·시간 열이 내림차순, 문자 열이 오름차순에서 시작하고 같은 열은 처음 방향 -> 반대 방향 -> 카드 기본 정렬 (머리글 클릭·S 공용)
+    // 기본 정렬 열은 기본 방향이 곧 꺼짐 상태라 두 방향만 번갈아 바뀜
     pub fn apply_change(&mut self, change: SortChange, spec: SortSpec) {
         let column_count = spec.kinds.len().max(1);
 
-        // 1. 요청 해석 (s 는 다음 열 오름차순, 클릭·S 는 대상 열의 순환)
+        // 1. 요청 해석 (s 는 다음 열의 처음 방향, 클릭·S 는 대상 열의 순환)
         let column = match change {
             SortChange::NextColumn => {
                 self.column = (self.column + 1) % column_count;
-                self.descending = false;
+                self.descending = first_descending(spec, self.column);
                 return;
             }
             SortChange::SelectColumn(column) => column,
@@ -76,18 +75,17 @@ impl SortState {
             return;
         }
 
-        // 2. 다른 열은 오름차순 시작
+        // 2. 다른 열은 그 열의 처음 방향에서 시작
+        let first = first_descending(spec, column);
         if self.column != column {
             self.column = column;
-            self.descending = false;
+            self.descending = first;
             return;
         }
 
-        // 3. 같은 열: 오름 -> 내림, 내림은 기본 정렬로 (이미 기본이면 오름)
-        if !self.descending {
-            self.descending = true;
-        } else if *self == spec.default {
-            self.descending = false;
+        // 3. 같은 열: 처음 방향 -> 반대 방향, 반대 방향은 기본 정렬로 (이미 기본이면 처음 방향)
+        if self.descending == first || *self == spec.default {
+            self.descending = !self.descending;
         } else {
             *self = spec.default;
         }
@@ -96,6 +94,11 @@ impl SortState {
     pub fn sort_arrow(self) -> &'static str {
         if self.descending { "↓" } else { "↑" }
     }
+}
+
+// 열의 처음 정렬 방향 (숫자·시간은 큰·최근 값 먼저, 문자는 오름차순)
+fn first_descending(spec: SortSpec, column: usize) -> bool {
+    spec.kinds.get(column) == Some(&SortKind::Number)
 }
 
 // 2. 카드별 정렬 규칙 ---------------------------------------------------------
@@ -107,8 +110,8 @@ pub fn sort_spec(card: CardId) -> Option<SortSpec> {
                 SortKind::Number,
                 SortKind::Text,
                 SortKind::Text,
-                SortKind::Text,
                 SortKind::Number,
+                SortKind::Text,
                 SortKind::Number,
                 SortKind::Number,
                 SortKind::Number,
@@ -292,14 +295,22 @@ pub fn compare_tool_row(left: &ToolLatencyRow, right: &ToolLatencyRow, column: u
     }
 }
 
+// 훅 판정 순서는 표시 언어와 무관 (모르는 값, 거부, 오류, 재작성, 허용)
+fn outcome_rank(outcome: &str) -> u8 {
+    match outcome {
+        "deny" => 1,
+        "error" => 2,
+        "rewrite" => 3,
+        "allow" => 4,
+        _ => 0,
+    }
+}
+
 pub fn compare_hook_row(left: &HookStatRow, right: &HookStatRow, column: usize) -> Ordering {
     match column {
         0 => compare_display_text(&left.route, &right.route),
         1 => compare_display_text(&left.guard, &right.guard),
-        2 => compare_display_text(
-            theme::outcome_label(&left.outcome),
-            theme::outcome_label(&right.outcome),
-        ),
+        2 => outcome_rank(&left.outcome).cmp(&outcome_rank(&right.outcome)),
         3 => compare_display_text(&left.detail, &right.detail),
         4 => left.count.cmp(&right.count),
         5 => left.p50_ms.cmp(&right.p50_ms),
@@ -367,13 +378,14 @@ pub fn compare_cache_break_row(
     }
 }
 
-// 피드 열: 시각, 종류, 이름, 에이전트, 입력, 출력, 캐시읽기, 소요 (화면에 보이는 값 기준)
+// 피드 열: 시각, 종류, 이름, 소요, 에이전트, 입력, 출력, 캐시읽기 (화면에 보이는 값 기준)
 pub fn compare_event_row(left: &LiveEvent, right: &LiveEvent, column: usize) -> Ordering {
-    let kind_label = |event: &LiveEvent| match event {
-        LiveEvent::Api(_) => "API",
-        LiveEvent::Tool(_) => "도구",
-        LiveEvent::Hook(_) => "훅",
-        LiveEvent::Notice { .. } => "알림",
+    // 종류는 표시 언어와 무관한 고정 순서 (API, 도구, 알림, 훅)
+    let kind_rank = |event: &LiveEvent| match event {
+        LiveEvent::Api(_) => 0,
+        LiveEvent::Tool(_) => 1,
+        LiveEvent::Notice { .. } => 2,
+        LiveEvent::Hook(_) => 3,
     };
     let agent_label = |event: &LiveEvent| match event {
         LiveEvent::Api(row) => row.agent.clone(),
@@ -396,13 +408,13 @@ pub fn compare_event_row(left: &LiveEvent, right: &LiveEvent, column: usize) -> 
     };
     match column {
         0 => live_event_timestamp(left).cmp(live_event_timestamp(right)),
-        1 => compare_display_text(kind_label(left), kind_label(right)),
+        1 => kind_rank(left).cmp(&kind_rank(right)),
         2 => compare_display_text(&feed_event_name(left), &feed_event_name(right)),
-        3 => compare_display_text(&agent_label(left), &agent_label(right)),
-        4 => token_count(left, 0).cmp(&token_count(right, 0)),
-        5 => token_count(left, 1).cmp(&token_count(right, 1)),
-        6 => token_count(left, 2).cmp(&token_count(right, 2)),
-        7 => duration(left).cmp(&duration(right)),
+        3 => duration(left).cmp(&duration(right)),
+        4 => compare_display_text(&agent_label(left), &agent_label(right)),
+        5 => token_count(left, 0).cmp(&token_count(right, 0)),
+        6 => token_count(left, 1).cmp(&token_count(right, 1)),
+        7 => token_count(left, 2).cmp(&token_count(right, 2)),
         _ => Ordering::Equal,
     }
 }
@@ -478,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn next_column_starts_each_column_ascending_and_wraps() {
+    fn next_column_starts_numbers_descending_and_text_ascending_and_wraps() {
         let mut state = SortState {
             column: 1,
             descending: true,
@@ -491,26 +503,26 @@ mod tests {
         assert_eq!(
             visited,
             [
-                (2, false),
-                (3, false),
-                (4, false),
-                (5, false),
+                (2, true),
+                (3, true),
+                (4, true),
+                (5, true),
                 (0, false),
-                (1, false)
+                (1, true)
             ]
         );
     }
 
     #[test]
-    fn reverse_direction_cycles_ascending_descending_default() {
+    fn reverse_direction_on_a_number_column_cycles_descending_ascending_default() {
         let mut state = SortState {
             column: 1,
-            descending: false,
+            descending: true,
         };
-        assert_eq!(state.sort_arrow(), "↑");
-        state.apply_change(SortChange::ReverseDirection, tool_spec());
-        assert_eq!((state.column, state.descending), (1, true));
         assert_eq!(state.sort_arrow(), "↓");
+        state.apply_change(SortChange::ReverseDirection, tool_spec());
+        assert_eq!((state.column, state.descending), (1, false));
+        assert_eq!(state.sort_arrow(), "↑");
 
         // 세 번째는 카드 기본 정렬 (도구: 합계 내림차순)
         state.apply_change(SortChange::ReverseDirection, tool_spec());
@@ -518,8 +530,62 @@ mod tests {
     }
 
     #[test]
-    fn three_clicks_on_one_header_return_to_the_default_sort() {
+    fn reverse_direction_on_a_text_column_cycles_ascending_descending_default() {
         let spec = tool_spec();
+        let mut state = SortState {
+            column: 0,
+            descending: false,
+        };
+        state.apply_change(SortChange::ReverseDirection, spec);
+        assert_eq!((state.column, state.descending), (0, true));
+        state.apply_change(SortChange::ReverseDirection, spec);
+        assert_eq!(state, spec.default);
+    }
+
+    #[test]
+    fn number_column_clicks_run_descending_ascending_then_the_card_default() {
+        // 도구 표 호출 수 열 (숫자): 기본 정렬은 다른 열
+        let spec = tool_spec();
+        assert_eq!(spec.kinds[1], SortKind::Number);
+        let mut state = spec.default;
+        state.apply_change(SortChange::SelectColumn(1), spec);
+        assert_eq!((state.column, state.descending), (1, true));
+        state.apply_change(SortChange::SelectColumn(1), spec);
+        assert_eq!((state.column, state.descending), (1, false));
+        state.apply_change(SortChange::SelectColumn(1), spec);
+        assert_eq!(state, spec.default);
+
+        // 다시 누르면 처음부터
+        state.apply_change(SortChange::SelectColumn(1), spec);
+        assert_eq!((state.column, state.descending), (1, true));
+    }
+
+    #[test]
+    fn time_column_clicks_run_latest_first_oldest_first_then_the_card_default() {
+        // 모델 표 마지막 시각 열 (시간): 기본 정렬은 요청 수 열
+        let spec = sort_spec(CardId::ModelTable).unwrap();
+        assert_eq!(spec.kinds[12], SortKind::Number);
+        let mut state = spec.default;
+        state.apply_change(SortChange::SelectColumn(12), spec);
+        assert_eq!((state.column, state.descending), (12, true));
+        state.apply_change(SortChange::SelectColumn(12), spec);
+        assert_eq!((state.column, state.descending), (12, false));
+        state.apply_change(SortChange::SelectColumn(12), spec);
+        assert_eq!(state, spec.default);
+
+        // 이벤트 피드 시각 열: 기본이 최근 먼저라 오름과 내림만 번갈아 바뀜
+        let feed = sort_spec(CardId::EventFeed).unwrap();
+        let mut state = feed.default;
+        state.apply_change(SortChange::SelectColumn(0), feed);
+        assert_eq!((state.column, state.descending), (0, false));
+        state.apply_change(SortChange::SelectColumn(0), feed);
+        assert_eq!(state, feed.default);
+    }
+
+    #[test]
+    fn text_column_clicks_run_ascending_descending_then_the_card_default() {
+        let spec = tool_spec();
+        assert_eq!(spec.kinds[0], SortKind::Text);
         let mut state = spec.default;
         state.apply_change(SortChange::SelectColumn(0), spec);
         assert_eq!((state.column, state.descending), (0, false));
@@ -534,29 +600,31 @@ mod tests {
     }
 
     #[test]
-    fn a_different_header_always_starts_ascending() {
+    fn a_different_header_starts_in_its_own_first_direction() {
         let spec = tool_spec();
         let mut state = SortState {
             column: 0,
             descending: true,
         };
         state.apply_change(SortChange::SelectColumn(4), spec);
-        assert_eq!((state.column, state.descending), (4, false));
-        state.apply_change(SortChange::SelectColumn(4), spec);
         assert_eq!((state.column, state.descending), (4, true));
+        state.apply_change(SortChange::SelectColumn(4), spec);
+        assert_eq!((state.column, state.descending), (4, false));
 
-        // 순환 중간에 다른 열을 누르면 그 열이 오름차순부터
+        // 순환 중간에 다른 열을 누르면 그 열이 처음 방향부터 (숫자는 내림, 문자는 오름)
         state.apply_change(SortChange::SelectColumn(1), spec);
-        assert_eq!((state.column, state.descending), (1, false));
+        assert_eq!((state.column, state.descending), (1, true));
+        state.apply_change(SortChange::SelectColumn(0), spec);
+        assert_eq!((state.column, state.descending), (0, false));
 
         // 범위 밖 열은 무시
         state.apply_change(SortChange::SelectColumn(99), spec);
-        assert_eq!((state.column, state.descending), (1, false));
+        assert_eq!((state.column, state.descending), (0, false));
     }
 
     #[test]
     fn default_column_alternates_between_its_two_directions() {
-        // 기본이 내림차순인 열: 기본 방향이 곧 꺼짐 상태라 오름 -> 내림(기본) -> 오름
+        // 기본이 내림차순인 숫자 열: 내림(기본) -> 오름 -> 내림(기본)
         let spec = tool_spec();
         let mut state = spec.default;
         state.apply_change(SortChange::SelectColumn(5), spec);

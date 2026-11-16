@@ -191,7 +191,7 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Incoming>) -> Resp
                     "error": {
                         "type": "api_error",
                         "message": format!(
-                            "rap gateway upstream timeout: no response headers within {}s",
+                            "cm gateway upstream timeout: no response headers within {}s",
                             upstream_timeout.as_secs()
                         ),
                     },
@@ -215,7 +215,7 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Incoming>) -> Resp
                     "type": "error",
                     "error": {
                         "type": "api_error",
-                        "message": format!("rap gateway upstream error: {message}"),
+                        "message": format!("cm gateway upstream error: {message}"),
                     },
                 }),
             );

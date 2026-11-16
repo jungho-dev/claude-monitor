@@ -5,6 +5,9 @@ use crate::report::table::convert_pipe_tables;
 use chrono::{DateTime, Local};
 use ratatui::text::Span;
 
+// 카드 제목 안 구간 구분 (i18n 의 정렬·이동 제목 조립과 같은 기호)
+const TITLE_SEPARATOR: &str = " · ";
+
 // 1. 천 단위 구분 정수 --------------------------------------------------------
 // 리포트와 공용 (구현은 report/render.rs)
 pub use crate::report::format_count;
@@ -72,6 +75,14 @@ pub fn fit_display(text: &str, width: usize) -> String {
         used += 1;
     }
     fitted
+}
+
+// 4-1. 제어 문자 정리 ---------------------------------------------------------
+// 표 칸에 그대로 쓰는 외부 문자열(설정 파일·기록 원문)의 제어 문자를 공백으로 바꿈 (칸 안 줄바꿈·탭이 화면 격자를 깨지 않도록)
+pub fn replace_control_chars(text: &str) -> String {
+    text.chars()
+        .map(|letter| if letter.is_control() { ' ' } else { letter })
+        .collect()
 }
 
 // 5. 시각 표시 ----------------------------------------------------------------
@@ -147,6 +158,21 @@ pub fn fit_display_middle(text: &str, width: usize) -> String {
     fitted.push('…');
     fitted.push_str(tail);
     fitted
+}
+
+// 8-1. 카드 제목 맞춤 ---------------------------------------------------------
+// 폭을 넘으면 " · " 구간을 마지막 구간 앞에서부터 덜어내 첫 구간과 마지막 구간(정렬 표시)을 남기고, 그래도 넘으면 끝 말줄임
+pub fn fit_title_segments(title: &str, width: usize) -> String {
+    let mut segments: Vec<&str> = title.split(TITLE_SEPARATOR).collect();
+    let mut joined = segments.join(TITLE_SEPARATOR);
+    while segments.len() > 2 && Span::raw(joined.as_str()).width() > width {
+        segments.remove(segments.len() - 2);
+        joined = segments.join(TITLE_SEPARATOR);
+    }
+    if Span::raw(joined.as_str()).width() <= width {
+        return joined;
+    }
+    fit_display(&joined, width).trim_end().to_string()
 }
 
 // 9. 오른쪽 정렬 --------------------------------------------------------------
@@ -301,6 +327,13 @@ mod tests {
     }
 
     #[test]
+    fn control_characters_become_spaces_and_everything_else_stays() {
+        assert_eq!(replace_control_chars("a\tb\nc\u{7}d"), "a b c d");
+        assert_eq!(replace_control_chars("한글 abc"), "한글 abc");
+        assert_eq!(replace_control_chars(""), "");
+    }
+
+    #[test]
     fn clock_time_falls_back_on_bad_input() {
         assert_eq!(format_clock_time("not-a-time"), "--:--:--");
         assert_eq!(format_clock_time("2026-11-15T01:02:03Z").len(), 8);
@@ -372,5 +405,28 @@ mod tests {
         assert_eq!(pad_left_display("abcdef", 4), "abc…");
         assert_eq!(Span::raw(pad_left_display("도구목록", 6)).width(), 6);
         assert_eq!(pad_left_display("a", 0), "");
+    }
+
+    #[test]
+    fn title_fit_drops_middle_segments_first_and_keeps_the_sort_tail() {
+        let title = "Hook verdicts · Deny 3 · Rewrite 45 · Saved 3m 09s · Sort Count↓";
+        // 들어가면 그대로
+        assert_eq!(fit_title_segments(title, 64), title);
+        // 마지막 구간 앞에서부터 하나씩 덜어냄
+        assert_eq!(
+            fit_title_segments(title, 50),
+            "Hook verdicts · Deny 3 · Rewrite 45 · Sort Count↓"
+        );
+        assert_eq!(fit_title_segments(title, 30), "Hook verdicts · Sort Count↓");
+        // 두 구간만 남아도 넘치면 끝 말줄임, 폭 0 은 빈 문자열
+        let fitted = fit_title_segments(title, 20);
+        assert_eq!(Span::raw(fitted.as_str()).width(), 20);
+        assert!(fitted.ends_with('…'));
+        assert_eq!(fit_title_segments(title, 0), "");
+        // 한글 구간도 표시 폭 기준
+        let korean = "에이전트 통계 · 2종 · 추정 (API 단가) · 합계 $13.10 · 정렬 요청↓";
+        let fitted = fit_title_segments(korean, 40);
+        assert!(Span::raw(fitted.as_str()).width() <= 40, "{fitted}");
+        assert!(fitted.ends_with("정렬 요청↓"), "{fitted}");
     }
 }

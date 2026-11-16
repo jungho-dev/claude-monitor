@@ -252,7 +252,7 @@ async fn gateway_returns_502_when_upstream_unreachable() {
     )
     .await;
     assert_eq!(status, 502);
-    assert!(text.contains("rap gateway upstream error"));
+    assert!(text.contains("cm gateway upstream error"));
     assert!(text.contains("\"type\":\"api_error\""));
 
     // 3. 오류 행 기록
@@ -321,7 +321,7 @@ async fn gateway_returns_504_when_upstream_never_answers() {
         }
     }
     assert_eq!(status, 504, "{text}");
-    assert!(text.contains("rap gateway upstream timeout"));
+    assert!(text.contains("cm gateway upstream timeout"));
     assert!(text.contains("\"type\":\"api_error\""));
 
     // 4. 오류 행 기록

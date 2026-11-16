@@ -1,0 +1,360 @@
+//! net/admin/mod.rs
+//! 관리 포트: 상태·집계 JSON, 토큰 보호 재색인·리포트 실행 (SSE 는 events, 클라이언트는 client).
+
+mod client;
+mod events;
+#[cfg(test)]
+pub(crate) mod test_support;
+#[cfg(test)]
+mod tests;
+
+pub use client::{fetch_status_blocking, post_admin_blocking};
+
+use crate::core::context::AppContext;
+use crate::core::model::{PortStatus, StatusSnapshot};
+use crate::net::common::{
+    ResponseBody, full_body, json_response, serve_local_http, serve_local_listener, text_response,
+};
+use crate::serve::BOUND_LISTENER_NAMES;
+use crate::{report, transcript};
+use anyhow::Context;
+use chrono::{Duration as ChronoDuration, Local, NaiveDate, SecondsFormat, Utc};
+use hyper::body::Incoming;
+use hyper::header::{CONTENT_TYPE, HeaderValue};
+use hyper::{Method, Request, Response, StatusCode};
+use ring::hmac;
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+const TOKEN_HEADER: &str = "x-cm-token";
+const DEFAULT_HOURS: i64 = 24;
+const MAX_HOURS: i64 = 720;
+const AGGREGATE_ROW_LIMIT: usize = 100;
+const PORT_PROBE_TIMEOUT: Duration = Duration::from_millis(50);
+
+// 1. 관리 서버 ----------------------------------------------------------------
+pub async fn run_admin_server(ctx: Arc<AppContext>) -> anyhow::Result<()> {
+    let port = ctx.config.ports.admin;
+    serve_local_http(port, move |req| {
+        let ctx = Arc::clone(&ctx);
+        async move { route_admin_request(ctx, req).await }
+    })
+    .await
+}
+
+/// 선점한 std 리스너로 관리 서버 실행 (기동 직전 포트 검사 틈 제거).
+pub async fn run_admin_server_on(
+    ctx: Arc<AppContext>,
+    listener: std::net::TcpListener,
+) -> anyhow::Result<()> {
+    listener
+        .set_nonblocking(true)
+        .context("관리 리스너 비차단 전환 실패")?;
+    let listener =
+        tokio::net::TcpListener::from_std(listener).context("관리 리스너 런타임 등록 실패")?;
+    serve_local_listener(listener, move |req| {
+        let ctx = Arc::clone(&ctx);
+        async move { route_admin_request(ctx, req).await }
+    })
+    .await
+}
+
+// 2. 요청 분기 ----------------------------------------------------------------
+async fn route_admin_request(
+    ctx: Arc<AppContext>,
+    req: Request<Incoming>,
+) -> Response<ResponseBody> {
+    // 1. 요청 분해
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let query = req.uri().query().map(str::to_string);
+
+    // 2. 변경 요청 토큰 검사 (상수 시간 비교)
+    if method == Method::POST {
+        let given = req
+            .headers()
+            .get(TOKEN_HEADER)
+            .map(|value| value.as_bytes())
+            .unwrap_or_default();
+        if !verify_admin_token(given, &ctx.admin_token) {
+            return json_response(
+                StatusCode::UNAUTHORIZED,
+                &serde_json::json!({"error": "unauthorized"}),
+            );
+        }
+    }
+
+    // 3. 경로 분기
+    match (method, path.as_str()) {
+        (Method::GET, "/health") => text_response(StatusCode::OK, "ok"),
+        (Method::GET, "/api/status") => respond_status(&ctx).await,
+        (Method::GET, "/api/events") => events::open_event_stream(&ctx),
+        (Method::GET, "/api/report") => respond_report_read(ctx, query).await,
+        (Method::POST, "/api/report") => respond_report_write(ctx, query).await,
+        (Method::POST, "/api/reindex") => respond_reindex(ctx).await,
+        (Method::GET, "/api/power") => json_response(
+            StatusCode::OK,
+            &serde_json::json!({
+                "enabled": ctx.config.power.enabled,
+                "keep_awake": ctx.config.power.keep_awake,
+                "holding": ctx.power.holding.load(Ordering::Relaxed),
+                "gaps": ctx.power.list_gaps(),
+            }),
+        ),
+        (Method::GET, other) if other.starts_with("/api/") => {
+            respond_aggregate(ctx, &other["/api/".len()..], query).await
+        }
+        _ => json_response(
+            StatusCode::NOT_FOUND,
+            &serde_json::json!({"error": "not found"}),
+        ),
+    }
+}
+
+// 3. 상태 응답 ----------------------------------------------------------------
+async fn respond_status(ctx: &Arc<AppContext>) -> Response<ResponseBody> {
+    // 1. 포트 목록
+    let planned = ctx.config.planned_ports();
+
+    // 2. 수신 검사 (관리 포트는 항상 수신 중, 바인드 기록이 있으면 기록 기준)
+    let probed = tokio::task::spawn_blocking(move || {
+        build_port_rows(planned, BOUND_LISTENER_NAMES.get().map(Vec::as_slice))
+    })
+    .await;
+    let port_rows = match probed {
+        Ok(rows) => rows,
+        Err(_) => {
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &serde_json::json!({"error": "포트 검사 실패"}),
+            );
+        }
+    };
+
+    // 3. 스냅샷 구성
+    let snapshot = StatusSnapshot {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        pid: std::process::id(),
+        started_at: ctx.started_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+        uptime_secs: u64::try_from((Utc::now() - ctx.started_at).num_seconds()).unwrap_or(0),
+        data_dir: ctx.config.data_dir.display().to_string(),
+        claude_home: ctx.config.claude_home.display().to_string(),
+        ports: port_rows,
+        counters: ctx.counters.snapshot_counters(),
+    };
+    json_response(StatusCode::OK, &snapshot)
+}
+
+// 3-1. 포트 행 구성 -----------------------------------------------------------
+/// 바인드 기록이 있으면 이 프로세스가 잡은 포트만 수신 중, 없으면 연결 시도로 판정.
+fn build_port_rows(
+    planned: Vec<(&'static str, u16, bool)>,
+    bound_names: Option<&[&'static str]>,
+) -> Vec<PortStatus> {
+    planned
+        .into_iter()
+        .map(|(name, port, enabled)| {
+            let listening = if name == "admin" {
+                true
+            } else if !enabled {
+                false
+            } else if let Some(names) = bound_names {
+                names.contains(&name)
+            } else {
+                TcpStream::connect_timeout(
+                    &SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+                    PORT_PROBE_TIMEOUT,
+                )
+                .is_ok()
+            };
+            PortStatus {
+                name: name.to_string(),
+                port,
+                enabled,
+                listening,
+            }
+        })
+        .collect()
+}
+
+// 4. 집계 응답 ----------------------------------------------------------------
+async fn respond_aggregate(
+    ctx: Arc<AppContext>,
+    name: &str,
+    query: Option<String>,
+) -> Response<ResponseBody> {
+    // 1. 구간 계산
+    let hours = match find_query_param(query.as_deref(), "hours") {
+        Some(text) => match text.parse::<i64>() {
+            Ok(parsed) => parsed.clamp(1, MAX_HOURS),
+            Err(_) => {
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    &serde_json::json!({"error": "hours 형식 오류"}),
+                );
+            }
+        },
+        None => DEFAULT_HOURS,
+    };
+    let now = Utc::now();
+    let until = now.to_rfc3339_opts(SecondsFormat::Millis, true);
+    let since = (now - ChronoDuration::hours(hours)).to_rfc3339_opts(SecondsFormat::Millis, true);
+
+    // 2. 조회 실행 (블로킹 풀)
+    let name = name.to_string();
+    let aggregated = run_blocking_job(move || -> anyhow::Result<Option<serde_json::Value>> {
+        let payload = match name.as_str() {
+            "overview" => serde_json::to_value(ctx.store.query_overview(&since, &until)?)?,
+            "tools" => serde_json::to_value(ctx.store.query_tool_latency(
+                &since,
+                &until,
+                AGGREGATE_ROW_LIMIT,
+            )?)?,
+            "hooks" => serde_json::to_value(ctx.store.query_hook_stats(&since, &until)?)?,
+            "models" => serde_json::to_value(ctx.store.query_model_usage(&since, &until)?)?,
+            "model-stats" => serde_json::to_value(ctx.store.query_model_stats(&since, &until)?)?,
+            "agent-stats" => serde_json::to_value(ctx.store.query_agent_stats(&since, &until)?)?,
+            "gateway" => serde_json::to_value(ctx.store.query_gateway_timing(&since, &until)?)?,
+            "cache-breaks" => serde_json::to_value(ctx.store.query_cache_breaks(
+                &since,
+                &until,
+                AGGREGATE_ROW_LIMIT,
+            )?)?,
+            "minutes" => serde_json::to_value(ctx.store.query_minute_buckets(&since, &until)?)?,
+            _ => return Ok(None),
+        };
+        Ok(Some(payload))
+    })
+    .await;
+
+    // 3. 응답 분기
+    match aggregated {
+        Ok(Some(payload)) => json_response(StatusCode::OK, &payload),
+        Ok(None) => json_response(
+            StatusCode::NOT_FOUND,
+            &serde_json::json!({"error": "not found"}),
+        ),
+        Err(failure) => failure,
+    }
+}
+
+// 5. 리포트 조회 응답 ---------------------------------------------------------
+async fn respond_report_read(
+    ctx: Arc<AppContext>,
+    query: Option<String>,
+) -> Response<ResponseBody> {
+    // 1. 날짜 검증
+    let report_date = match find_query_param(query.as_deref(), "date")
+        .and_then(|text| NaiveDate::parse_from_str(&text, "%Y-%m-%d").ok())
+    {
+        Some(date) => date,
+        None => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({"error": "date=YYYY-MM-DD 필요"}),
+            );
+        }
+    };
+
+    // 2. 보관본 조회
+    let date_text = report_date.format("%Y-%m-%d").to_string();
+    let loaded = run_blocking_job(move || ctx.store.load_daily_report(&date_text)).await;
+
+    // 3. 응답 분기
+    match loaded {
+        Ok(Some(markdown)) => {
+            let mut response = Response::new(full_body(markdown));
+            response.headers_mut().insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/markdown; charset=utf-8"),
+            );
+            response
+        }
+        Ok(None) => json_response(
+            StatusCode::NOT_FOUND,
+            &serde_json::json!({"error": "리포트 없음"}),
+        ),
+        Err(failure) => failure,
+    }
+}
+
+// 6. 리포트 생성 응답 ---------------------------------------------------------
+async fn respond_report_write(
+    ctx: Arc<AppContext>,
+    query: Option<String>,
+) -> Response<ResponseBody> {
+    // 1. 날짜 결정 (기본 어제)
+    let report_date = match find_query_param(query.as_deref(), "date") {
+        Some(text) => match NaiveDate::parse_from_str(&text, "%Y-%m-%d") {
+            Ok(date) => date,
+            Err(_) => {
+                return json_response(
+                    StatusCode::BAD_REQUEST,
+                    &serde_json::json!({"error": "date=YYYY-MM-DD 형식 오류"}),
+                );
+            }
+        },
+        None => (Local::now() - ChronoDuration::days(1)).date_naive(),
+    };
+
+    // 2. 생성 실행 (블로킹 풀)
+    let written =
+        run_blocking_job(move || report::write_daily_report(&ctx.config, &ctx.store, report_date))
+            .await;
+
+    // 3. 응답 분기
+    match written {
+        Ok(path) => json_response(
+            StatusCode::OK,
+            &serde_json::json!({"path": path.display().to_string()}),
+        ),
+        Err(failure) => failure,
+    }
+}
+
+// 7. 재색인 응답 --------------------------------------------------------------
+async fn respond_reindex(ctx: Arc<AppContext>) -> Response<ResponseBody> {
+    let indexed =
+        run_blocking_job(move || transcript::index_transcripts_once(&ctx.config, &ctx.store)).await;
+    match indexed {
+        Ok(summary) => json_response(StatusCode::OK, &summary),
+        Err(failure) => failure,
+    }
+}
+
+// 8. 토큰 비교 ----------------------------------------------------------------
+// HMAC 태그 비교 (ring 상수 시간 검증, 길이 누설 없음)
+fn verify_admin_token(given: &[u8], expected: &str) -> bool {
+    let key = hmac::Key::new(hmac::HMAC_SHA256, expected.as_bytes());
+    let expected_tag = hmac::sign(&key, expected.as_bytes());
+    hmac::verify(&key, given, expected_tag.as_ref()).is_ok()
+}
+
+// 9. 질의 값 추출 -------------------------------------------------------------
+fn find_query_param(query: Option<&str>, key: &str) -> Option<String> {
+    query?
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(name, _)| *name == key)
+        .map(|(_, value)| value.to_string())
+}
+
+// 10. 블로킹 작업 실행 --------------------------------------------------------
+// 오류·panic 은 500 응답으로 반환
+async fn run_blocking_job<T: Send + 'static>(
+    work: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> Result<T, Response<ResponseBody>> {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(err)) => Err(json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &serde_json::json!({"error": format!("{err:#}")}),
+        )),
+        Err(_) => Err(json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &serde_json::json!({"error": "내부 오류 (작업 중단)"}),
+        )),
+    }
+}

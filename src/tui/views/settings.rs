@@ -1,9 +1,10 @@
 //! tui/views/settings.rs
-//! 설정 탭: 훅·MCP·에이전트·진단 카드 (카드마다 독립 스크롤·정렬 머리글, 경계 드래그 크기 조절).
+//! 설정 탭: 훅·MCP·에이전트·진단 표 카드 (카드마다 독립 스크롤·정렬 머리글·열 경계 드래그, 표 아래 보조 줄 영역).
 
 use crate::inventory::{DoctorFinding, Inventory};
-use crate::tui::cards::{CardId, HeaderSpan};
-use crate::tui::format::{fit_display, format_count, pad_left_display};
+use crate::tui::cards::CardId;
+use crate::tui::format::{format_count, replace_control_chars};
+use crate::tui::i18n::{self, Lang, Msg};
 use crate::tui::layout::{SplitAxis, SplitGroup};
 use crate::tui::sort::{
     SortState, compare_agent_entry, compare_doctor_finding, compare_hook_entry, compare_mcp_entry,
@@ -12,88 +13,110 @@ use crate::tui::sort::{
 use crate::tui::state::{AppState, Panel};
 use crate::tui::theme;
 use crate::tui::views::common::{
-    TextCard, build_uniform_sort_header, panel_message, render_text_card,
+    CardTable, ColumnFit, ColumnSpec, PanelNote, TableCell, panel_message, render_card_table,
+    render_notice_card,
 };
 use ratatui::Frame;
-use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::layout::{Alignment, Rect};
 use ratatui::text::{Line, Span};
 
-const HOOK_EVENT_WIDTH: usize = 18;
-const HOOK_MATCHER_WIDTH: usize = 18;
-const HOOK_TYPE_WIDTH: usize = 8;
-const HOOK_ASYNC_WIDTH: usize = 6;
-const HOOK_TIMEOUT_WIDTH: usize = 7;
-const NAME_WIDTH: usize = 24;
-const SMALL_COLUMN_WIDTH: usize = 10;
-const MCP_MARK_WIDTH: usize = 4;
-const AGENT_TURNS_WIDTH: usize = 7;
-const DOCTOR_TAG_WIDTH: usize = 6;
 // 카드 테두리 2열과 안쪽 여백 2열
 const CARD_CHROME_WIDTH: u16 = 4;
+// 기본 배치에서 카드 하나가 갖는 최소 줄 수 (위아래 테두리 2줄과 본문 한 줄)
+const MIN_CARD_ROWS: u16 = 3;
 
-// 1. 카드 줄 묶음 -------------------------------------------------------------
-// 고정 머리글 줄(없을 수 있음), 머리글 열 클릭 구간, 본문 줄
+// 설정 표 열 (정렬 열 번호와 순서 일치: sort.rs)
+pub const SETTINGS_HOOK_COLUMNS: [ColumnSpec; 6] = [
+    (Msg::SetEvent, 12, ColumnFit::Shrink, Alignment::Left),
+    (Msg::SetMatcher, 8, ColumnFit::Shrink, Alignment::Left),
+    (Msg::SetType, 6, ColumnFit::Fixed, Alignment::Left),
+    (Msg::SetTarget, 16, ColumnFit::Grow, Alignment::Left),
+    (Msg::SetAsync, 5, ColumnFit::Fixed, Alignment::Left),
+    (Msg::SetTimeout, 7, ColumnFit::Fixed, Alignment::Right),
+];
+
+pub const SETTINGS_MCP_COLUMNS: [ColumnSpec; 4] = [
+    (Msg::SetStatus, 5, ColumnFit::Fixed, Alignment::Left),
+    (Msg::SetName, 12, ColumnFit::Shrink, Alignment::Left),
+    (Msg::SetTransport, 9, ColumnFit::Fixed, Alignment::Left),
+    (Msg::SetTarget, 16, ColumnFit::Grow, Alignment::Left),
+];
+
+pub const SETTINGS_AGENT_COLUMNS: [ColumnSpec; 4] = [
+    (Msg::SetName, 16, ColumnFit::Grow, Alignment::Left),
+    (Msg::SetModel, 8, ColumnFit::Shrink, Alignment::Left),
+    (Msg::SetEffort, 6, ColumnFit::Fixed, Alignment::Left),
+    (Msg::SetMaxTurns, 5, ColumnFit::Fixed, Alignment::Right),
+];
+
+pub const SETTINGS_DOCTOR_COLUMNS: [ColumnSpec; 3] = [
+    (Msg::SetLevel, 6, ColumnFit::Fixed, Alignment::Left),
+    (Msg::SetTopic, 12, ColumnFit::Shrink, Alignment::Left),
+    (Msg::SetMessage, 16, ColumnFit::Grow, Alignment::Left),
+];
+
+// 1. 카드 묶음 ----------------------------------------------------------------
+// 표 영역의 정렬을 마친 행과 표 아래 보조 줄 영역 (보조 줄은 정렬·열 폭에 속하지 않음)
 #[derive(Default)]
-pub struct CardLines {
-    pub header: Option<Line<'static>>,
-    pub header_cells: Vec<HeaderSpan>,
-    pub lines: Vec<Line<'static>>,
+pub struct SettingsTable {
+    pub rows: Vec<Vec<TableCell>>,
+    pub aux_lines: Vec<Line<'static>>,
+}
+
+// 설정 카드 그리기 입력 (table 이 None 이면 note 로 안내 카드)
+struct SettingsCard {
+    card: CardId,
+    title: String,
+    hint: String,
+    columns: Vec<ColumnSpec>,
+    table: Option<SettingsTable>,
+    note: Option<PanelNote>,
 }
 
 // 2. 설정 탭 ------------------------------------------------------------------
 pub fn render_settings_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
-    // 1. 카드 분할 (훅 30%, MCP 20%, 에이전트 20%, 진단 30%)
+    // 1. 카드 분할 (훅 30%, MCP 20%, 에이전트 20%, 진단 30%), 낮은 화면에서도 카드마다 적어도 3줄(테두리 2줄과 본문 한 줄)
     let height = u32::from(area.height);
+    let first_cut = ((height * 30 / 100) as u16).max(MIN_CARD_ROWS);
+    let second_cut = ((height * 50 / 100) as u16).max(first_cut + MIN_CARD_ROWS);
+    let third_cut = ((height * 70 / 100) as u16)
+        .max(second_cut + MIN_CARD_ROWS)
+        .min(area.height.saturating_sub(MIN_CARD_ROWS));
     let panes = state.card_layout.split_cards(
-        &mut state.hit_areas.split_hits,
+        &mut state.hit_areas,
         SplitGroup::SettingsRows,
         SplitAxis::Rows,
         area,
-        &[
-            (height * 30 / 100) as u16,
-            (height * 50 / 100) as u16,
-            (height * 70 / 100) as u16,
-        ],
+        &[first_cut, second_cut, third_cut],
         &[4, 4, 4, 4],
     );
-    let widths: Vec<usize> = panes
-        .iter()
-        .map(|pane| pane.width.saturating_sub(CARD_CHROME_WIDTH) as usize)
-        .collect();
+    let agent_width = usize::from(panes[2].width.saturating_sub(CARD_CHROME_WIDTH));
 
-    // 2. 카드 내용 (적재 전에는 상태 문구)
-    let hook_card = build_hook_lines(
-        &state.inventory,
-        widths[0],
-        state.card_sorts[CardId::SettingsHooks as usize],
-    );
-    let mcp_card = build_mcp_lines(
-        &state.inventory,
-        widths[1],
-        state.card_sorts[CardId::SettingsMcp as usize],
-    );
-    let agent_card = build_agent_lines(
-        &state.inventory,
-        widths[2],
-        state.card_sorts[CardId::SettingsAgents as usize],
-    );
-    let doctor_card = build_doctor_lines(
-        &state.doctor,
-        widths[3],
-        state.card_sorts[CardId::SettingsDoctor as usize],
-    );
-    let hook_count = match &state.inventory {
-        Panel::Ready(loaded) => format!(" · {}건", format_count(loaded.hooks.len() as i64)),
-        _ => String::new(),
+    // 2. 카드 내용 (적재 전에는 안내 카드)
+    let lang = state.lang;
+    let hook_sort = state.card_sorts[CardId::SettingsHooks as usize];
+    let mcp_sort = state.card_sorts[CardId::SettingsMcp as usize];
+    let agent_sort = state.card_sorts[CardId::SettingsAgents as usize];
+    let doctor_sort = state.card_sorts[CardId::SettingsDoctor as usize];
+    let (hook_table, mcp_table, agent_table) = match &state.inventory {
+        Panel::Ready(loaded) => (
+            Some(build_hook_table(lang, loaded, hook_sort)),
+            Some(build_mcp_table(lang, loaded, mcp_sort)),
+            Some(build_agent_table(lang, loaded, agent_width, agent_sort)),
+        ),
+        _ => (None, None, None),
     };
-    let mcp_count = match &state.inventory {
-        Panel::Ready(loaded) => format!(" · {}건", loaded.mcp_servers.len()),
-        _ => String::new(),
+    let doctor_table = match &state.doctor {
+        Panel::Ready(findings) => Some(build_doctor_table(lang, findings, doctor_sort)),
+        _ => None,
     };
-    let agent_count = match &state.inventory {
-        Panel::Ready(loaded) => format!(" · {}건", loaded.agents.len()),
-        _ => String::new(),
+    let (hook_count, mcp_count, agent_count) = match &state.inventory {
+        Panel::Ready(loaded) => (
+            i18n::settings_count(lang, loaded.hooks.len()),
+            i18n::settings_count(lang, loaded.mcp_servers.len()),
+            i18n::settings_count(lang, loaded.agents.len()),
+        ),
+        _ => (String::new(), String::new(), String::new()),
     };
     let doctor_summary = match &state.doctor {
         Panel::Ready(findings) => {
@@ -105,268 +128,270 @@ pub fn render_settings_tab(frame: &mut Frame, area: Rect, state: &mut AppState) 
                 .iter()
                 .filter(|finding| finding.level == "warn")
                 .count();
-            format!(" · 실패 {failed} · 경고 {warned}")
+            i18n::doctor_summary(lang, failed, warned)
         }
         _ => String::new(),
     };
+    let inventory_note = panel_message(lang, &state.inventory);
+    let doctor_note = panel_message(lang, &state.doctor);
     let claude_home = state.config.claude_home.display().to_string();
 
     // 3. 카드 그리기
-    render_text_card(
+    render_settings_card(
         frame,
         state,
         panes[0],
-        TextCard {
+        SettingsCard {
             card: CardId::SettingsHooks,
-            title: format!("훅 등록{hook_count}"),
+            title: format!(
+                "{}{hook_count}",
+                i18n::text(lang, Msg::TitleHooksRegistered)
+            ),
             hint: claude_home,
-            header: hook_card.header,
-            header_cells: hook_card.header_cells,
-            lines: hook_card.lines,
+            columns: SETTINGS_HOOK_COLUMNS.to_vec(),
+            table: hook_table,
+            note: inventory_note.clone(),
         },
     );
-    render_text_card(
+    render_settings_card(
         frame,
         state,
         panes[1],
-        TextCard {
+        SettingsCard {
             card: CardId::SettingsMcp,
-            title: format!("MCP 서버{mcp_count}"),
+            title: format!("{}{mcp_count}", i18n::text(lang, Msg::TitleMcpServers)),
             hint: String::new(),
-            header: mcp_card.header,
-            header_cells: mcp_card.header_cells,
-            lines: mcp_card.lines,
+            columns: SETTINGS_MCP_COLUMNS.to_vec(),
+            table: mcp_table,
+            note: inventory_note.clone(),
         },
     );
-    render_text_card(
+    render_settings_card(
         frame,
         state,
         panes[2],
-        TextCard {
+        SettingsCard {
             card: CardId::SettingsAgents,
-            title: format!("에이전트·스킬·env{agent_count}"),
+            title: format!("{}{agent_count}", i18n::text(lang, Msg::TitleAgentsSkills)),
             hint: String::new(),
-            header: agent_card.header,
-            header_cells: agent_card.header_cells,
-            lines: agent_card.lines,
+            columns: SETTINGS_AGENT_COLUMNS.to_vec(),
+            table: agent_table,
+            note: inventory_note,
         },
     );
-    render_text_card(
+    render_settings_card(
         frame,
         state,
         panes[3],
-        TextCard {
+        SettingsCard {
             card: CardId::SettingsDoctor,
-            title: format!("진단{doctor_summary}"),
-            hint: "r 새로고침".to_string(),
-            header: doctor_card.header,
-            header_cells: doctor_card.header_cells,
-            lines: doctor_card.lines,
+            title: format!(
+                "{}{doctor_summary}",
+                i18n::text(lang, Msg::TitleDiagnostics)
+            ),
+            hint: i18n::text(lang, Msg::HintRefresh).to_string(),
+            columns: SETTINGS_DOCTOR_COLUMNS.to_vec(),
+            table: doctor_table,
+            note: doctor_note,
         },
     );
 }
 
-// 3. 훅 등록 줄 ---------------------------------------------------------------
-// (고정 머리글, 정렬한 훅 한 줄씩 + HTTP 훅 허용 목록), 적재 전에는 상태 문구 한 줄
-pub fn build_hook_lines(inventory: &Panel<Inventory>, width: usize, sort: SortState) -> CardLines {
-    let Panel::Ready(loaded) = inventory else {
-        return CardLines {
-            lines: unloaded_lines(inventory),
-            ..CardLines::default()
-        };
-    };
-    let mut lines: Vec<Line<'static>> = Vec::new();
+// 3. 설정 카드 그리기 ---------------------------------------------------------
+// 표가 준비되면 표 카드(머리글 정렬·열 경계 드래그·스크롤바 공용), 아니면 상태 문구 안내 카드
+fn render_settings_card(frame: &mut Frame, state: &mut AppState, pane: Rect, spec: SettingsCard) {
+    let SettingsCard {
+        card,
+        title,
+        hint,
+        columns,
+        table,
+        note,
+    } = spec;
+    match table {
+        Some(built) => render_card_table(
+            frame,
+            state,
+            pane,
+            CardTable {
+                card,
+                title,
+                hint,
+                columns,
+                rows: built.rows,
+                aux_lines: built.aux_lines,
+            },
+        ),
+        None => render_notice_card(frame, state, card, pane, &title, note.unwrap_or_default()),
+    }
+}
 
-    // 1. 머리글
-    let target_width = width
-        .saturating_sub(
-            HOOK_EVENT_WIDTH
-                + HOOK_MATCHER_WIDTH
-                + HOOK_TYPE_WIDTH
-                + HOOK_ASYNC_WIDTH
-                + HOOK_TIMEOUT_WIDTH
-                + 5,
-        )
-        .max(10);
-    let (header_line, header_cells) = build_uniform_sort_header(
-        &[
-            ("이벤트", HOOK_EVENT_WIDTH, false),
-            ("matcher", HOOK_MATCHER_WIDTH, false),
-            ("종류", HOOK_TYPE_WIDTH, false),
-            ("대상", target_width, false),
-            ("async", HOOK_ASYNC_WIDTH, false),
-            ("timeout", HOOK_TIMEOUT_WIDTH, true),
-        ],
-        sort,
-    );
-
-    // 2. 훅 줄 (정렬)
+// 4. 훅 등록 표 ---------------------------------------------------------------
+// 정렬한 훅 한 행씩, 표 아래 HTTP 훅 허용 목록
+pub fn build_hook_table(lang: Lang, loaded: &Inventory, sort: SortState) -> SettingsTable {
     let mut sorted = loaded.hooks.clone();
     sort_rows(&mut sorted, sort, compare_hook_entry);
-    for hook in &sorted {
-        let timeout = hook
-            .timeout_secs
-            .map_or("-".to_string(), |secs| format!("{secs}s"));
-        lines.push(Line::from(Span::styled(
-            format!(
-                "{} {} {} {} {} {}",
-                fit_display(&hook.event, HOOK_EVENT_WIDTH),
-                fit_display(&hook.matcher, HOOK_MATCHER_WIDTH),
-                fit_display(&hook.hook_type, HOOK_TYPE_WIDTH),
-                fit_display(&hook.target, target_width),
-                fit_display(if hook.is_async { "예" } else { "-" }, HOOK_ASYNC_WIDTH),
-                pad_left_display(&timeout, HOOK_TIMEOUT_WIDTH),
-            ),
-            theme::STYLE_TEXT,
-        )));
-    }
-
-    // 3. HTTP 훅 허용 목록
+    let rows: Vec<Vec<TableCell>> = sorted
+        .iter()
+        .map(|hook| {
+            let timeout = hook
+                .timeout_secs
+                .map_or("-".to_string(), |secs| format!("{secs}s"));
+            let async_text = if hook.is_async {
+                i18n::text(lang, Msg::SetYes)
+            } else {
+                "-"
+            };
+            vec![
+                vec![Span::styled(
+                    replace_control_chars(&hook.event),
+                    theme::STYLE_TEXT,
+                )],
+                vec![Span::styled(
+                    replace_control_chars(&hook.matcher),
+                    theme::STYLE_TEXT,
+                )],
+                vec![Span::styled(
+                    replace_control_chars(&hook.hook_type),
+                    theme::STYLE_TEXT,
+                )],
+                vec![Span::styled(
+                    replace_control_chars(&hook.target),
+                    theme::STYLE_TEXT,
+                )],
+                vec![Span::styled(async_text, theme::STYLE_TEXT)],
+                vec![Span::styled(timeout, theme::STYLE_TEXT)],
+            ]
+        })
+        .collect();
+    let mut aux_lines: Vec<Line<'static>> = Vec::new();
     if !loaded.http_hook_allowlist.is_empty() {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            format!("HTTP 훅 허용 목록 ({}건)", loaded.http_hook_allowlist.len()),
+        aux_lines.push(Line::from(""));
+        aux_lines.push(Line::from(Span::styled(
+            i18n::allowlist_heading(lang, loaded.http_hook_allowlist.len()),
             theme::STYLE_ACCENT,
         )));
         for allowed in &loaded.http_hook_allowlist {
-            lines.push(Line::from(Span::styled(
-                format!("  {allowed}"),
+            aux_lines.push(Line::from(Span::styled(
+                format!("  {}", replace_control_chars(allowed)),
                 theme::STYLE_TEXT,
             )));
         }
     }
-    CardLines {
-        header: Some(header_line.style(theme::STYLE_TABLE_HEADER)),
-        header_cells,
-        lines,
-    }
+    SettingsTable { rows, aux_lines }
 }
 
-// 4. MCP 서버 줄 --------------------------------------------------------------
-// 정렬한 서버 한 줄씩 + 적재 경고
-pub fn build_mcp_lines(inventory: &Panel<Inventory>, width: usize, sort: SortState) -> CardLines {
-    let Panel::Ready(loaded) = inventory else {
-        return CardLines {
-            lines: unloaded_lines(inventory),
-            ..CardLines::default()
-        };
-    };
-    let mut lines: Vec<Line<'static>> = Vec::new();
-
-    // 1. 머리글
-    let target_width = width
-        .saturating_sub(MCP_MARK_WIDTH + NAME_WIDTH + SMALL_COLUMN_WIDTH + 3)
-        .max(10);
-    let (header_line, header_cells) = build_uniform_sort_header(
-        &[
-            ("상태", MCP_MARK_WIDTH, false),
-            ("이름", NAME_WIDTH, false),
-            ("전송", SMALL_COLUMN_WIDTH, false),
-            ("대상", target_width, false),
-        ],
-        sort,
-    );
-
-    // 2. 서버 줄 (정렬)
+// 5. MCP 서버 표 --------------------------------------------------------------
+// 정렬한 서버 한 행씩 (차단 서버는 흐리게), 표 아래 적재 경고
+pub fn build_mcp_table(lang: Lang, loaded: &Inventory, sort: SortState) -> SettingsTable {
     let mut sorted = loaded.mcp_servers.clone();
     sort_rows(&mut sorted, sort, compare_mcp_entry);
-    for server in &sorted {
-        let (mark, style) = if server.denied {
-            ("차단", theme::STYLE_CRIT)
-        } else {
-            ("허용", theme::STYLE_OK)
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{} ", fit_display(mark, MCP_MARK_WIDTH)), style),
-            Span::styled(
-                format!(
-                    "{} {} {}",
-                    fit_display(&server.name, NAME_WIDTH),
-                    fit_display(&server.transport, SMALL_COLUMN_WIDTH),
-                    fit_display(&server.target, target_width),
-                ),
-                if server.denied {
-                    theme::STYLE_DIM
-                } else {
-                    theme::STYLE_TEXT
-                },
-            ),
-        ]));
-    }
-
-    // 3. 적재 경고
-    for warning in &loaded.warnings {
-        lines.push(Line::from(Span::styled(
-            format!("! {warning}"),
-            theme::STYLE_WARN,
-        )));
-    }
-    CardLines {
-        header: Some(header_line.style(theme::STYLE_TABLE_HEADER)),
-        header_cells,
-        lines,
-    }
+    let rows: Vec<Vec<TableCell>> = sorted
+        .iter()
+        .map(|server| {
+            let (mark, mark_style, body_style) = if server.denied {
+                (
+                    i18n::text(lang, Msg::SetBlocked),
+                    theme::STYLE_CRIT,
+                    theme::STYLE_DIM,
+                )
+            } else {
+                (
+                    i18n::text(lang, Msg::SetAllowed),
+                    theme::STYLE_OK,
+                    theme::STYLE_TEXT,
+                )
+            };
+            vec![
+                vec![Span::styled(mark, mark_style)],
+                vec![Span::styled(
+                    replace_control_chars(&server.name),
+                    body_style,
+                )],
+                vec![Span::styled(
+                    replace_control_chars(&server.transport),
+                    body_style,
+                )],
+                vec![Span::styled(
+                    replace_control_chars(&server.target),
+                    body_style,
+                )],
+            ]
+        })
+        .collect();
+    let aux_lines: Vec<Line<'static>> = loaded
+        .warnings
+        .iter()
+        .map(|warning| {
+            Line::from(Span::styled(
+                format!("! {}", replace_control_chars(warning)),
+                theme::STYLE_WARN,
+            ))
+        })
+        .collect();
+    SettingsTable { rows, aux_lines }
 }
 
-// 5. 에이전트·스킬·env 줄 -----------------------------------------------------
-// 에이전트 표(머리글 정렬)와 스킬·env 요약 줄
-pub fn build_agent_lines(inventory: &Panel<Inventory>, width: usize, sort: SortState) -> CardLines {
-    let Panel::Ready(loaded) = inventory else {
-        return CardLines {
-            lines: unloaded_lines(inventory),
-            ..CardLines::default()
-        };
-    };
-    let mut lines: Vec<Line<'static>> = Vec::new();
-
-    // 1. 머리글과 에이전트 줄 (정렬)
-    let (header_line, header_cells) = build_uniform_sort_header(
-        &[
-            ("이름", NAME_WIDTH, false),
-            ("모델", SMALL_COLUMN_WIDTH, false),
-            ("effort", SMALL_COLUMN_WIDTH, false),
-            ("최대턴", AGENT_TURNS_WIDTH, true),
-        ],
-        sort,
-    );
+// 6. 에이전트·스킬·env 표 -----------------------------------------------------
+// 정렬한 에이전트 한 행씩, 표 아래 스킬·env 요약 줄 (env 키는 width 에 맞춰 줄바꿈)
+pub fn build_agent_table(
+    lang: Lang,
+    loaded: &Inventory,
+    width: usize,
+    sort: SortState,
+) -> SettingsTable {
+    // 1. 에이전트 행 (정렬)
     let mut sorted = loaded.agents.clone();
     sort_rows(&mut sorted, sort, compare_agent_entry);
-    for agent in &sorted {
-        let max_turns = agent
-            .max_turns
-            .map_or("-".to_string(), |turns| turns.to_string());
-        lines.push(Line::from(Span::styled(
-            format!(
-                "{} {} {} {max_turns:>AGENT_TURNS_WIDTH$}",
-                fit_display(&agent.name, NAME_WIDTH),
-                fit_display(&agent.model, SMALL_COLUMN_WIDTH),
-                fit_display(&agent.effort, SMALL_COLUMN_WIDTH),
-            ),
-            theme::STYLE_TEXT,
-        )));
-    }
+    let rows: Vec<Vec<TableCell>> = sorted
+        .iter()
+        .map(|agent| {
+            let max_turns = agent
+                .max_turns
+                .map_or("-".to_string(), |turns| turns.to_string());
+            vec![
+                vec![Span::styled(
+                    replace_control_chars(&agent.name),
+                    theme::STYLE_TEXT,
+                )],
+                vec![Span::styled(
+                    replace_control_chars(&agent.model),
+                    theme::STYLE_TEXT,
+                )],
+                vec![Span::styled(
+                    replace_control_chars(&agent.effort),
+                    theme::STYLE_TEXT,
+                )],
+                vec![Span::styled(max_turns, theme::STYLE_TEXT)],
+            ]
+        })
+        .collect();
 
     // 2. 스킬 (개수와 설명 길이 합계)
+    let mut aux_lines: Vec<Line<'static>> = Vec::new();
     let description_total: usize = loaded
         .skills
         .iter()
         .map(|skill| skill.description_chars)
         .sum();
-    lines.push(Line::from(vec![
-        Span::styled("스킬 ", theme::STYLE_ACCENT),
+    aux_lines.push(Line::from(vec![
         Span::styled(
-            format!(
-                "{}개 · 설명 합계 {}자",
+            format!("{} ", i18n::text(lang, Msg::SettingsSkills)),
+            theme::STYLE_ACCENT,
+        ),
+        Span::styled(
+            i18n::skills_summary(
+                lang,
                 loaded.skills.len(),
-                format_count(description_total as i64)
+                &format_count(description_total as i64),
             ),
             theme::STYLE_TEXT,
         ),
     ]));
 
     // 3. env 키 (폭에 맞춰 줄바꿈)
-    lines.push(Line::from(Span::styled(
-        format!("env 키 ({}개)", loaded.env_keys.len()),
+    aux_lines.push(Line::from(Span::styled(
+        i18n::env_keys_heading(lang, loaded.env_keys.len()),
         theme::STYLE_ACCENT,
     )));
     let wrap_width = width.saturating_sub(2).max(20);
@@ -374,7 +399,7 @@ pub fn build_agent_lines(inventory: &Panel<Inventory>, width: usize, sort: SortS
     for key in &loaded.env_keys {
         let key_width = Span::raw(key.as_str()).width();
         if !current.is_empty() && Span::raw(current.as_str()).width() + 2 + key_width > wrap_width {
-            lines.push(Line::from(Span::styled(
+            aux_lines.push(Line::from(Span::styled(
                 format!("  {current}"),
                 theme::STYLE_TEXT,
             )));
@@ -386,96 +411,57 @@ pub fn build_agent_lines(inventory: &Panel<Inventory>, width: usize, sort: SortS
         current.push_str(key);
     }
     if !current.is_empty() {
-        lines.push(Line::from(Span::styled(
+        aux_lines.push(Line::from(Span::styled(
             format!("  {current}"),
             theme::STYLE_TEXT,
         )));
     }
-    CardLines {
-        header: Some(header_line.style(theme::STYLE_TABLE_HEADER)),
-        header_cells,
-        lines,
-    }
+    SettingsTable { rows, aux_lines }
 }
 
-// 6. 진단 결과 줄 -------------------------------------------------------------
-// 수준별 색 (ok 녹색, warn 노랑, fail 적색), 해결 힌트는 다음 줄, 정렬해도 힌트는 항목에 붙음
-pub fn build_doctor_lines(
-    doctor: &Panel<Vec<DoctorFinding>>,
-    width: usize,
+// 7. 진단 결과 표 -------------------------------------------------------------
+// 수준별 색 (ok 녹색, warn 노랑, fail 적색), 해결 힌트는 내용 칸 뒤에 붙어 정렬해도 항목을 따라감
+pub fn build_doctor_table(
+    lang: Lang,
+    findings: &[DoctorFinding],
     sort: SortState,
-) -> CardLines {
-    let Panel::Ready(findings) = doctor else {
-        return CardLines {
-            lines: unloaded_lines(doctor),
-            ..CardLines::default()
-        };
-    };
-    let mut lines: Vec<Line<'static>> = Vec::new();
-
-    // 1. 머리글
-    let body_width = width
-        .saturating_sub(DOCTOR_TAG_WIDTH + NAME_WIDTH + 2)
-        .max(10);
-    let (header_line, header_cells) = build_uniform_sort_header(
-        &[
-            ("수준", DOCTOR_TAG_WIDTH, false),
-            ("주제", NAME_WIDTH, false),
-            ("내용", body_width, false),
-        ],
-        sort,
-    );
-
-    // 2. 진단 줄 (정렬)
-    let mut sorted = findings.clone();
+) -> SettingsTable {
+    let mut sorted = findings.to_vec();
     sort_rows(&mut sorted, sort, compare_doctor_finding);
-    for finding in &sorted {
-        let (tag, style) = match finding.level.as_str() {
-            "ok" => ("[정상]", theme::STYLE_OK),
-            "warn" => ("[경고]", theme::STYLE_WARN),
-            "fail" => ("[실패]", theme::STYLE_CRIT),
-            _ => ("[기타]", theme::STYLE_DIM),
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{tag} "), style),
-            Span::styled(
-                format!("{} ", fit_display(&finding.topic, NAME_WIDTH)),
+    let rows: Vec<Vec<TableCell>> = sorted
+        .iter()
+        .map(|finding| {
+            let (tag, style) = match finding.level.as_str() {
+                "ok" => (Msg::DoctorOk, theme::STYLE_OK),
+                "warn" => (Msg::DoctorWarn, theme::STYLE_WARN),
+                "fail" => (Msg::DoctorFail, theme::STYLE_CRIT),
+                _ => (Msg::DoctorOther, theme::STYLE_DIM),
+            };
+            let mut message = vec![Span::styled(
+                replace_control_chars(&finding.message),
                 theme::STYLE_TEXT,
-            ),
-            Span::styled(
-                fit_display(&finding.message, body_width)
-                    .trim_end()
-                    .to_string(),
-                theme::STYLE_TEXT,
-            ),
-        ]));
-        if !finding.fix_hint.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled("    → ", theme::STYLE_ACCENT),
-                Span::styled(
-                    fit_display(&finding.fix_hint, width.saturating_sub(6).max(10))
-                        .trim_end()
-                        .to_string(),
+            )];
+            if !finding.fix_hint.is_empty() {
+                message.push(Span::styled(" → ", theme::STYLE_ACCENT));
+                message.push(Span::styled(
+                    replace_control_chars(&finding.fix_hint),
                     theme::STYLE_DIM,
-                ),
-            ]));
-        }
+                ));
+            }
+            vec![
+                vec![Span::styled(i18n::text(lang, tag), style)],
+                vec![Span::styled(
+                    replace_control_chars(&finding.topic),
+                    theme::STYLE_TEXT,
+                )],
+                message,
+            ]
+        })
+        .collect();
+    SettingsTable {
+        rows,
+        aux_lines: Vec::new(),
     }
-    CardLines {
-        header: Some(header_line.style(theme::STYLE_TABLE_HEADER)),
-        header_cells,
-        lines,
-    }
-}
-
-// 7. 적재 전 상태 줄 ----------------------------------------------------------
-// Pending·실패 문구를 색과 함께 한 줄로
-fn unloaded_lines<T>(panel: &Panel<T>) -> Vec<Line<'static>> {
-    let (message, color) = panel_message(panel).unwrap_or((String::new(), theme::FG_DIM));
-    vec![Line::from(Span::styled(
-        message,
-        Style::default().fg(color),
-    ))]
 }
 
 #[cfg(test)]
@@ -484,10 +470,30 @@ mod tests {
     use crate::inventory::{AgentEntry, HookEntry, McpEntry, SkillEntry};
     use crate::tui::sort::sort_spec;
 
-    fn line_text(line: &Line<'_>) -> String {
-        line.spans
+    const KO: Lang = Lang::Ko;
+
+    fn cell_text(cell: &TableCell) -> String {
+        cell.iter().map(|span| span.content.as_ref()).collect()
+    }
+
+    fn row_texts(table: &SettingsTable) -> Vec<Vec<String>> {
+        table
+            .rows
             .iter()
-            .map(|span| span.content.as_ref())
+            .map(|row| row.iter().map(cell_text).collect())
+            .collect()
+    }
+
+    fn aux_texts(table: &SettingsTable) -> Vec<String> {
+        table
+            .aux_lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
             .collect()
     }
 
@@ -533,38 +539,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn inventory_cards_cover_hooks_mcp_agents_skills_and_env() {
-        let inventory = Panel::Ready(sample_inventory());
-        let hook_card = build_hook_lines(&inventory, 100, default_sort(CardId::SettingsHooks));
-        let hook_text: Vec<String> = hook_card.lines.iter().map(line_text).collect();
-        assert!(line_text(&hook_card.header.unwrap()).contains("matcher"));
-        assert_eq!(hook_card.header_cells.len(), 6);
-        assert_eq!(hook_text.len(), 1);
-        assert!(hook_text[0].contains("PreToolUse"));
-        assert!(hook_text[0].contains("5s"));
-
-        let mcp_card = build_mcp_lines(&inventory, 100, default_sort(CardId::SettingsMcp));
-        let mcp_text: Vec<String> = mcp_card.lines.iter().map(line_text).collect();
-        assert!(mcp_text[0].contains("차단"));
-        assert_eq!(mcp_card.header_cells.len(), 4);
-
-        let agent_card = build_agent_lines(&inventory, 100, default_sort(CardId::SettingsAgents));
-        let agent_text = agent_card
-            .lines
-            .iter()
-            .map(line_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(agent_text.contains("worker"));
-        assert!(agent_text.contains("스킬 2개 · 설명 합계 1,320자"));
-        assert!(agent_text.contains("BASH_DEFAULT_TIMEOUT_MS, DEBUG"));
-        assert!(line_text(&agent_card.header.unwrap()).contains("최대턴"));
-    }
-
-    #[test]
-    fn doctor_card_colors_findings_and_prints_fix_hints() {
-        let findings = vec![
+    fn sample_findings() -> Vec<DoctorFinding> {
+        vec![
             DoctorFinding {
                 level: "ok".to_string(),
                 topic: "토큰".to_string(),
@@ -577,65 +553,163 @@ mod tests {
                 message: "47333 사용 중".to_string(),
                 fix_hint: "다른 포트로 변경".to_string(),
             },
-        ];
-        let card = build_doctor_lines(
-            &Panel::Ready(findings),
-            100,
-            default_sort(CardId::SettingsDoctor),
-        );
-        let text = card
-            .lines
-            .iter()
-            .map(line_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains("→ 다른 포트로 변경"));
-        assert_eq!(card.lines.len(), 3);
-        // 기본 정렬은 심각한 수준이 먼저, 힌트는 해당 항목 바로 뒤
-        assert_eq!(card.lines[0].spans[0].style, theme::STYLE_CRIT);
-        assert!(line_text(&card.lines[1]).contains("다른 포트로 변경"));
-        assert_eq!(card.lines[2].spans[0].style, theme::STYLE_OK);
+        ]
     }
 
     #[test]
-    fn header_sort_changes_row_order_and_marks_the_active_column() {
+    fn settings_columns_match_their_sort_specs_and_every_row_has_one_cell_per_column() {
+        let inventory = sample_inventory();
+        let findings = sample_findings();
+        let cases: [(CardId, usize, SettingsTable); 4] = [
+            (
+                CardId::SettingsHooks,
+                SETTINGS_HOOK_COLUMNS.len(),
+                build_hook_table(KO, &inventory, default_sort(CardId::SettingsHooks)),
+            ),
+            (
+                CardId::SettingsMcp,
+                SETTINGS_MCP_COLUMNS.len(),
+                build_mcp_table(KO, &inventory, default_sort(CardId::SettingsMcp)),
+            ),
+            (
+                CardId::SettingsAgents,
+                SETTINGS_AGENT_COLUMNS.len(),
+                build_agent_table(KO, &inventory, 80, default_sort(CardId::SettingsAgents)),
+            ),
+            (
+                CardId::SettingsDoctor,
+                SETTINGS_DOCTOR_COLUMNS.len(),
+                build_doctor_table(KO, &findings, default_sort(CardId::SettingsDoctor)),
+            ),
+        ];
+        for (card, columns, table) in cases {
+            assert_eq!(sort_spec(card).unwrap().kinds.len(), columns, "{card:?}");
+            assert!(!table.rows.is_empty(), "{card:?}");
+            for row in &table.rows {
+                assert_eq!(row.len(), columns, "{card:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn inventory_tables_cover_hooks_mcp_agents_skills_and_env() {
+        let inventory = sample_inventory();
+        let hooks = build_hook_table(KO, &inventory, default_sort(CardId::SettingsHooks));
+        assert_eq!(
+            row_texts(&hooks),
+            [[
+                "PreToolUse",
+                "Bash",
+                "http",
+                "http://127.0.0.1:47333/pretool",
+                "-",
+                "5s"
+            ]]
+        );
+        assert!(hooks.aux_lines.is_empty());
+
+        let mcp = build_mcp_table(KO, &inventory, default_sort(CardId::SettingsMcp));
+        assert_eq!(
+            row_texts(&mcp),
+            [["차단", "outline", "http", "https://example.invalid"]]
+        );
+        assert_eq!(mcp.rows[0][0][0].style, theme::STYLE_CRIT);
+        assert_eq!(mcp.rows[0][1][0].style, theme::STYLE_DIM);
+
+        let agents = build_agent_table(KO, &inventory, 100, default_sort(CardId::SettingsAgents));
+        assert_eq!(row_texts(&agents), [["worker", "sonnet", "high", "-"]]);
+        let aux = aux_texts(&agents).join("\n");
+        assert!(aux.contains("스킬 2개 · 설명 합계 1,320자"), "{aux}");
+        assert!(aux.contains("BASH_DEFAULT_TIMEOUT_MS, DEBUG"), "{aux}");
+    }
+
+    #[test]
+    fn doctor_rows_color_findings_and_keep_the_fix_hint_with_its_item() {
+        let findings = sample_findings();
+        let table = build_doctor_table(KO, &findings, default_sort(CardId::SettingsDoctor));
+        // 기본 정렬은 심각한 수준이 먼저, 힌트는 해당 항목의 내용 칸 뒤
+        assert_eq!(
+            row_texts(&table),
+            [
+                ["[실패]", "포트", "47333 사용 중 → 다른 포트로 변경"],
+                ["[정상]", "토큰", "정상"]
+            ]
+        );
+        assert_eq!(table.rows[0][0][0].style, theme::STYLE_CRIT);
+        assert_eq!(table.rows[1][0][0].style, theme::STYLE_OK);
+        assert!(table.aux_lines.is_empty());
+
+        // 주제 열 정렬을 바꿔도 힌트는 같은 항목을 따라감
+        let ascending = SortState {
+            column: 1,
+            descending: false,
+        };
+        let table = build_doctor_table(KO, &findings, ascending);
+        assert_eq!(row_texts(&table)[0][2], "정상");
+        assert!(row_texts(&table)[1][2].ends_with("다른 포트로 변경"));
+    }
+
+    #[test]
+    fn header_sort_changes_row_order() {
         let mut inventory = sample_inventory();
         inventory.hooks.push(HookEntry {
             event: "Notification".to_string(),
             timeout_secs: Some(30),
             ..HookEntry::default()
         });
-        let panel = Panel::Ready(inventory);
+        let first_event =
+            |sort: SortState| row_texts(&build_hook_table(KO, &inventory, sort))[0][0].clone();
         let by_timeout = SortState {
             column: 5,
             descending: true,
         };
-        let card = build_hook_lines(&panel, 100, by_timeout);
-        assert!(line_text(&card.lines[0]).contains("Notification"));
-        assert!(line_text(&card.header.unwrap()).contains("timeout↓"));
-
+        assert_eq!(first_event(by_timeout), "Notification");
         let by_event = SortState {
             column: 0,
             descending: false,
         };
-        let card = build_hook_lines(&panel, 100, by_event);
-        assert!(line_text(&card.lines[0]).contains("Notification"));
+        assert_eq!(first_event(by_event), "Notification");
         let reversed = SortState {
             column: 0,
             descending: true,
         };
-        let card = build_hook_lines(&panel, 100, reversed);
-        assert!(line_text(&card.lines[0]).contains("PreToolUse"));
+        assert_eq!(first_event(reversed), "PreToolUse");
     }
 
     #[test]
-    fn unloaded_panels_show_one_status_line() {
-        let inventory: Panel<Inventory> = Panel::Failed("내부 오류: boom".to_string());
-        let card = build_hook_lines(&inventory, 80, default_sort(CardId::SettingsHooks));
-        assert!(card.header.is_none());
-        assert_eq!(line_text(&card.lines[0]), "내부 오류: boom");
-        let doctor: Panel<Vec<DoctorFinding>> = Panel::Pending;
-        let card = build_doctor_lines(&doctor, 80, default_sort(CardId::SettingsDoctor));
-        assert_eq!(line_text(&card.lines[0]), "집계 대기 중");
+    fn aux_lines_hold_the_allowlist_warnings_and_wrapped_env_keys() {
+        let mut inventory = sample_inventory();
+        inventory.http_hook_allowlist = vec!["http://127.0.0.1:47333/*".to_string()];
+        inventory.warnings = vec!["settings.json: skipped".to_string()];
+        let hooks = build_hook_table(KO, &inventory, default_sort(CardId::SettingsHooks));
+        let aux = aux_texts(&hooks);
+        assert_eq!(aux.len(), 3);
+        assert!(aux[0].is_empty());
+        assert!(aux[2].contains("http://127.0.0.1:47333/*"), "{aux:?}");
+        let mcp = build_mcp_table(KO, &inventory, default_sort(CardId::SettingsMcp));
+        assert_eq!(aux_texts(&mcp), ["! settings.json: skipped"]);
+        assert_eq!(mcp.aux_lines[0].spans[0].style, theme::STYLE_WARN);
+
+        // 좁은 폭에서는 env 키가 여러 줄로 이어짐, 키는 중간에서 잘리지 않음
+        let sort = default_sort(CardId::SettingsAgents);
+        let narrow = aux_texts(&build_agent_table(KO, &inventory, 20, sort));
+        let wide = aux_texts(&build_agent_table(KO, &inventory, 100, sort));
+        assert!(narrow.len() > wide.len(), "{narrow:?} / {wide:?}");
+        assert!(
+            narrow
+                .iter()
+                .any(|line| line.contains("BASH_DEFAULT_TIMEOUT_MS"))
+        );
+    }
+
+    #[test]
+    fn values_from_settings_files_never_carry_control_characters_into_cells() {
+        let mut inventory = sample_inventory();
+        inventory.hooks[0].target = "a\nb\tc".to_string();
+        inventory.warnings = vec!["x\ny".to_string()];
+        let hooks = build_hook_table(KO, &inventory, default_sort(CardId::SettingsHooks));
+        assert_eq!(row_texts(&hooks)[0][3], "a b c");
+        let mcp = build_mcp_table(KO, &inventory, default_sort(CardId::SettingsMcp));
+        assert_eq!(aux_texts(&mcp), ["! x y"]);
     }
 }

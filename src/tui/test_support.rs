@@ -13,6 +13,7 @@ use crate::store::query::{
     AgentStatsRow, CacheBreakRow, HookStatRow, MinuteBucket, ModelStatsRow, OverviewStats,
     ToolLatencyRow,
 };
+use crate::tui::i18n::Lang;
 use crate::tui::state::{AppState, DashboardSnapshot, DbState, Panel};
 use chrono::{NaiveDate, Utc};
 use std::path::PathBuf;
@@ -20,8 +21,8 @@ use std::path::PathBuf;
 // 1. 합성 설정 ----------------------------------------------------------------
 pub fn sample_config() -> AppConfig {
     AppConfig {
-        data_dir: PathBuf::from("C:/rap-test-data"),
-        claude_home: PathBuf::from("C:/rap-test-claude"),
+        data_dir: PathBuf::from("C:/cm-test-data"),
+        claude_home: PathBuf::from("C:/cm-test-claude"),
         ports: PortConfig::default(),
         gateway: GatewayConfig::default(),
         hooks: HookConfig::default(),
@@ -33,17 +34,19 @@ pub fn sample_config() -> AppConfig {
 }
 
 // 2. 합성 화면 상태 -----------------------------------------------------------
+// 기존 한국어 문구 단언을 위해 한국어로 고정 (영어는 테스트가 lang 를 바꾸어 검사)
 pub fn sample_state_with_snapshot() -> AppState {
     let today = NaiveDate::from_ymd_opt(2026, 11, 15).unwrap();
     let mut state = AppState::new(sample_config(), today);
+    state.lang = Lang::Ko;
 
     let status = StatusSnapshot {
         version: "0.1.0".to_string(),
         pid: 4242,
         started_at: "2026-11-15T00:00:00Z".to_string(),
         uptime_secs: 3_900,
-        data_dir: "C:/rap-test-data".to_string(),
-        claude_home: "C:/rap-test-claude".to_string(),
+        data_dir: "C:/cm-test-data".to_string(),
+        claude_home: "C:/cm-test-claude".to_string(),
         ports: vec![
             PortStatus {
                 name: "admin".to_string(),

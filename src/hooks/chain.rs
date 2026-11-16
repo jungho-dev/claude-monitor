@@ -9,7 +9,7 @@ use bytes::Bytes;
 use serde_json::{Map, Value, json};
 use std::time::Duration;
 
-pub const FAIL_CLOSED_REASON: &str = "[rap] pretool-guard 응답 없음 (fail-closed)";
+pub const FAIL_CLOSED_REASON: &str = "[cm] pretool-guard 응답 없음 (fail-closed)";
 // 가드 사유에서 이름만 남기는 구형 CLI 목록 (명령 원문 보관 금지)
 const LEGACY_NAMES: [&str; 9] = [
     "cat", "ls", "eza", "grep", "find", "du", "top", "btop", "git diff",
@@ -181,14 +181,14 @@ pub async fn evaluate_pretool_chain(
         Some("ask") => "가드 재검사 확인 요청",
         _ => "가드 재검사 판정 없음",
     };
-    let rap_context = format!(
-        "[rap] 명령 자동 변환: {} ({verdict_note})",
+    let cm_context = format!(
+        "[cm] 명령 자동 변환: {} ({verdict_note})",
         rewrite.notes.join(", ")
     );
     let context = if guard_context.is_empty() {
-        rap_context
+        cm_context
     } else {
-        format!("{guard_context}\n{rap_context}")
+        format!("{guard_context}\n{cm_context}")
     };
     let mut updated_input = payload
         .as_ref()
@@ -202,7 +202,7 @@ pub async fn evaluate_pretool_chain(
             specific.insert("permissionDecision".to_string(), json!("allow"));
             specific.insert(
                 "permissionDecisionReason".to_string(),
-                json!("[rap] rewrite"),
+                json!("[cm] rewrite"),
             );
         }
         Some("ask") => {}
@@ -242,7 +242,7 @@ fn fail_closed_result(session_id: String, detail: String) -> ChainResult {
     ChainResult {
         body: Bytes::from(fail_closed_body()),
         outcome: HookOutcome::Error,
-        guard: "rap".to_string(),
+        guard: "cm".to_string(),
         detail,
         session_id,
         saved_ms: None,
@@ -271,12 +271,14 @@ pub fn extract_guard_label(reason: &str) -> String {
 }
 
 // 5. 구형 명령 이름 추출 ------------------------------------------------------
-/// 사유의 `감지:` 뒤 항목 중 구형 CLI 이름만 쉼표로 이어 반환 (원문 보관 금지).
+/// 사유의 `detected:`·`감지:` 뒤 항목 중 구형 CLI 이름만 쉼표로 이어 반환 (원문 보관 금지).
 pub fn extract_legacy_names(reason: &str) -> String {
-    let Some(marker) = reason.find("감지:") else {
+    let Some(tail) = ["detected:", "Detected:", "감지:"]
+        .iter()
+        .find_map(|marker| reason.find(marker).map(|at| &reason[at + marker.len()..]))
+    else {
         return String::new();
     };
-    let tail = &reason[marker + "감지:".len()..];
     let items = &tail[..tail.find(['\n', ')']).unwrap_or(tail.len())];
     let mut names: Vec<&str> = Vec::new();
     for piece in items.split(',') {

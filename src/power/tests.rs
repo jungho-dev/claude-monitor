@@ -112,7 +112,7 @@ fn tool_failure_hint_requires_overlap_with_run_window() {
     let hint = state
         .build_standby_hint("s1", overlapping, now_ms, &config)
         .expect("겹친 실패 안내");
-    assert!(hint.contains("[rap standby]"), "{hint}");
+    assert!(hint.contains("[cm standby]"), "{hint}");
     assert!(hint.contains("(14분)"), "{hint}");
 
     // 2. 같은 세션 재실패도 안내 (중복 억제 없음)
@@ -270,7 +270,7 @@ fn standby_hook_answers_context_or_empty_object() {
     assert!(
         specific["additionalContext"]
             .as_str()
-            .is_some_and(|text| text.contains("[rap standby]"))
+            .is_some_and(|text| text.contains("[cm standby]"))
     );
 
     // 2. 대상 아닌 이벤트와 깨진 본문

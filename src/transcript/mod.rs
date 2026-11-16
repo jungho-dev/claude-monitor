@@ -93,7 +93,7 @@ pub fn index_transcripts_with_events(
         let output = match scan_transcript_file(&request) {
             Ok(output) => output,
             Err(err) => {
-                eprintln!("[rap] 색인 건너뜀: {err:#}");
+                eprintln!("[cm] 색인 건너뜀: {err:#}");
                 continue;
             }
         };

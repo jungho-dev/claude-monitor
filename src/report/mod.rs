@@ -120,7 +120,7 @@ async fn generate_scheduled_report(ctx: &Arc<AppContext>, report_date: NaiveDate
         Ok(Err(err)) => format!("{err:#}"),
         Err(err) => format!("리포트 작업 중단: {err}"),
     };
-    eprintln!("[rap] 일일 리포트 실패 ({report_date}): {failure}");
+    eprintln!("[cm] 일일 리포트 실패 ({report_date}): {failure}");
     let _ = ctx.live_tx.send(LiveEvent::Notice {
         ts: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         level: "error".to_string(),
@@ -156,7 +156,7 @@ pub async fn run_report_scheduler(ctx: Arc<AppContext>) -> anyhow::Result<()> {
         )
         .await;
         if !indexed {
-            eprintln!("[rap] 첫 색인 대기 초과: 어제 리포트를 현재 색인 상태로 생성");
+            eprintln!("[cm] 첫 색인 대기 초과: 어제 리포트를 현재 색인 상태로 생성");
             let _ = ctx.live_tx.send(LiveEvent::Notice {
                 ts: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
                 level: "warn".to_string(),

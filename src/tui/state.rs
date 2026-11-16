@@ -1,7 +1,7 @@
 //! tui/state.rs
 //! TUI 화면 상태: 탭, 카드 포커스·배치·스크롤, 집계 구간, 패널 데이터, 키 입력 상태 전이.
 
-use crate::core::config::AppConfig;
+use crate::core::config::{AppConfig, TUI_STATE_FILE_NAME};
 use crate::core::model::{LiveEvent, StatusSnapshot};
 use crate::inventory::{DoctorFinding, Inventory};
 use crate::store::query::{
@@ -9,12 +9,13 @@ use crate::store::query::{
     ToolLatencyRow,
 };
 use crate::tui::cards::{
-    CARD_COUNT, CardId, CardKind, CardView, ColumnDrag, CursorMotion, MAX_TABLE_COLUMNS,
-    ScrollDrag, UiAction, UiHitAreas,
+    CARD_COUNT, CardId, CardKind, CardMove, CardPress, CardView, ColumnDrag, CursorMotion,
+    MAX_TABLE_COLUMNS, ScrollDrag, UiAction, UiHitAreas,
 };
 use crate::tui::format::{outline_entries, prepare_report_markdown};
+use crate::tui::i18n::{self, Failure, Lang, Msg};
 use crate::tui::layout::{CardLayout, SplitDrag, SplitGroup};
-use crate::tui::poller::live_event_key;
+use crate::tui::poller::{AdminAction, AdminOutcome, live_event_key};
 use crate::tui::sort::{
     SortChange, SortState, compare_agent_row, compare_cache_break_row, compare_event_row,
     compare_hook_row, compare_model_row, compare_tool_row, default_card_sorts, sort_rows,
@@ -22,6 +23,7 @@ use crate::tui::sort::{
 };
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 pub const TAB_COUNT: usize = 7;
@@ -59,16 +61,17 @@ impl ActiveTab {
         Self::Report,
     ];
 
-    pub fn tab_label(self) -> &'static str {
-        match self {
-            Self::Overview => "개요",
-            Self::Tools => "도구",
-            Self::Hooks => "훅",
-            Self::Models => "모델",
-            Self::Agents => "에이전트",
-            Self::Settings => "설정",
-            Self::Report => "리포트",
-        }
+    pub fn tab_label(self, lang: Lang) -> &'static str {
+        let msg = match self {
+            Self::Overview => Msg::TabOverview,
+            Self::Tools => Msg::TabTools,
+            Self::Hooks => Msg::TabHooks,
+            Self::Models => Msg::TabModels,
+            Self::Agents => Msg::TabAgents,
+            Self::Settings => Msg::TabSettings,
+            Self::Report => Msg::TabReport,
+        };
+        i18n::text(lang, msg)
     }
 
     // 클릭한 카드가 없을 때 키 입력을 받는 탭의 주 카드
@@ -87,11 +90,18 @@ impl ActiveTab {
     // 열 폭을 끌어 조절하는 표 카드 (배치 초기화 대상)
     pub fn table_cards(self) -> &'static [CardId] {
         match self {
+            Self::Overview => &[CardId::EventFeed],
             Self::Tools => &[CardId::ToolTable],
             Self::Hooks => &[CardId::HookTable],
             Self::Models => &[CardId::ModelTable, CardId::CacheBreaks],
             Self::Agents => &[CardId::AgentTable],
-            Self::Overview | Self::Settings | Self::Report => &[],
+            Self::Settings => &[
+                CardId::SettingsHooks,
+                CardId::SettingsMcp,
+                CardId::SettingsAgents,
+                CardId::SettingsDoctor,
+            ],
+            Self::Report => &[],
         }
     }
 
@@ -125,12 +135,13 @@ pub enum WindowKind {
 }
 
 impl WindowKind {
-    pub fn window_label(self) -> &'static str {
-        match self {
-            Self::Hour => "1시간",
-            Self::Day => "24시간",
-            Self::Week => "7일",
-        }
+    pub fn window_label(self, lang: Lang) -> &'static str {
+        let msg = match self {
+            Self::Hour => Msg::WindowHour,
+            Self::Day => Msg::WindowDay,
+            Self::Week => Msg::WindowWeek,
+        };
+        i18n::text(lang, msg)
     }
 
     pub fn window_span(self) -> ChronoDuration {
@@ -149,7 +160,7 @@ pub enum Panel<T> {
     #[default]
     Pending,
     Ready(T),
-    Failed(String),
+    Failed(Failure),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -158,7 +169,7 @@ pub enum DbState {
     Pending,
     Missing,
     Open,
-    Failed(String),
+    Failed(Failure),
 }
 
 // 4. 수집 스냅샷 --------------------------------------------------------------
@@ -206,9 +217,14 @@ pub enum UiMessage {
         date: NaiveDate,
         body: Panel<Option<String>>,
     },
-    Toast {
-        text: String,
-        level: ToastLevel,
+    // 관리 요청 결과 (알림 문구는 화면 언어로 UI 스레드에서 만듦)
+    Admin {
+        action: AdminAction,
+        outcome: AdminOutcome,
+    },
+    // 상태 파일 저장 스레드의 실패 (detail = 번역하지 않는 오류 원문, 알림 문구는 UI 스레드가 만듦)
+    StateSaveFailed {
+        detail: String,
     },
 }
 
@@ -223,11 +239,16 @@ pub enum UiCommand {
     GenerateReport(NaiveDate),
     Reindex,
     SetTopmost(bool),
+    // 카드 배치(순서·경계·열 폭)나 표시 언어가 확정돼 상태 파일 저장 필요 (쓰기는 저장 스레드가 함)
+    SaveState,
 }
 
 // 8. 화면 상태 ----------------------------------------------------------------
 pub struct AppState {
     pub config: AppConfig,
+    // 상태 파일(tui.toml) 경로, 시작할 때 한 번 정함 (new 는 데이터 폴더 기준, 실행 진입점이 홈 공용 폴더로 교체)
+    pub state_file: PathBuf,
+    pub lang: Lang,
     pub today: NaiveDate,
     pub tab: ActiveTab,
     pub window: WindowKind,
@@ -236,11 +257,14 @@ pub struct AppState {
     pub card_sorts: [SortState; CARD_COUNT],
     // 카드별 스크롤·선택 (탭을 오가도 유지)
     pub card_views: [CardView; CARD_COUNT],
-    // 카드 경계 비율 (세션 동안 메모리에만 보관), 드래그 중·마우스 아래 경계
+    // 카드 경계 비율·순서 (tui.toml 로 저장·복원), 드래그 중·마우스 아래 경계
     pub card_layout: CardLayout,
     pub split_drag: Option<SplitDrag>,
+    // 카드 제목을 누른 채 대기 중, 길게 눌러 진입한 카드 이동 중
+    pub card_press: Option<CardPress>,
+    pub card_move: Option<CardMove>,
     pub split_hover: Option<(SplitGroup, usize)>,
-    // 카드별 끌어 정한 열 폭 (None 이면 자동 폭, 세션 동안 메모리에만 보관), 열 경계 드래그 중·마우스 아래 경계
+    // 카드별 끌어 정한 열 폭 (None 이면 자동 폭, tui.toml 로 저장·복원), 열 경계 드래그 중·마우스 아래 경계
     // last_column_click = 끌지 않고 뗀 직전 경계 클릭 (더블클릭 판정용)
     pub column_widths: [[Option<u16>; MAX_TABLE_COLUMNS]; CARD_COUNT],
     pub column_drag: Option<ColumnDrag>,
@@ -249,6 +273,8 @@ pub struct AppState {
     // 스크롤바 썸 드래그 중, 마우스가 트랙 위에 있는 카드
     pub scroll_drag: Option<ScrollDrag>,
     pub scroll_hover: Option<CardId>,
+    // 다른 실행 요청에 밀려 아직 보내지 못한 상태 파일 저장 (이벤트 루프가 이벤트마다 확인해 보냄)
+    pub save_pending: bool,
     // 클릭한 카드(선택 당시 탭에서만 유효), 마우스 아래 카드
     pub focused_card: Option<(ActiveTab, CardId)>,
     pub hover_card: Option<CardId>,
@@ -270,7 +296,9 @@ impl AppState {
     // 8-1. 초기 상태 (리포트 날짜 기본값 = 어제)
     pub fn new(config: AppConfig, today: NaiveDate) -> Self {
         Self {
+            state_file: config.data_dir.join(TUI_STATE_FILE_NAME),
             config,
+            lang: Lang::default(),
             today,
             tab: ActiveTab::Overview,
             window: WindowKind::Hour,
@@ -279,6 +307,8 @@ impl AppState {
             card_views: [CardView::default(); CARD_COUNT],
             card_layout: CardLayout::default(),
             split_drag: None,
+            card_press: None,
+            card_move: None,
             split_hover: None,
             column_widths: [[None; MAX_TABLE_COLUMNS]; CARD_COUNT],
             column_drag: None,
@@ -286,6 +316,7 @@ impl AppState {
             last_column_click: None,
             scroll_drag: None,
             scroll_hover: None,
+            save_pending: false,
             focused_card: None,
             hover_card: None,
             hit_areas: UiHitAreas::default(),
@@ -302,23 +333,24 @@ impl AppState {
         }
     }
 
-    // 8-2. 탭 전환 (설정은 첫 진입 시, 리포트는 진입마다 적재 요청)
+    // 8-2. 탭 전환 (설정은 첫 진입 시, 리포트는 진입마다 적재 요청, 끌어 움직인 경계·열 폭은 버리지 않고 저장)
     pub fn switch_tab(&mut self, tab: ActiveTab) -> UiCommand {
+        self.cancel_card_move();
+        let saved = self.end_drags(None);
         self.tab = tab;
         self.hover_card = None;
         self.split_hover = None;
         self.column_hover = None;
-        self.column_drag = None;
         self.scroll_hover = None;
-        self.scroll_drag = None;
-        match tab {
+        let command = match tab {
             ActiveTab::Settings if !self.settings_requested => {
                 self.settings_requested = true;
                 UiCommand::LoadSettings
             }
             ActiveTab::Report => UiCommand::LoadReport(self.report_date),
             _ => UiCommand::None,
-        }
+        };
+        self.merge_save(saved, command)
     }
 
     // 8-3. 키 입력 대상 카드 (클릭한 카드가 이 탭 것이면 그 카드, 아니면 탭의 주 카드)
@@ -352,7 +384,15 @@ impl AppState {
             return UiCommand::None;
         }
 
-        // 3. 키별 전이
+        // 3. 카드 이동 중·길게 누름 대기 중에는 Esc 취소만 받음
+        if self.card_move.is_some() || self.card_press.is_some() {
+            if key.code == KeyCode::Esc {
+                self.cancel_card_move();
+            }
+            return UiCommand::None;
+        }
+
+        // 4. 키별 전이
         let slot = self.tab as usize;
         let card = self.focused_card_id();
         match key.code {
@@ -365,6 +405,12 @@ impl AppState {
             KeyCode::Tab => self.switch_tab(ActiveTab::ALL[(slot + 1) % TAB_COUNT]),
             KeyCode::Char(digit @ '1'..='7') => {
                 self.switch_tab(ActiveTab::ALL[digit as usize - '1' as usize])
+            }
+            // Shift+방향키는 포커스 카드 위치 이동 (리포트 날짜 이동 등 일반 방향키보다 먼저)
+            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
+                if key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                self.shift_focused_card(card, key.code)
             }
             KeyCode::Up => self.step_focused_card(card, CursorMotion::Lines(-1)),
             KeyCode::Down => self.step_focused_card(card, CursorMotion::Lines(1)),
@@ -402,7 +448,8 @@ impl AppState {
             }
             KeyCode::Char('i' | 'I') => self.perform_action(UiAction::Reindex),
             KeyCode::Char('t' | 'T') => self.perform_action(UiAction::TogglePin),
-            KeyCode::Char('l' | 'L') => self.perform_action(UiAction::ResetLayout),
+            KeyCode::Char('l') => self.perform_action(UiAction::ResetLayout),
+            KeyCode::Char('L') => self.perform_action(UiAction::ToggleLanguage),
             _ => UiCommand::None,
         }
     }
@@ -434,12 +481,12 @@ impl AppState {
             },
             UiAction::TogglePin => {
                 self.always_on_top = !self.always_on_top;
-                let text = if self.always_on_top {
-                    "창 최상단 고정"
+                let toast = if self.always_on_top {
+                    Msg::ToastPinned
                 } else {
-                    "창 최상단 고정 해제"
+                    Msg::ToastUnpinned
                 };
-                self.show_toast(text, ToastLevel::Info);
+                self.show_toast(i18n::text(self.lang, toast), ToastLevel::Info);
                 UiCommand::SetTopmost(self.always_on_top)
             }
             UiAction::ResetLayout => {
@@ -451,8 +498,19 @@ impl AppState {
                 self.split_hover = None;
                 self.column_drag = None;
                 self.column_hover = None;
-                self.show_toast("카드 크기·열 폭 기본 배치 복원", ToastLevel::Info);
-                UiCommand::None
+                self.show_toast(
+                    i18n::text(self.lang, Msg::ToastLayoutReset),
+                    ToastLevel::Info,
+                );
+                UiCommand::SaveState
+            }
+            UiAction::ToggleLanguage => {
+                self.lang = match self.lang {
+                    Lang::En => Lang::Ko,
+                    Lang::Ko => Lang::En,
+                };
+                self.show_toast(i18n::text(self.lang, Msg::ToastLanguage), ToastLevel::Info);
+                UiCommand::SaveState
             }
             UiAction::ReportPrev => {
                 self.report_date = self.report_date.pred_opt().unwrap_or(self.report_date);
@@ -594,10 +652,18 @@ impl AppState {
                     self.report = body;
                 }
             }
-            UiMessage::Toast { text, level } => {
+            UiMessage::Admin { action, outcome } => {
+                let (text, level) = i18n::admin_toast(self.lang, action, &outcome);
                 self.toast = Some(Toast {
                     text,
                     level,
+                    expires_at: now + TOAST_LIFETIME,
+                });
+            }
+            UiMessage::StateSaveFailed { detail } => {
+                self.toast = Some(Toast {
+                    text: i18n::state_save_failed(self.lang, &detail),
+                    level: ToastLevel::Error,
                     expires_at: now + TOAST_LIFETIME,
                 });
             }
@@ -724,6 +790,7 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::cards::SlotGroupHit;
     use crate::tui::test_support::sample_config;
     use crossterm::event::KeyEventKind;
 
@@ -731,9 +798,12 @@ mod tests {
         KeyEvent::new_with_kind(code, KeyModifiers::NONE, KeyEventKind::Press)
     }
 
+    // 기존 한국어 문구 단언을 위해 한국어로 고정
     fn sample_state() -> AppState {
         let today = NaiveDate::from_ymd_opt(2026, 11, 15).unwrap();
-        AppState::new(sample_config(), today)
+        let mut state = AppState::new(sample_config(), today);
+        state.lang = Lang::Ko;
+        state
     }
 
     #[test]
@@ -1021,9 +1091,9 @@ mod tests {
 
         // 합계 내림차순: Bash, Read, Edit 에서 Read 선택
         state.card_views[table].selected = 1;
-        // 호출 오름차순으로 바꾸면 Bash, Edit, Read 이라 선택은 셋째 행
+        // 호출 내림차순으로 바꾸면 Read, Edit, Bash 이라 선택은 첫째 행 (숫자 열은 내림차순부터)
         state.change_card_sort(CardId::ToolTable, SortChange::SelectColumn(1));
-        assert_eq!(state.card_views[table].selected, 2);
+        assert_eq!(state.card_views[table].selected, 0);
         // 이름 오름차순: Bash, Edit, Read 에서 Read 는 그대로 셋째 행
         state.change_card_sort(CardId::ToolTable, SortChange::SelectColumn(0));
         assert_eq!(state.card_views[table].selected, 2);
@@ -1043,7 +1113,7 @@ mod tests {
         state.change_card_sort(CardId::EventFeed, SortChange::SelectColumn(0));
         assert_eq!(state.card_views[feed].selected, 3);
 
-        // 모델 표: 요청 내림차순(a, b, c)에서 둘째 행 b 선택 후 세션 오름차순(a, c, b)으로
+        // 모델 표: 요청 내림차순(a, b, c)에서 둘째 행 b 선택 후 세션 내림차순(b, c, a)으로
         let model = |name: &str, requests: u64, sessions: u64| ModelStatsRow {
             model: name.to_string(),
             requests,
@@ -1058,7 +1128,7 @@ mod tests {
         let models = CardId::ModelTable as usize;
         state.card_views[models].selected = 1;
         state.change_card_sort(CardId::ModelTable, SortChange::SelectColumn(2));
-        assert_eq!(state.card_views[models].selected, 2);
+        assert_eq!(state.card_views[models].selected, 0);
     }
 
     #[test]
@@ -1134,30 +1204,37 @@ mod tests {
 
     #[test]
     fn layout_reset_key_clears_only_current_tab_groups() {
-        use crate::tui::layout::{SplitAxis, SplitHit};
+        use crate::tui::cards::UiHitAreas;
+        use crate::tui::layout::{IDENTITY_ORDER, SplitAxis};
         use ratatui::layout::Rect;
 
         let mut state = sample_state();
-        let mut hits: Vec<SplitHit> = Vec::new();
+        let mut hit_areas = UiHitAreas::default();
         let area = Rect::new(0, 0, 100, 30);
         state.card_layout.split_cards(
-            &mut hits,
+            &mut hit_areas,
             SplitGroup::ToolsRows,
             SplitAxis::Rows,
             area,
             &[20],
             &[5, 3],
         );
-        let hit = hits[0];
+        let hit = hit_areas.split_hits[0];
         state.card_layout.drag_cut(&hit, 10);
+        state
+            .card_layout
+            .move_card_to_slot(SplitGroup::ToolsRows, &IDENTITY_ORDER, 0, 1);
         assert!(
             state
                 .card_layout
                 .has_custom_groups(&[SplitGroup::ToolsRows])
         );
 
-        // 개요 탭에서 초기화해도 도구 탭 배치는 유지
-        state.handle_key_event(press(KeyCode::Char('l')));
+        // 개요 탭에서 초기화해도 도구 탭 배치는 유지 (저장 요청은 항상)
+        assert_eq!(
+            state.handle_key_event(press(KeyCode::Char('l'))),
+            UiCommand::SaveState
+        );
         assert!(
             state
                 .card_layout
@@ -1165,13 +1242,251 @@ mod tests {
         );
         assert!(state.toast.is_some());
 
+        // 도구 탭에서는 경계 비율과 카드 순서가 함께 기본으로
         state.handle_key_event(press(KeyCode::Char('2')));
-        state.handle_key_event(press(KeyCode::Char('l')));
+        assert_eq!(
+            state.handle_key_event(press(KeyCode::Char('l'))),
+            UiCommand::SaveState
+        );
         assert!(
             !state
                 .card_layout
                 .has_custom_groups(&[SplitGroup::ToolsRows])
         );
+        assert_eq!(
+            state.card_layout.order_of(SplitGroup::ToolsRows),
+            IDENTITY_ORDER
+        );
+    }
+
+    fn shift_press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new_with_kind(code, KeyModifiers::SHIFT, KeyEventKind::Press)
+    }
+
+    // 그리기 없이 모든 순서 그룹이 이번 프레임에 그려진 것으로 표시
+    fn mark_all_groups_drawn(state: &mut AppState) {
+        for group in SplitGroup::ALL {
+            state.hit_areas.slot_groups.push(SlotGroupHit {
+                group,
+                axis: group.axis(),
+                slots: Vec::new(),
+                cards: Vec::new(),
+            });
+        }
+    }
+
+    #[test]
+    fn shift_down_and_up_move_the_focused_card_within_a_rows_group() {
+        let mut state = sample_state();
+        mark_all_groups_drawn(&mut state);
+        state.handle_key_event(press(KeyCode::Char('6')));
+        assert_eq!(state.focused_card_id(), CardId::SettingsHooks);
+
+        // 첫 카드를 한 칸 아래로: 다음 카드가 한 칸 위로, 알림과 저장 요청
+        assert_eq!(
+            state.handle_key_event(shift_press(KeyCode::Down)),
+            UiCommand::SaveState
+        );
+        assert_eq!(
+            state.card_layout.order_of(SplitGroup::SettingsRows)[..4],
+            [1, 0, 2, 3]
+        );
+        assert_eq!(
+            state.toast.as_ref().map(|toast| toast.text.as_str()),
+            Some("카드 위치 변경 (l 기본 배치)")
+        );
+        assert_eq!(state.toast.as_ref().unwrap().level, ToastLevel::Info);
+
+        // 위로 되돌리면 기본 배치와 같아짐, 맨 위에서 더 올리면 아무 일 없음
+        assert_eq!(
+            state.handle_key_event(shift_press(KeyCode::Up)),
+            UiCommand::SaveState
+        );
+        assert_eq!(state.card_layout, CardLayout::default());
+        assert_eq!(
+            state.handle_key_event(shift_press(KeyCode::Up)),
+            UiCommand::None
+        );
+        assert_eq!(state.card_layout, CardLayout::default());
+
+        // 세로 나열 그룹은 ←→ 를 받지 않음
+        assert_eq!(
+            state.handle_key_event(shift_press(KeyCode::Right)),
+            UiCommand::None
+        );
+        assert_eq!(state.card_layout, CardLayout::default());
+
+        // 마지막 카드 아래로는 이동 없음
+        state.focused_card = Some((ActiveTab::Settings, CardId::SettingsDoctor));
+        assert_eq!(
+            state.handle_key_event(shift_press(KeyCode::Down)),
+            UiCommand::None
+        );
+        assert_eq!(
+            state.handle_key_event(shift_press(KeyCode::Up)),
+            UiCommand::SaveState
+        );
+        assert_eq!(
+            state.card_layout.order_of(SplitGroup::SettingsRows)[..4],
+            [0, 1, 3, 2]
+        );
+    }
+
+    #[test]
+    fn shift_left_and_right_move_cards_within_a_columns_group_and_keep_report_date_keys() {
+        let mut state = sample_state();
+        mark_all_groups_drawn(&mut state);
+        // 개요 탭 기본 포커스(이벤트 피드)는 가로 그룹: ←→ 만 받음
+        assert_eq!(state.focused_card_id(), CardId::EventFeed);
+        assert_eq!(
+            state.handle_key_event(shift_press(KeyCode::Down)),
+            UiCommand::None
+        );
+        assert_eq!(
+            state.handle_key_event(shift_press(KeyCode::Left)),
+            UiCommand::None
+        );
+        assert_eq!(
+            state.handle_key_event(shift_press(KeyCode::Right)),
+            UiCommand::SaveState
+        );
+        assert_eq!(
+            state.card_layout.order_of(SplitGroup::OverviewFeedCols)[..2],
+            [1, 0]
+        );
+        assert!(
+            !state
+                .card_layout
+                .has_custom_groups(&[SplitGroup::OverviewKpiCols])
+        );
+
+        // 리포트 탭: Shift+←→ 는 카드 이동, 일반 ←→ 는 날짜 이동
+        state.handle_key_event(press(KeyCode::Char('7')));
+        assert_eq!(state.focused_card_id(), CardId::ReportBody);
+        assert_eq!(
+            state.handle_key_event(shift_press(KeyCode::Left)),
+            UiCommand::SaveState
+        );
+        assert_eq!(
+            state.card_layout.order_of(SplitGroup::ReportCols)[..2],
+            [1, 0]
+        );
+        let today = NaiveDate::from_ymd_opt(2026, 11, 15).unwrap();
+        let yesterday = NaiveDate::from_ymd_opt(2026, 11, 14).unwrap();
+        assert_eq!(
+            state.handle_key_event(press(KeyCode::Right)),
+            UiCommand::LoadReport(today)
+        );
+        assert_eq!(
+            state.handle_key_event(press(KeyCode::Left)),
+            UiCommand::LoadReport(yesterday)
+        );
+        assert_eq!(
+            state.card_layout.order_of(SplitGroup::ReportCols)[..2],
+            [1, 0]
+        );
+    }
+
+    #[test]
+    fn plain_arrows_still_scroll_and_cards_outside_reorder_groups_ignore_shift_arrows() {
+        let mut state = sample_state();
+        mark_all_groups_drawn(&mut state);
+        state.handle_key_event(press(KeyCode::Char('6')));
+        let hooks = CardId::SettingsHooks as usize;
+        state.card_views[hooks].total = 30;
+        state.card_views[hooks].visible = 10;
+
+        // 일반 ↓ 는 스크롤, Shift+↓ 는 스크롤하지 않고 카드를 이동
+        state.handle_key_event(press(KeyCode::Down));
+        assert_eq!(state.card_views[hooks].scroll, 1);
+        state.handle_key_event(shift_press(KeyCode::Down));
+        assert_eq!(state.card_views[hooks].scroll, 1);
+        assert_eq!(
+            state.card_layout.order_of(SplitGroup::SettingsRows)[..2],
+            [1, 0]
+        );
+
+        // 서버 상태 카드는 순서 대상이 아님
+        state.handle_key_event(press(KeyCode::Char('1')));
+        state.focused_card = Some((ActiveTab::Overview, CardId::ServerStatus));
+        let before = state.card_layout;
+        assert_eq!(
+            state.handle_key_event(shift_press(KeyCode::Down)),
+            UiCommand::None
+        );
+        assert_eq!(
+            state.handle_key_event(shift_press(KeyCode::Right)),
+            UiCommand::None
+        );
+        assert_eq!(state.card_layout, before);
+    }
+
+    #[test]
+    fn esc_during_a_card_move_cancels_it_instead_of_quitting_and_other_keys_wait() {
+        use crate::tui::cards::CardMove;
+
+        let mut state = sample_state();
+        state.handle_key_event(press(KeyCode::Char('6')));
+        let baseline = state.card_layout.order_of(SplitGroup::SettingsRows);
+        state
+            .card_layout
+            .move_card_to_slot(SplitGroup::SettingsRows, &baseline, 0, 2);
+        state.card_move = Some(CardMove {
+            card: CardId::SettingsHooks,
+            group: SplitGroup::SettingsRows,
+            index: 0,
+            baseline,
+            target: 2,
+        });
+
+        // 이동 중 일반 키는 무시, 탭도 바뀌지 않음
+        assert_eq!(
+            state.handle_key_event(press(KeyCode::Char('2'))),
+            UiCommand::None
+        );
+        assert_eq!(state.tab, ActiveTab::Settings);
+        assert!(state.card_move.is_some());
+
+        // Esc: 종료하지 않고 누르기 전 순서로 복원
+        assert_eq!(state.handle_key_event(press(KeyCode::Esc)), UiCommand::None);
+        assert!(!state.should_quit);
+        assert!(state.card_move.is_none());
+        assert_eq!(state.card_layout, CardLayout::default());
+
+        // 이동이 끝나면 Esc 는 다시 종료
+        state.handle_key_event(press(KeyCode::Esc));
+        assert!(state.should_quit);
+    }
+
+    #[test]
+    fn switching_tabs_cancels_a_pending_press_and_a_card_move() {
+        use crate::tui::cards::{CardMove, CardPress};
+
+        let mut state = sample_state();
+        state.handle_key_event(press(KeyCode::Char('6')));
+        let baseline = state.card_layout.order_of(SplitGroup::SettingsRows);
+        state
+            .card_layout
+            .move_card_to_slot(SplitGroup::SettingsRows, &baseline, 0, 3);
+        state.card_move = Some(CardMove {
+            card: CardId::SettingsHooks,
+            group: SplitGroup::SettingsRows,
+            index: 0,
+            baseline,
+            target: 3,
+        });
+        state.card_press = Some(CardPress {
+            card: CardId::SettingsMcp,
+            group: SplitGroup::SettingsRows,
+            index: 1,
+            started: Instant::now(),
+            cell: ratatui::layout::Position::new(0, 0),
+        });
+
+        state.switch_tab(ActiveTab::Hooks);
+        assert!(state.card_move.is_none());
+        assert!(state.card_press.is_none());
+        assert_eq!(state.card_layout, CardLayout::default());
     }
 
     #[test]
@@ -1410,18 +1725,124 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_state_starts_in_english() {
+        let today = NaiveDate::from_ymd_opt(2026, 11, 15).unwrap();
+        let state = AppState::new(sample_config(), today);
+        assert_eq!(state.lang, Lang::En);
+        assert_eq!(ActiveTab::Overview.tab_label(state.lang), "Overview");
+        assert_eq!(WindowKind::Hour.window_label(state.lang), "1h");
+    }
+
+    #[test]
+    fn shift_l_toggles_the_language_both_ways_and_requests_a_save() {
+        let mut state = sample_state();
+        assert_eq!(state.lang, Lang::Ko);
+
+        assert_eq!(
+            state.handle_key_event(shift_press(KeyCode::Char('L'))),
+            UiCommand::SaveState
+        );
+        assert_eq!(state.lang, Lang::En);
+        let toast = state.toast.as_ref().unwrap();
+        assert_eq!(
+            (toast.text.as_str(), toast.level),
+            ("Language: English", ToastLevel::Info)
+        );
+
+        // 콤키 조합 없이 대문자만 와도 같은 키
+        assert_eq!(
+            state.handle_key_event(press(KeyCode::Char('L'))),
+            UiCommand::SaveState
+        );
+        assert_eq!(state.lang, Lang::Ko);
+        assert_eq!(state.toast.as_ref().unwrap().text, "언어: 한국어");
+
+        // 도움말이 열려 있으면 닫기만
+        state.show_help = true;
+        assert_eq!(
+            state.handle_key_event(shift_press(KeyCode::Char('L'))),
+            UiCommand::None
+        );
+        assert_eq!(state.lang, Lang::Ko);
+        assert!(!state.show_help);
+    }
+
+    #[test]
+    fn plain_l_resets_the_layout_and_keeps_the_language() {
+        for lang in [Lang::En, Lang::Ko] {
+            let mut state = sample_state();
+            state.lang = lang;
+            assert_eq!(
+                state.handle_key_event(press(KeyCode::Char('l'))),
+                UiCommand::SaveState
+            );
+            assert_eq!(state.lang, lang);
+            let expected = match lang {
+                Lang::En => "Card size, order, widths reset",
+                Lang::Ko => "카드 크기·순서·열 폭 기본 배치 복원",
+            };
+            assert_eq!(state.toast.as_ref().unwrap().text, expected);
+        }
+    }
+
+    #[test]
+    fn pin_toast_follows_the_active_language() {
+        let mut state = sample_state();
+        state.lang = Lang::En;
+        state.handle_key_event(press(KeyCode::Char('t')));
+        assert_eq!(state.toast.as_ref().unwrap().text, "Window pinned on top");
+        state.handle_key_event(press(KeyCode::Char('t')));
+        assert_eq!(state.toast.as_ref().unwrap().text, "Window unpinned");
+        state.lang = Lang::Ko;
+        state.handle_key_event(press(KeyCode::Char('t')));
+        assert_eq!(state.toast.as_ref().unwrap().text, "창 최상단 고정");
+    }
+
+    #[test]
     fn toast_message_sets_expiry_from_now() {
         let mut state = sample_state();
         let now = Instant::now();
+        let reindexed = || UiMessage::Admin {
+            action: AdminAction::Reindex,
+            outcome: AdminOutcome::Done("ok".to_string()),
+        };
+        state.apply_ui_message(reindexed(), now);
+        let toast = state.toast.as_ref().unwrap();
+        assert_eq!(toast.text, "재색인 완료 ok");
+        assert_eq!(toast.level, ToastLevel::Success);
+        assert_eq!(toast.expires_at, now + TOAST_LIFETIME);
+
+        // 알림 문구는 수신 시점의 화면 언어로 만듦
+        state.lang = Lang::En;
+        state.apply_ui_message(reindexed(), now);
+        assert_eq!(state.toast.as_ref().unwrap().text, "Reindex done ok");
+    }
+
+    #[test]
+    fn a_state_save_failure_message_becomes_an_error_toast_in_the_active_language() {
+        let mut state = sample_state();
+        let now = Instant::now();
         state.apply_ui_message(
-            UiMessage::Toast {
-                text: "재색인 완료".to_string(),
-                level: ToastLevel::Success,
+            UiMessage::StateSaveFailed {
+                detail: "access denied".to_string(),
             },
             now,
         );
         let toast = state.toast.as_ref().unwrap();
-        assert_eq!(toast.text, "재색인 완료");
+        assert_eq!(toast.text, "화면 상태 저장 실패: access denied");
+        assert_eq!(toast.level, ToastLevel::Error);
         assert_eq!(toast.expires_at, now + TOAST_LIFETIME);
+
+        state.lang = Lang::En;
+        state.apply_ui_message(
+            UiMessage::StateSaveFailed {
+                detail: "access denied".to_string(),
+            },
+            now,
+        );
+        assert_eq!(
+            state.toast.as_ref().unwrap().text,
+            "Saving UI state failed: access denied"
+        );
     }
 }

@@ -36,7 +36,7 @@ pub fn unique_temp_dir(label: &str) -> PathBuf {
         .unwrap_or(0);
     let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "rap-test-{label}-{}-{nanos}-{sequence}",
+        "cm-test-{label}-{}-{nanos}-{sequence}",
         std::process::id()
     ));
     fs::create_dir_all(&dir).expect("임시 폴더 생성");
@@ -82,7 +82,7 @@ pub fn prepare_fixture_workspace(label: &str) -> TestWorkspace {
         power: PowerConfig::default(),
         source_path: None,
     };
-    let store = Store::open_store(&root.join("data").join("rap.sqlite")).expect("DB 열기");
+    let store = Store::open_store(&root.join("data").join("cm.sqlite")).expect("DB 열기");
     TestWorkspace {
         config,
         store,
@@ -113,7 +113,7 @@ pub fn remove_temp_dir(dir: &Path) {
                 Err(_) => std::thread::sleep(Duration::from_millis(DEFERRED_RETRY_MS)),
             }
         }
-        eprintln!("[rap-test] 임시 폴더 삭제 실패 {}", pending.display());
+        eprintln!("[cm-test] 임시 폴더 삭제 실패 {}", pending.display());
     });
 }
 

@@ -1,105 +1,39 @@
 //! tui/views/feed.rs
-//! 이벤트 피드: 열 격자, 고정 머리글, 이벤트 한 줄, 상세 줄, 같은 종류 맥락 줄.
+//! 이벤트 피드: 표 열 명세와 이벤트 한 행의 칸, 상세 줄, 같은 종류 맥락 줄.
 
 use crate::core::model::{HookOutcome, LiveEvent};
-use crate::tui::cards::HeaderSpan;
 use crate::tui::format::{
     fit_display, fit_display_middle, format_clock_time, format_compact, format_duration_ms,
-    pad_left_display, short_agent, short_model, short_tool,
+    pad_left_display, replace_control_chars, short_model, short_tool,
 };
-use crate::tui::sort::SortState;
+use crate::tui::i18n::{self, Lang, Msg};
 use crate::tui::theme;
-use crate::tui::views::common::{HeaderCell, build_sort_header};
-use ratatui::style::{Modifier, Style};
+use crate::tui::views::common::{ColumnFit, ColumnSpec, TableCell};
+use ratatui::layout::Alignment;
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 const CLOCK_WIDTH: usize = 8;
 const TAG_WIDTH: usize = 4;
 const COLUMN_GAP: usize = 2;
-const TOKEN_IN_WIDTH: usize = 6;
-const TOKEN_OUT_WIDTH: usize = 7;
-const TOKEN_CACHE_WIDTH: usize = 8;
 const DURATION_WIDTH: usize = 7;
 const DETAIL_LABEL_WIDTH: usize = 10;
 const CACHE_BAR_WIDTH: usize = 20;
-const NAME_MIN_WIDTH: usize = 16;
-const NAME_BASE_WIDTH: usize = 40;
-// 정렬 열 번호 순서의 머리글 이름 (sort.rs 와 일치)
-pub const FEED_COLUMN_LABELS: [&str; 8] = [
-    "시각",
-    "종류",
-    "이름",
-    "에이전트",
-    "입력",
-    "출력",
-    "캐시읽기",
-    "소요",
+
+// 피드 표 열 (정렬 열 번호와 순서 일치: sort.rs)
+// 오른쪽 열부터 숨으므로 시각·종류·이름·소요가 앞, 에이전트와 토큰 열이 뒤, 이름과 에이전트는 읽을 수 있는 폭을 지킴
+pub const FEED_COLUMNS: [ColumnSpec; 8] = [
+    (Msg::FeedTime, 8, ColumnFit::Fixed, Alignment::Left),
+    (Msg::FeedKind, 4, ColumnFit::Fixed, Alignment::Left),
+    (Msg::FeedName, 8, ColumnFit::GrowKeep, Alignment::Left),
+    (Msg::FeedDuration, 7, ColumnFit::Fixed, Alignment::Right),
+    (Msg::FeedAgent, 8, ColumnFit::Keep, Alignment::Left),
+    (Msg::FeedInput, 6, ColumnFit::Fixed, Alignment::Right),
+    (Msg::FeedOutput, 7, ColumnFit::Fixed, Alignment::Right),
+    (Msg::FeedCacheRead, 8, ColumnFit::Fixed, Alignment::Right),
 ];
 
-// 1. 열 배치 ------------------------------------------------------------------
-// 폭 구간별로 보이는 열과 이름·에이전트 칸 폭 (한 프레임에 한 번 계산)
-#[derive(Debug, Clone, Copy)]
-pub struct FeedColumns {
-    pub name: u16,
-    pub agent: u16,
-    pub show_in: bool,
-    pub show_cache: bool,
-    pub show_agent: bool,
-    pub show_out: bool,
-}
-
-// 폭 구간별 열 선택: 100 이상 전체, 76 이상 입력 생략, 56 이상 캐시·에이전트도 생략, 미만 출력도 생략
-// 이름 칸 = 가장 긴 이름(16~40)과 남는 폭 중 작은 값, 그 다음 남는 폭은 에이전트 칸(구간 기본 폭 이상, 최대 자연 폭)이
-// 먼저, 그래도 남으면 40 넘는 이름이 차지해 말줄임 없이 보이도록 함
-pub fn derive_feed_columns(width: usize, longest_name: usize, longest_agent: usize) -> FeedColumns {
-    let (fixed, agent_base, show_agent, show_in, show_cache, show_out) = if width >= 100 {
-        (69usize, 18u16, true, true, true, true)
-    } else if width >= 76 {
-        (58, 14, true, false, true, true)
-    } else if width >= 56 {
-        (33, 0, false, false, false, true)
-    } else {
-        (25, 0, false, false, false, false)
-    };
-    let room = width.saturating_sub(fixed);
-    let name_base = longest_name
-        .clamp(NAME_MIN_WIDTH, NAME_BASE_WIDTH)
-        .min(room);
-    let mut free = room - name_base;
-    let agent_extra = if show_agent {
-        longest_agent
-            .saturating_sub(usize::from(agent_base))
-            .min(free)
-    } else {
-        0
-    };
-    free -= agent_extra;
-    let name = name_base + longest_name.saturating_sub(name_base).min(free);
-    FeedColumns {
-        name: name as u16,
-        agent: agent_base + agent_extra as u16,
-        show_in,
-        show_cache,
-        show_agent,
-        show_out,
-    }
-}
-
-// 1-1. 에이전트 칸 자연 폭 ----------------------------------------------------
-// 이름#id 는 이름 + # 꼬리 5열, 그 밖은 전체 (빈 값은 - 한 칸, 훅·알림은 칸을 쓰지 않음)
-pub fn feed_agent_width(event: &LiveEvent) -> usize {
-    let agent = match event {
-        LiveEvent::Api(row) => row.agent.as_str(),
-        LiveEvent::Tool(row) => row.agent.as_str(),
-        LiveEvent::Hook(_) | LiveEvent::Notice { .. } => return 0,
-    };
-    match agent.rsplit_once('#') {
-        Some((name, _)) => Span::raw(name).width() + 5,
-        None => Span::raw(agent).width().max(1),
-    }
-}
-
-// 2. 이벤트 이름 --------------------------------------------------------------
+// 1. 이벤트 이름 --------------------------------------------------------------
 // 이름 칸 문구: 모델(claude- 제거), 도구(mcp 축약), 훅 경로·가드 (빈 부분은 건너뜀)
 pub fn feed_event_name(event: &LiveEvent) -> String {
     let name = match event {
@@ -119,313 +53,176 @@ pub fn feed_event_name(event: &LiveEvent) -> String {
     }
 }
 
-// 3. 머리글 줄 ----------------------------------------------------------------
-// 본문 줄과 같은 폭 규칙, 숫자 머리글은 오른쪽 정렬, 정렬 열은 화살표
-pub fn build_feed_header(
-    columns: &FeedColumns,
-    sort: SortState,
-) -> (Line<'static>, Vec<HeaderSpan>) {
-    let mut cells = vec![
-        HeaderCell {
-            column: 0,
-            label: "시각",
-            width: CLOCK_WIDTH,
-            lead: 0,
-            right: false,
-        },
-        HeaderCell {
-            column: 1,
-            label: "종류",
-            width: TAG_WIDTH,
-            lead: COLUMN_GAP,
-            right: false,
-        },
-        HeaderCell {
-            column: 2,
-            label: "이름",
-            width: usize::from(columns.name),
-            lead: COLUMN_GAP,
-            right: false,
-        },
-    ];
-    if columns.show_agent {
-        cells.push(HeaderCell {
-            column: 3,
-            label: "에이전트",
-            width: usize::from(columns.agent),
-            lead: COLUMN_GAP,
-            right: false,
-        });
-    }
-    let mut token_lead = COLUMN_GAP;
-    let tokens = [
-        (columns.show_in, 4, "입력", TOKEN_IN_WIDTH),
-        (columns.show_out, 5, "출력", TOKEN_OUT_WIDTH),
-        (columns.show_cache, 6, "캐시읽기", TOKEN_CACHE_WIDTH),
-    ];
-    for (shown, column, label, width) in tokens {
-        if shown {
-            cells.push(HeaderCell {
-                column,
-                label,
-                width,
-                lead: token_lead,
-                right: true,
-            });
-            token_lead = 1;
-        }
-    }
-    cells.push(HeaderCell {
-        column: 7,
-        label: "소요",
-        width: DURATION_WIDTH,
-        lead: token_lead,
-        right: true,
-    });
-    build_sort_header(&cells, sort)
-}
-
-// 4. 칸 구성 ------------------------------------------------------------------
-// 한 이벤트의 칸 내용 (이름, 에이전트 조각, 숫자 셋, 토큰 칸 대신 쓰는 조각, 소요)
-struct FeedCells {
-    name: String,
-    name_style: Style,
-    agent: Vec<(String, Style)>,
-    numbers: Option<[String; 3]>,
-    region: Vec<(String, Style)>,
-    duration: (String, Style),
-}
-
-// 종류별 칸 채우기: 훅은 판정 라벨과 상세, 도구 오류는 오류 종류를 토큰 칸에 둠
-fn build_feed_cells(event: &LiveEvent, columns: &FeedColumns) -> FeedCells {
-    let agent_width = usize::from(columns.agent);
-    let name = feed_event_name(event);
+// 2. 시각·종류 ----------------------------------------------------------------
+// 시각 문자열, 종류 태그(정렬용 공백 포함), 태그 색
+fn feed_clock_and_tag(lang: Lang, event: &LiveEvent) -> (String, &'static str, Color) {
     match event {
-        // 1. API 요청
-        LiveEvent::Api(row) => {
-            let (head, tail) = short_agent(&row.agent, agent_width);
-            let head_style = if row.agent.is_empty() || row.agent == "main" {
-                theme::STYLE_DIM
-            } else {
-                theme::STYLE_TEXT
-            };
-            FeedCells {
-                name,
-                name_style: theme::STYLE_TEXT,
-                agent: vec![(head, head_style), (tail, theme::STYLE_DIM)],
-                numbers: Some([
-                    format_compact(row.input_tokens),
-                    format_compact(row.output_tokens),
-                    format_compact(row.cache_read_tokens),
-                ]),
-                region: Vec::new(),
-                duration: row
-                    .duration_ms
-                    .map_or(("-".to_string(), theme::STYLE_DIM), |ms| {
-                        (format_duration_ms(ms), theme::STYLE_TEXT)
-                    }),
-            }
-        }
-
-        // 2. 도구 호출
-        LiveEvent::Tool(row) => {
-            let (head, tail) = short_agent(&row.agent, agent_width);
-            let head_style = if row.agent.is_empty() || row.agent == "main" {
-                theme::STYLE_DIM
-            } else {
-                theme::STYLE_TEXT
-            };
-            let (name_style, region) = if row.is_error {
-                let error_text = if row.error_kind.is_empty() {
-                    "오류".to_string()
-                } else {
-                    format!("오류 {}", row.error_kind)
-                };
-                (theme::STYLE_CRIT, vec![(error_text, theme::STYLE_CRIT)])
-            } else {
-                (theme::STYLE_TEXT, Vec::new())
-            };
-            FeedCells {
-                name,
-                name_style,
-                agent: vec![(head, head_style), (tail, theme::STYLE_DIM)],
-                numbers: None,
-                region,
-                duration: row
-                    .duration_ms
-                    .map_or(("-".to_string(), theme::STYLE_DIM), |ms| {
-                        (format_duration_ms(ms), theme::STYLE_TEXT)
-                    }),
-            }
-        }
-
-        // 3. 훅 판정 (빈 가드는 이름에서 빠지고, 에이전트 칸이 없으면 라벨을 토큰 칸 앞에)
-        LiveEvent::Hook(row) => {
-            let label = theme::outcome_label(row.outcome.as_str()).to_string();
-            let label_style = theme::outcome_style(row.outcome.as_str());
-            let name_style = match row.outcome {
-                HookOutcome::Deny => theme::STYLE_CRIT,
-                HookOutcome::Rewrite => theme::STYLE_OK,
-                HookOutcome::Error => theme::STYLE_WARN,
-                HookOutcome::Allow => theme::STYLE_TEXT,
-            };
-            let (agent, region) = if columns.show_agent {
-                (
-                    vec![(label, label_style)],
-                    vec![(row.detail.clone(), theme::STYLE_DIM)],
-                )
-            } else {
-                (
-                    Vec::new(),
-                    vec![
-                        (label, label_style),
-                        (" ".to_string(), theme::STYLE_DIM),
-                        (row.detail.clone(), theme::STYLE_DIM),
-                    ],
-                )
-            };
-            let duration = match (row.saved_ms, row.duration_ms) {
-                (Some(saved), _) => (format!("+{}", format_duration_ms(saved)), theme::STYLE_OK),
-                (None, Some(ms)) => (format_duration_ms(ms), theme::STYLE_DIM),
-                (None, None) => (String::new(), theme::STYLE_DIM),
-            };
-            FeedCells {
-                name,
-                name_style,
-                agent,
-                numbers: None,
-                region,
-                duration,
-            }
-        }
-
-        // 4. 알림은 호출하는 쪽에서 문구 전체를 따로 그림
-        LiveEvent::Notice { .. } => FeedCells {
-            name,
-            name_style: theme::STYLE_TEXT,
-            agent: Vec::new(),
-            numbers: None,
-            region: Vec::new(),
-            duration: (String::new(), theme::STYLE_DIM),
-        },
-    }
-}
-
-// 5. 조각 맞춤 ----------------------------------------------------------------
-// 스타일 조각들을 앞에서부터 정확히 width 열에 맞춤 (넘치면 말줄임, 남으면 공백)
-fn fit_styled_pieces(pieces: &[(String, Style)], width: usize) -> Vec<Span<'static>> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut left = width;
-    for (text, style) in pieces {
-        if left == 0 {
-            break;
-        }
-        let shown_width = Span::raw(text.as_str()).width().min(left);
-        spans.push(Span::styled(fit_display(text, shown_width), *style));
-        left -= shown_width;
-    }
-    if left > 0 {
-        spans.push(Span::raw(" ".repeat(left)));
-    }
-    spans
-}
-
-// 6. 이벤트 한 줄 -------------------------------------------------------------
-// 시각·종류 두 칸 뒤에 이름(심각도 색)과 열 격자, 알림은 이름 칸부터 문구 전체
-// spans[0] = 시각, spans[1] = 종류 태그, spans[2] = 이름 칸 (테스트가 기대는 계약)
-pub fn build_feed_line(event: &LiveEvent, columns: &FeedColumns) -> Line<'static> {
-    let name_width = usize::from(columns.name);
-    let agent_width = usize::from(columns.agent);
-    let token_width = [
-        (columns.show_in, TOKEN_IN_WIDTH),
-        (columns.show_out, TOKEN_OUT_WIDTH),
-        (columns.show_cache, TOKEN_CACHE_WIDTH),
-    ]
-    .iter()
-    .filter(|(shown, _)| *shown)
-    .map(|(_, width)| width + 1)
-    .sum::<usize>();
-
-    // 1. 시각·종류 칸
-    let (clock, tag, tag_color) = match event {
-        LiveEvent::Api(row) => (format_clock_time(&row.ts), "API ", theme::COLOR_API),
-        LiveEvent::Tool(row) => (format_clock_time(&row.ts), "도구", theme::COLOR_TOOL),
-        LiveEvent::Hook(row) => (format_clock_time(&row.ts), "훅  ", theme::COLOR_HOOK),
-        LiveEvent::Notice { ts, .. } => (format_clock_time(ts), "알림", theme::COLOR_NOTICE),
-    };
-    let mut spans = vec![
-        Span::styled(format!("{clock}  "), theme::STYLE_DIM),
-        Span::styled(
-            format!("{tag}  "),
-            Style::default().fg(tag_color).add_modifier(Modifier::BOLD),
+        LiveEvent::Api(row) => (
+            format_clock_time(&row.ts),
+            i18n::text(lang, Msg::TagApi),
+            theme::COLOR_API,
         ),
-    ];
-
-    // 2. 알림: 이름 칸부터 줄 끝까지 문구
-    if let LiveEvent::Notice { level, text, .. } = event {
-        let agent_cell_width = if columns.show_agent {
-            agent_width + COLUMN_GAP
-        } else {
-            0
-        };
-        let rest_width = name_width + COLUMN_GAP + agent_cell_width + token_width + DURATION_WIDTH;
-        let level_style = match level.as_str() {
-            "error" => theme::STYLE_CRIT,
-            "warn" | "warning" => theme::STYLE_WARN,
-            _ => theme::STYLE_TEXT,
-        };
-        spans.push(Span::styled(fit_display(text, rest_width), level_style));
-        return Line::from(spans);
+        LiveEvent::Tool(row) => (
+            format_clock_time(&row.ts),
+            i18n::text(lang, Msg::TagTool),
+            theme::COLOR_TOOL,
+        ),
+        LiveEvent::Hook(row) => (
+            format_clock_time(&row.ts),
+            i18n::text(lang, Msg::TagHook),
+            theme::COLOR_HOOK,
+        ),
+        LiveEvent::Notice { ts, .. } => (
+            format_clock_time(ts),
+            i18n::text(lang, Msg::TagNotice),
+            theme::COLOR_NOTICE,
+        ),
     }
+}
 
-    // 3. 이름·에이전트 칸
-    let cells = build_feed_cells(event, columns);
-    spans.push(Span::styled(
-        fit_display(&cells.name, name_width),
-        cells.name_style,
-    ));
-    spans.push(Span::raw("  "));
-    if columns.show_agent {
-        spans.extend(fit_styled_pieces(&cells.agent, agent_width));
-        spans.push(Span::raw("  "));
+// 3. 이름·소요 스타일 ---------------------------------------------------------
+// 이름 글자 색: 도구 오류 적색, 훅은 판정별 색, 그 밖은 본문색
+fn feed_name_style(event: &LiveEvent) -> Style {
+    match event {
+        LiveEvent::Tool(row) if row.is_error => theme::STYLE_CRIT,
+        LiveEvent::Hook(row) => match row.outcome {
+            HookOutcome::Deny => theme::STYLE_CRIT,
+            HookOutcome::Rewrite => theme::STYLE_OK,
+            HookOutcome::Error => theme::STYLE_WARN,
+            HookOutcome::Allow => theme::STYLE_TEXT,
+        },
+        _ => theme::STYLE_TEXT,
     }
+}
 
-    // 4. 숫자 칸 (오른쪽 정렬) 또는 토큰 칸 조각
-    if let Some(numbers) = &cells.numbers {
-        let numeric = [
-            (columns.show_in, TOKEN_IN_WIDTH, &numbers[0]),
-            (columns.show_out, TOKEN_OUT_WIDTH, &numbers[1]),
-            (columns.show_cache, TOKEN_CACHE_WIDTH, &numbers[2]),
-        ];
-        for (shown, width, number) in numeric {
-            if shown {
-                spans.push(Span::styled(
-                    format!("{} ", pad_left_display(number, width)),
-                    theme::STYLE_TEXT,
-                ));
-            }
+// 소요 칸 글자와 스타일: 훅은 절약 시간(+), 없으면 걸린 시간, 값이 없으면 - 또는 빈 칸
+fn feed_duration_cell(event: &LiveEvent) -> (String, Style) {
+    let dash_or = |millis: Option<i64>| {
+        millis.map_or(("-".to_string(), theme::STYLE_DIM), |ms| {
+            (format_duration_ms(ms), theme::STYLE_TEXT)
+        })
+    };
+    match event {
+        LiveEvent::Api(row) => dash_or(row.duration_ms),
+        LiveEvent::Tool(row) => dash_or(row.duration_ms),
+        LiveEvent::Hook(row) => match (row.saved_ms, row.duration_ms) {
+            (Some(saved), _) => (format!("+{}", format_duration_ms(saved)), theme::STYLE_OK),
+            (None, Some(ms)) => (format_duration_ms(ms), theme::STYLE_DIM),
+            (None, None) => (String::new(), theme::STYLE_DIM),
+        },
+        LiveEvent::Notice { .. } => (String::new(), theme::STYLE_DIM),
+    }
+}
+
+// 4. 표 행 --------------------------------------------------------------------
+// 한 이벤트의 칸 (열 순서 = FEED_COLUMNS), 훅 상세·도구 오류 문구는 이름 칸 뒤에, 알림 문구는 이름 칸에 두고 훅 판정은 에이전트 칸에 둠
+// 칸은 자연 폭 그대로 두고 폭이 모자랄 때만 표 그리기가 끝을 말줄임, 제어 문자는 공백으로
+pub fn build_feed_row(lang: Lang, event: &LiveEvent) -> Vec<TableCell> {
+    let clean = replace_control_chars;
+    let (clock, tag, tag_color) = feed_clock_and_tag(lang, event);
+    let (duration, duration_style) = feed_duration_cell(event);
+    let name_style = feed_name_style(event);
+
+    // 1. 이름 칸
+    let mut name_cell: TableCell = Vec::new();
+    match event {
+        LiveEvent::Notice { level, text, .. } => {
+            let level_style = match level.as_str() {
+                "error" => theme::STYLE_CRIT,
+                "warn" | "warning" => theme::STYLE_WARN,
+                _ => theme::STYLE_TEXT,
+            };
+            let shown = if text.is_empty() {
+                "-".to_string()
+            } else {
+                clean(text)
+            };
+            name_cell.push(Span::styled(shown, level_style));
         }
-    } else if token_width > 0 {
-        spans.extend(fit_styled_pieces(&cells.region, token_width));
+        _ => name_cell.push(Span::styled(clean(&feed_event_name(event)), name_style)),
+    }
+    if let LiveEvent::Tool(row) = event
+        && row.is_error
+    {
+        name_cell.push(Span::styled(
+            format!(" {}", clean(&i18n::event_error(lang, &row.error_kind))),
+            theme::STYLE_CRIT,
+        ));
+    }
+    if let LiveEvent::Hook(row) = event
+        && !row.detail.is_empty()
+    {
+        name_cell.push(Span::styled(
+            format!(" {}", clean(&row.detail)),
+            theme::STYLE_DIM,
+        ));
     }
 
-    // 5. 소요 칸
-    spans.push(Span::styled(
-        pad_left_display(&cells.duration.0, DURATION_WIDTH),
-        cells.duration.1,
-    ));
-    Line::from(spans)
+    // 2. 에이전트 칸 (이름 + # 꼬리 4자, 훅은 판정 라벨)
+    let agent_cell: TableCell = match event {
+        LiveEvent::Api(row) => feed_agent_cell(&clean(&row.agent)),
+        LiveEvent::Tool(row) => feed_agent_cell(&clean(&row.agent)),
+        LiveEvent::Hook(row) => vec![Span::styled(
+            i18n::outcome_label(lang, row.outcome.as_str()),
+            theme::outcome_style(row.outcome.as_str()),
+        )],
+        LiveEvent::Notice { .. } => Vec::new(),
+    };
+
+    // 3. 토큰 칸 (API 요청만)
+    let tokens: [TableCell; 3] = match event {
+        LiveEvent::Api(row) => [row.input_tokens, row.output_tokens, row.cache_read_tokens]
+            .map(|count| vec![Span::styled(format_compact(count), theme::STYLE_TEXT)]),
+        _ => [Vec::new(), Vec::new(), Vec::new()],
+    };
+
+    // 4. 열 순서대로 조립
+    let [input_cell, output_cell, cache_cell] = tokens;
+    vec![
+        vec![Span::styled(clock, theme::STYLE_DIM)],
+        vec![Span::styled(
+            tag.trim_end().to_string(),
+            Style::default().fg(tag_color).add_modifier(Modifier::BOLD),
+        )],
+        name_cell,
+        vec![Span::styled(duration, duration_style)],
+        agent_cell,
+        input_cell,
+        output_cell,
+        cache_cell,
+    ]
 }
 
-// 폭만으로 열 배치를 정해 한 줄 생성 (테스트용)
-#[cfg(test)]
-pub fn build_event_line(event: &LiveEvent, width: usize) -> Line<'static> {
-    build_feed_line(event, &derive_feed_columns(width, NAME_BASE_WIDTH, 0))
+// 에이전트 칸: 마지막 # 기준 이름과 꼬리(# + 앞 4자), 빈 값은 -, main 은 흐리게
+fn feed_agent_cell(agent: &str) -> TableCell {
+    if agent.is_empty() {
+        return vec![Span::styled("-", theme::STYLE_DIM)];
+    }
+    let (name, tail) = match agent.rsplit_once('#') {
+        Some((name, suffix)) => (
+            name,
+            std::iter::once('#')
+                .chain(suffix.chars().take(4))
+                .collect::<String>(),
+        ),
+        None => (agent, String::new()),
+    };
+    let name_style = if name == "main" {
+        theme::STYLE_DIM
+    } else {
+        theme::STYLE_TEXT
+    };
+    let mut cell = vec![Span::styled(name.to_string(), name_style)];
+    if !tail.is_empty() {
+        cell.push(Span::styled(tail, theme::STYLE_DIM));
+    }
+    cell
 }
 
-// 7. 이벤트 상세 줄 -----------------------------------------------------------
+// 5. 이벤트 상세 줄 -----------------------------------------------------------
 // 종류 제목 한 줄 + 항목 이름·값 줄 (원문은 담지 않고 메타데이터만), 긴 값은 중간 말줄임
-pub fn build_event_detail_lines(event: &LiveEvent, width: usize) -> Vec<Line<'static>> {
+pub fn build_event_detail_lines(lang: Lang, event: &LiveEvent, width: usize) -> Vec<Line<'static>> {
+    let word = |msg: Msg| i18n::text(lang, msg);
     let value_width = width.saturating_sub(DETAIL_LABEL_WIDTH);
     let bold = |color| Style::default().fg(color).add_modifier(Modifier::BOLD);
     let text_value = |value: &str| {
@@ -443,28 +240,43 @@ pub fn build_event_detail_lines(event: &LiveEvent, width: usize) -> Vec<Line<'st
     let (headline, pairs): (Line<'static>, Vec<(&str, Span<'static>)>) = match event {
         // 1. API 요청
         LiveEvent::Api(row) => (
-            Line::from(Span::styled("API 요청", bold(theme::COLOR_API))),
+            Line::from(Span::styled(word(Msg::DetailApi), bold(theme::COLOR_API))),
             vec![
-                ("시각", text_value(&format_clock_time(&row.ts))),
-                ("모델", text_value(&row.model)),
-                ("에이전트", text_value(&row.agent)),
-                ("입력 토큰", text_value(&format_compact(row.input_tokens))),
-                ("출력 토큰", text_value(&format_compact(row.output_tokens))),
                 (
-                    "캐시 읽기",
+                    word(Msg::DetailTime),
+                    text_value(&format_clock_time(&row.ts)),
+                ),
+                (word(Msg::DetailModel), text_value(&row.model)),
+                (word(Msg::DetailAgent), text_value(&row.agent)),
+                (
+                    word(Msg::DetailInputTokens),
+                    text_value(&format_compact(row.input_tokens)),
+                ),
+                (
+                    word(Msg::DetailOutputTokens),
+                    text_value(&format_compact(row.output_tokens)),
+                ),
+                (
+                    word(Msg::DetailCacheRead),
                     text_value(&format_compact(row.cache_read_tokens)),
                 ),
                 (
-                    "캐시 생성",
+                    word(Msg::DetailCacheWrite),
                     text_value(&format_compact(row.cache_creation_tokens)),
                 ),
-                ("첫 바이트", duration_value(row.first_byte_ms)),
-                ("첫 토큰", duration_value(row.first_token_ms)),
                 (
-                    "세션",
+                    word(Msg::DetailFirstByte),
+                    duration_value(row.first_byte_ms),
+                ),
+                (
+                    word(Msg::DetailFirstToken),
+                    duration_value(row.first_token_ms),
+                ),
+                (
+                    word(Msg::DetailSession),
                     text_value(&row.session_id.chars().take(8).collect::<String>()),
                 ),
-                ("소요", duration_value(row.duration_ms)),
+                (word(Msg::DetailDuration), duration_value(row.duration_ms)),
             ],
         ),
 
@@ -476,25 +288,31 @@ pub fn build_event_detail_lines(event: &LiveEvent, width: usize) -> Vec<Line<'st
                 .and_then(|rest| rest.split_once("__"))
                 .map_or("", |(server, _)| server);
             let result = if row.is_error {
-                Span::styled(format!("오류 {}", row.error_kind), theme::STYLE_CRIT)
+                Span::styled(
+                    format!("{} {}", word(Msg::FeedError), row.error_kind),
+                    theme::STYLE_CRIT,
+                )
             } else {
-                Span::styled("정상", theme::STYLE_TEXT)
+                Span::styled(word(Msg::DetailResultOk), theme::STYLE_TEXT)
             };
             (
-                Line::from(Span::styled("도구 호출", bold(theme::COLOR_TOOL))),
+                Line::from(Span::styled(word(Msg::DetailTool), bold(theme::COLOR_TOOL))),
                 vec![
-                    ("시각", text_value(&format_clock_time(&row.ts))),
-                    ("도구", text_value(&row.tool_name)),
-                    ("서버", text_value(server)),
-                    ("에이전트", text_value(&row.agent)),
                     (
-                        "세션",
+                        word(Msg::DetailTime),
+                        text_value(&format_clock_time(&row.ts)),
+                    ),
+                    (word(Msg::DetailToolName), text_value(&row.tool_name)),
+                    (word(Msg::DetailServer), text_value(server)),
+                    (word(Msg::DetailAgent), text_value(&row.agent)),
+                    (
+                        word(Msg::DetailSession),
                         text_value(&row.session_id.chars().take(8).collect::<String>()),
                     ),
-                    ("소요", duration_value(row.duration_ms)),
-                    ("결과", result),
+                    (word(Msg::DetailDuration), duration_value(row.duration_ms)),
+                    (word(Msg::DetailResult), result),
                     (
-                        "호출 id",
+                        word(Msg::DetailCallId),
                         text_value(&row.tool_use_id.chars().take(8).collect::<String>()),
                     ),
                 ],
@@ -504,39 +322,45 @@ pub fn build_event_detail_lines(event: &LiveEvent, width: usize) -> Vec<Line<'st
         // 3. 훅 판정 (가드가 비면 항목 생략)
         LiveEvent::Hook(row) => {
             let mut hook_pairs: Vec<(&str, Span<'static>)> = vec![
-                ("시각", text_value(&format_clock_time(&row.ts))),
-                ("경로", text_value(&row.route)),
+                (
+                    word(Msg::DetailTime),
+                    text_value(&format_clock_time(&row.ts)),
+                ),
+                (word(Msg::DetailRoute), text_value(&row.route)),
             ];
             if !row.guard.is_empty() {
-                hook_pairs.push(("가드", text_value(&row.guard)));
+                hook_pairs.push((word(Msg::DetailGuard), text_value(&row.guard)));
             }
             hook_pairs.push((
-                "판정",
+                word(Msg::DetailVerdict),
                 Span::styled(
-                    theme::outcome_label(row.outcome.as_str()),
+                    i18n::outcome_label(lang, row.outcome.as_str()),
                     theme::outcome_style(row.outcome.as_str()),
                 ),
             ));
-            hook_pairs.push(("상세", text_value(&row.detail)));
-            hook_pairs.push(("소요", duration_value(row.duration_ms)));
-            hook_pairs.push(("절약", duration_value(row.saved_ms)));
+            hook_pairs.push((word(Msg::DetailDetail), text_value(&row.detail)));
+            hook_pairs.push((word(Msg::DetailDuration), duration_value(row.duration_ms)));
+            hook_pairs.push((word(Msg::DetailSaved), duration_value(row.saved_ms)));
             hook_pairs.push((
-                "세션",
+                word(Msg::DetailSession),
                 text_value(&row.session_id.chars().take(8).collect::<String>()),
             ));
             (
-                Line::from(Span::styled("훅 판정", bold(theme::COLOR_HOOK))),
+                Line::from(Span::styled(word(Msg::DetailHook), bold(theme::COLOR_HOOK))),
                 hook_pairs,
             )
         }
 
         // 4. 알림 (항목 3개 고정)
         LiveEvent::Notice { ts, level, text } => (
-            Line::from(Span::styled("알림", bold(theme::COLOR_NOTICE))),
+            Line::from(Span::styled(
+                word(Msg::DetailNotice),
+                bold(theme::COLOR_NOTICE),
+            )),
             vec![
-                ("시각", text_value(&format_clock_time(ts))),
-                ("수준", text_value(level)),
-                ("내용", text_value(text)),
+                (word(Msg::DetailTime), text_value(&format_clock_time(ts))),
+                (word(Msg::DetailLevel), text_value(level)),
+                (word(Msg::DetailContent), text_value(text)),
             ],
         ),
     };
@@ -558,7 +382,7 @@ pub fn build_event_detail_lines(event: &LiveEvent, width: usize) -> Vec<Line<'st
             let filled = (ratio * CACHE_BAR_WIDTH as f64).round() as usize;
             lines.push(Line::from(vec![
                 Span::styled(
-                    fit_display("캐시 적중", DETAIL_LABEL_WIDTH),
+                    fit_display(word(Msg::DetailCacheHit), DETAIL_LABEL_WIDTH),
                     theme::STYLE_DIM,
                 ),
                 Span::styled(format!("{:.1}% ", ratio * 100.0), theme::STYLE_TEXT),
@@ -573,9 +397,10 @@ pub fn build_event_detail_lines(event: &LiveEvent, width: usize) -> Vec<Line<'st
     lines
 }
 
-// 8. 같은 종류 맥락 줄 --------------------------------------------------------
+// 6. 같은 종류 맥락 줄 --------------------------------------------------------
 // 구분선, 집계 한 줄, 같은 에이전트(도구는 같은 도구, 훅은 같은 가드)의 최근 이벤트 최대 row_budget 개
 pub fn build_event_context_lines(
+    lang: Lang,
     event: &LiveEvent,
     events: &[LiveEvent],
     width: usize,
@@ -584,7 +409,7 @@ pub fn build_event_context_lines(
     // 1. 같은 종류 이벤트 모으기 (알림은 맥락 없음)
     let (title, matching): (&str, Vec<&LiveEvent>) = match event {
         LiveEvent::Api(row) => (
-            "같은 에이전트",
+            i18n::text(lang, Msg::ContextSameAgent),
             events
                 .iter()
                 .filter(|other| match other {
@@ -595,7 +420,7 @@ pub fn build_event_context_lines(
                 .collect(),
         ),
         LiveEvent::Tool(row) => (
-            "같은 도구",
+            i18n::text(lang, Msg::ContextSameTool),
             events
                 .iter()
                 .filter(|other| {
@@ -604,7 +429,7 @@ pub fn build_event_context_lines(
                 .collect(),
         ),
         LiveEvent::Hook(row) => (
-            "같은 가드",
+            i18n::text(lang, Msg::ContextSameGuard),
             events
                 .iter()
                 .filter(|other| {
@@ -655,13 +480,11 @@ pub fn build_event_context_lines(
         "-".to_string()
     };
     let summary = match event {
-        LiveEvent::Api(_) => format!(
-            "API {api_count} · 도구 {tool_count} · 오류 {error_count} · 평균 소요 {average}"
-        ),
-        LiveEvent::Tool(_) => {
-            format!("호출 {tool_count} · 오류 {error_count} · 평균 소요 {average}")
+        LiveEvent::Api(_) => {
+            i18n::context_summary_api(lang, api_count, tool_count, error_count, &average)
         }
-        _ => format!("훅 {hook_count} · 거부 {denial_count} · 재작성 {rewrite_count}"),
+        LiveEvent::Tool(_) => i18n::context_summary_tool(lang, tool_count, error_count, &average),
+        _ => i18n::context_summary_hook(lang, hook_count, denial_count, rewrite_count),
     };
 
     // 3. 구분선과 집계 줄
@@ -679,32 +502,26 @@ pub fn build_event_context_lines(
     ];
 
     // 4. 최근 이벤트 (시각 8, 종류 4, 이름 flex, 소요 7 오른쪽 정렬)
-    let compact_columns = derive_feed_columns(width, 0, 0);
     let name_width = width
         .saturating_sub(
             CLOCK_WIDTH + COLUMN_GAP + TAG_WIDTH + COLUMN_GAP + COLUMN_GAP + DURATION_WIDTH,
         )
         .max(1);
     for other in matching.iter().take(row_budget) {
-        let (clock, tag, tag_color) = match other {
-            LiveEvent::Api(row) => (format_clock_time(&row.ts), "API ", theme::COLOR_API),
-            LiveEvent::Tool(row) => (format_clock_time(&row.ts), "도구", theme::COLOR_TOOL),
-            LiveEvent::Hook(row) => (format_clock_time(&row.ts), "훅  ", theme::COLOR_HOOK),
-            LiveEvent::Notice { ts, .. } => (format_clock_time(ts), "알림", theme::COLOR_NOTICE),
-        };
-        let cells = build_feed_cells(other, &compact_columns);
+        let (clock, tag, tag_color) = feed_clock_and_tag(lang, other);
+        let (duration, duration_style) = feed_duration_cell(other);
         lines.push(Line::from(vec![
             Span::styled(format!("{clock}  "), theme::STYLE_DIM),
             Span::styled(
                 format!("{tag}  "),
                 Style::default().fg(tag_color).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(fit_display(&cells.name, name_width), cells.name_style),
-            Span::raw("  "),
             Span::styled(
-                pad_left_display(&cells.duration.0, DURATION_WIDTH),
-                cells.duration.1,
+                fit_display(&feed_event_name(other), name_width),
+                feed_name_style(other),
             ),
+            Span::raw("  "),
+            Span::styled(pad_left_display(&duration, DURATION_WIDTH), duration_style),
         ]));
     }
     lines
@@ -714,17 +531,20 @@ pub fn build_event_context_lines(
 mod tests {
     use super::*;
     use crate::core::model::{ApiRequestRow, HookEventRow, ToolCallRow};
+    use crate::tui::cards::CardId;
+    use crate::tui::sort::sort_spec;
 
-    const TIME_DESCENDING: SortState = SortState {
-        column: 0,
-        descending: true,
-    };
+    const KO: Lang = Lang::Ko;
 
     fn line_text(line: &Line<'_>) -> String {
         line.spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    fn cell_text(cell: &TableCell) -> String {
+        cell.iter().map(|span| span.content.as_ref()).collect()
     }
 
     fn api_event(output_tokens: i64, agent: &str) -> LiveEvent {
@@ -741,88 +561,79 @@ mod tests {
     }
 
     #[test]
-    fn event_line_tags_each_kind_and_fits_width() {
-        let hook = LiveEvent::Hook(HookEventRow {
-            ts: "2026-11-15T01:00:01Z".to_string(),
-            route: "pretool".to_string(),
-            guard: "cliguard".to_string(),
-            outcome: HookOutcome::Deny,
-            detail: "x".repeat(200),
-            ..HookEventRow::default()
-        });
-        let line = build_event_line(&hook, 60);
-        assert!(line.width() <= 60);
-        assert_eq!(line.spans[2].style, theme::STYLE_CRIT);
+    fn api_tag_cells_in_the_rendered_feed_use_the_api_color_not_the_accent() {
+        use crate::tui::test_support::sample_state_with_snapshot;
+        use crate::tui::views::render_frame;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
 
-        let notice = LiveEvent::Notice {
-            ts: "2026-11-15T01:00:00Z".to_string(),
-            level: "warn".to_string(),
-            text: "느린 색인".to_string(),
-        };
-        let line = build_event_line(&notice, 60);
-        assert_eq!(line.spans[1].content, "알림  ");
-        assert_eq!(line.spans[2].style, theme::STYLE_WARN);
-    }
-
-    #[test]
-    fn event_detail_lists_labeled_metadata_for_every_kind() {
-        let hook = LiveEvent::Hook(HookEventRow {
-            ts: "2026-11-15T01:00:01Z".to_string(),
-            route: "pretool".to_string(),
-            guard: "cliguard".to_string(),
-            outcome: HookOutcome::Rewrite,
-            detail: "grep -> rg".to_string(),
-            saved_ms: Some(1_500),
-            ..HookEventRow::default()
-        });
-        let text: Vec<String> = build_event_detail_lines(&hook, 60)
+        let mut state = sample_state_with_snapshot();
+        // API 행(첫 행)이 선택 행 색으로 덮이지 않게 다른 행을 선택
+        state.card_views[CardId::EventFeed as usize].selected = 1;
+        let mut terminal = Terminal::new(TestBackend::new(130, 40)).unwrap();
+        terminal
+            .draw(|frame| render_frame(frame, &mut state))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let feed = state
+            .hit_areas
+            .card_rects
             .iter()
-            .map(line_text)
-            .collect();
-        assert_eq!(text[0], "훅 판정");
-        assert!(text.iter().any(|row| row.contains("cliguard")));
-        assert!(text.iter().any(|row| row.contains("grep -> rg")));
-        assert!(text.iter().any(|row| row.contains("1.5s")));
+            .find(|(card, _)| *card == CardId::EventFeed)
+            .map(|(_, rect)| *rect)
+            .unwrap();
 
-        let notice = LiveEvent::Notice {
-            ts: "2026-11-15T01:00:00Z".to_string(),
-            level: "warn".to_string(),
-            text: "느린 색인".to_string(),
-        };
-        let text: Vec<String> = build_event_detail_lines(&notice, 60)
-            .iter()
-            .map(line_text)
-            .collect();
-        assert_eq!(text.len(), 4);
-        assert!(text.iter().any(|row| row.contains("느린 색인")));
-    }
-
-    #[test]
-    fn hook_row_with_empty_guard_has_no_dangling_slash() {
-        let hook = LiveEvent::Hook(HookEventRow {
-            ts: "2026-11-15T01:00:01Z".to_string(),
-            route: "pretool-chain".to_string(),
-            outcome: HookOutcome::Allow,
-            ..HookEventRow::default()
-        });
-        for width in [40, 60, 80, 120] {
-            let text = line_text(&build_event_line(&hook, width));
-            assert!(!text.contains('/'), "{width}: {text}");
-            assert!(text.contains("pretool-chain"));
+        // 제목 줄(위 테두리)의 개수 안내 문구에도 API 가 있으니 표 안쪽 줄만 봄
+        let mut tag_starts = Vec::new();
+        for y in feed.y + 1..feed.bottom() {
+            for x in feed.x..feed.right().saturating_sub(2) {
+                let word: String = (x..x + 3)
+                    .map(|column| buffer[(column, y)].symbol())
+                    .collect();
+                if word == "API" {
+                    tag_starts.push((x, y));
+                }
+            }
         }
-        assert_eq!(feed_event_name(&hook), "pretool-chain");
-
-        // 가드가 있으면 가운데점으로 이음
-        let guarded = LiveEvent::Hook(HookEventRow {
-            route: "pretool".to_string(),
-            guard: "cliguard".to_string(),
-            ..HookEventRow::default()
-        });
-        assert_eq!(feed_event_name(&guarded), "pretool·cliguard");
+        assert!(!tag_starts.is_empty());
+        assert_eq!(theme::COLOR_API, Color::Indexed(111));
+        assert_ne!(theme::COLOR_API, theme::FG_ACCENT);
+        for (x, y) in tag_starts {
+            assert_eq!(buffer[(x, y)].fg, theme::COLOR_API);
+        }
     }
 
     #[test]
-    fn feed_tiers_keep_every_row_within_width_and_aligned() {
+    fn feed_columns_match_the_sort_spec_one_to_one_in_order() {
+        let spec = sort_spec(CardId::EventFeed).unwrap();
+        assert_eq!(FEED_COLUMNS.len(), spec.kinds.len());
+        let labels: Vec<Msg> = FEED_COLUMNS.iter().map(|column| column.0).collect();
+        assert_eq!(
+            labels,
+            [
+                Msg::FeedTime,
+                Msg::FeedKind,
+                Msg::FeedName,
+                Msg::FeedDuration,
+                Msg::FeedAgent,
+                Msg::FeedInput,
+                Msg::FeedOutput,
+                Msg::FeedCacheRead
+            ]
+        );
+        // 숫자 열(오른쪽 정렬)은 숫자·시간 정렬 열
+        for (index, column) in FEED_COLUMNS.iter().enumerate() {
+            let numeric = spec.kinds[index] == crate::tui::sort::SortKind::Number;
+            assert_eq!(
+                column.3 == Alignment::Right,
+                numeric && index != 0,
+                "{index}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_kind_fills_the_eight_cells_in_column_order() {
         let tool = LiveEvent::Tool(ToolCallRow {
             ts: "2026-11-15T01:00:02Z".to_string(),
             tool_name: "mcp__rust-fs-mcp__file-read".to_string(),
@@ -843,116 +654,128 @@ mod tests {
         });
         let notice = LiveEvent::Notice {
             ts: "2026-11-15T01:00:00Z".to_string(),
-            level: "info".to_string(),
-            text: "색인 완료".to_string(),
+            level: "warn".to_string(),
+            text: "느린 색인".to_string(),
         };
-        let first = api_event(340, "main");
-        let second = api_event(911_900, "engineer-rdr2#a0a2bf9b");
-        for width in [30, 40, 56, 60, 75, 76, 80, 99, 100, 120, 200] {
-            let columns = derive_feed_columns(width, 40, 0);
-            let expected = build_feed_header(&columns, TIME_DESCENDING).0.width();
-            for event in [&first, &second, &tool, &hook, &notice] {
-                let line = build_feed_line(event, &columns);
-                assert!(line.width() <= width.max(25), "{width}: {}", line.width());
-                assert_eq!(line.width(), expected, "{width}: {}", line_text(&line));
-            }
-        }
 
-        // 숫자 열은 모든 줄에서 같은 x 에서 끝남 (출력 열: 340 / 911.9K)
-        for width in [80, 120] {
-            let columns = derive_feed_columns(width, 40, 0);
-            let end_of = |event: &LiveEvent, token: &str| {
-                let text = line_text(&build_feed_line(event, &columns));
-                let found = text.find(token).unwrap();
-                Span::raw(&text[..found + token.len()]).width()
-            };
-            assert_eq!(end_of(&first, "340"), end_of(&second, "911.9K"), "{width}");
-        }
+        // API: 모델(claude- 제거), 소요, 에이전트 이름과 꼬리, 토큰 셋
+        let row = build_feed_row(KO, &api_event(340, "engineer-rdr2#a0a2bf9b"));
+        assert_eq!(row.len(), 8);
+        assert_eq!(cell_text(&row[1]), "API");
+        assert_eq!(cell_text(&row[2]), "sonnet-5-5");
+        assert_eq!(cell_text(&row[3]), "2.1s");
+        assert_eq!(cell_text(&row[4]), "engineer-rdr2#a0a2");
+        assert_eq!(row[4][1].style, theme::STYLE_DIM);
+        assert_eq!(cell_text(&row[5]), "1.2K");
+        assert_eq!(cell_text(&row[6]), "340");
+        assert_eq!(cell_text(&row[7]), "176.2M");
+
+        // 도구 오류: 이름이 적색, 오류 문구는 이름 뒤, 토큰 칸 비움
+        let row = build_feed_row(KO, &tool);
+        assert_eq!(cell_text(&row[1]), "도구");
+        assert_eq!(cell_text(&row[2]), "rust-fs·file-read 오류 timeout");
+        assert_eq!(row[2][0].style, theme::STYLE_CRIT);
+        assert_eq!(cell_text(&row[3]), "85ms");
+        assert!(row[5..].iter().all(Vec::is_empty));
+
+        // 훅: 이름은 판정 색, 상세는 이름 뒤 흐리게, 판정 라벨은 에이전트 칸, 소요는 절약 시간
+        let row = build_feed_row(KO, &hook);
+        assert_eq!(cell_text(&row[1]), "훅");
+        assert_eq!(cell_text(&row[2]), "pretool·cliguard grep -> rg");
+        assert_eq!(row[2][0].style, theme::STYLE_OK);
+        assert_eq!(row[2][1].style, theme::STYLE_DIM);
+        assert_eq!(cell_text(&row[4]), i18n::outcome_label(KO, "rewrite"));
+        assert_eq!(cell_text(&row[3]), "+1.5s");
+
+        // 알림: 문구 전체가 이름 칸, 수준 색
+        let row = build_feed_row(KO, &notice);
+        assert_eq!(cell_text(&row[1]), "알림");
+        assert_eq!(cell_text(&row[2]), "느린 색인");
+        assert_eq!(row[2][0].style, theme::STYLE_WARN);
+        assert!(row[3..].iter().all(|cell| cell_text(cell).is_empty()));
     }
 
     #[test]
-    fn feed_tiers_drop_columns_by_width() {
-        let wide = derive_feed_columns(120, 40, 0);
-        assert!(wide.show_in && wide.show_out && wide.show_cache && wide.show_agent);
-        assert_eq!((wide.agent, wide.name), (18, 40));
-        let mid = derive_feed_columns(80, 40, 0);
-        assert!(!mid.show_in && mid.show_out && mid.show_cache && mid.show_agent);
-        assert_eq!(mid.agent, 14);
-        let narrow = derive_feed_columns(60, 40, 0);
-        assert!(narrow.show_out && !narrow.show_cache && !narrow.show_agent);
-        assert_eq!(narrow.name, 27);
-        let tiny = derive_feed_columns(40, 40, 0);
-        assert!(!tiny.show_out);
-        assert_eq!(tiny.name, 15);
-        // 가장 긴 이름이 짧아도 이름 칸은 최소 16
-        assert_eq!(derive_feed_columns(200, 3, 0).name, 16);
+    fn hook_row_with_empty_guard_and_detail_has_no_dangling_separator() {
+        let hook = LiveEvent::Hook(HookEventRow {
+            ts: "2026-11-15T01:00:01Z".to_string(),
+            route: "pretool-chain".to_string(),
+            outcome: HookOutcome::Allow,
+            ..HookEventRow::default()
+        });
+        let row = build_feed_row(KO, &hook);
+        assert_eq!(cell_text(&row[2]), "pretool-chain");
+        assert!(!cell_text(&row[2]).contains('/'));
+        assert_eq!(feed_event_name(&hook), "pretool-chain");
+
+        // 가드가 있으면 가운데점으로 이음
+        let guarded = LiveEvent::Hook(HookEventRow {
+            route: "pretool".to_string(),
+            guard: "cliguard".to_string(),
+            ..HookEventRow::default()
+        });
+        assert_eq!(feed_event_name(&guarded), "pretool·cliguard");
     }
 
     #[test]
-    fn wide_feed_grows_agent_and_name_to_their_natural_width() {
-        let long_agent = "engineer-rdr2-longname#a0a2bf9b";
-        let event = api_event(340, long_agent);
-        assert_eq!(feed_agent_width(&event), 27);
-        assert_eq!(feed_agent_width(&api_event(1, "worker")), 6);
-        assert_eq!(feed_agent_width(&api_event(1, "")), 1);
+    fn row_cells_turn_control_characters_into_spaces_and_empty_agents_into_a_dash() {
+        let hook = LiveEvent::Hook(HookEventRow {
+            route: "pre\ttool".to_string(),
+            detail: "line one\nline two".to_string(),
+            ..HookEventRow::default()
+        });
+        let row = build_feed_row(KO, &hook);
+        let name = cell_text(&row[2]);
+        assert_eq!(name, "pre tool line one line two");
+        assert!(!name.chars().any(char::is_control));
 
-        // 넓은 카드: 에이전트 자연 폭이 먼저, 남는 폭으로 40 넘는 이름도 말줄임 없음
-        let wide = derive_feed_columns(200, 60, 27);
-        assert_eq!((wide.agent, wide.name), (27, 60));
-        let text = line_text(&build_feed_line(&event, &wide));
-        assert!(text.contains("engineer-rdr2-longname#a0a2"), "{text}");
-        assert!(!text.contains('…'), "{text}");
-
-        // 이름이 남는 폭을 모두 쓰면 에이전트는 구간 기본 폭 유지
-        assert_eq!(derive_feed_columns(100, 40, 27).agent, 18);
-        assert_eq!(derive_feed_columns(120, 40, 27).agent, 27);
-
-        // 훅·알림은 에이전트 칸을 쓰지 않음
-        let hook = LiveEvent::Hook(HookEventRow::default());
-        assert_eq!(feed_agent_width(&hook), 0);
+        let row = build_feed_row(KO, &api_event(1, ""));
+        assert_eq!(cell_text(&row[4]), "-");
+        assert_eq!(row[4][0].style, theme::STYLE_DIM);
+        let row = build_feed_row(KO, &api_event(1, "main"));
+        assert_eq!(row[4][0].style, theme::STYLE_DIM);
+        let row = build_feed_row(KO, &api_event(1, "worker"));
+        assert_eq!(cell_text(&row[4]), "worker");
+        assert_eq!(row[4][0].style, theme::STYLE_TEXT);
     }
 
     #[test]
-    fn api_row_shortens_model_and_agent_and_drops_inline_labels() {
-        let columns = derive_feed_columns(120, 40, 0);
-        let text = line_text(&build_feed_line(
-            &api_event(340, "engineer-rdr2#a0a2bf9b"),
-            &columns,
-        ));
-        assert!(text.contains("sonnet-5-5"));
-        assert!(!text.contains("claude-"));
-        assert!(text.contains("engineer-rdr2#a0a2"));
-        assert!(!text.contains("a0a2bf9b"));
-        assert!(!text.contains("입력"));
-        assert!(!text.contains("캐시읽기"));
-    }
+    fn event_detail_lists_labeled_metadata_for_every_kind() {
+        let hook = LiveEvent::Hook(HookEventRow {
+            ts: "2026-11-15T01:00:01Z".to_string(),
+            route: "pretool".to_string(),
+            guard: "cliguard".to_string(),
+            outcome: HookOutcome::Rewrite,
+            detail: "grep -> rg".to_string(),
+            saved_ms: Some(1_500),
+            ..HookEventRow::default()
+        });
+        let text: Vec<String> = build_event_detail_lines(KO, &hook, 60)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert_eq!(text[0], "훅 판정");
+        assert!(text.iter().any(|row| row.contains("cliguard")));
+        assert!(text.iter().any(|row| row.contains("grep -> rg")));
+        assert!(text.iter().any(|row| row.contains("1.5s")));
 
-    #[test]
-    fn header_uses_the_same_columns_as_rows() {
-        let header =
-            line_text(&build_feed_header(&derive_feed_columns(120, 40, 0), TIME_DESCENDING).0);
-        for label in [
-            "시각",
-            "종류",
-            "이름",
-            "에이전트",
-            "입력",
-            "출력",
-            "캐시읽기",
-            "소요",
-        ] {
-            assert!(header.contains(label), "{label}");
-        }
-        let narrow =
-            line_text(&build_feed_header(&derive_feed_columns(60, 40, 0), TIME_DESCENDING).0);
-        assert!(narrow.contains("출력") && narrow.contains("소요"));
-        assert!(!narrow.contains("입력") && !narrow.contains("에이전트"));
+        let notice = LiveEvent::Notice {
+            ts: "2026-11-15T01:00:00Z".to_string(),
+            level: "warn".to_string(),
+            text: "느린 색인".to_string(),
+        };
+        let text: Vec<String> = build_event_detail_lines(KO, &notice, 60)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert_eq!(text.len(), 4);
+        assert!(text.iter().any(|row| row.contains("느린 색인")));
     }
 
     #[test]
     fn api_detail_adds_cache_bar_and_full_identifiers() {
         let text: Vec<String> =
-            build_event_detail_lines(&api_event(340, "engineer-rdr2#a0a2bf9b"), 60)
+            build_event_detail_lines(KO, &api_event(340, "engineer-rdr2#a0a2bf9b"), 60)
                 .iter()
                 .map(line_text)
                 .collect();
@@ -983,7 +806,7 @@ mod tests {
             }),
             api_event(10, "other"),
         ];
-        let lines = build_event_context_lines(&events[0], &events, 50, 8);
+        let lines = build_event_context_lines(KO, &events[0], &events, 50, 8);
         let text: Vec<String> = lines.iter().map(line_text).collect();
         assert!(text[0].starts_with("── 같은 에이전트 "));
         assert_eq!(Span::raw(text[0].as_str()).width(), 50);
@@ -991,7 +814,7 @@ mod tests {
         // 같은 에이전트 두 건만, 예산 1이면 한 건
         assert_eq!(lines.len(), 4);
         assert_eq!(
-            build_event_context_lines(&events[0], &events, 50, 1).len(),
+            build_event_context_lines(KO, &events[0], &events, 50, 1).len(),
             3
         );
 
@@ -1000,26 +823,6 @@ mod tests {
             level: "info".to_string(),
             text: String::new(),
         };
-        assert!(build_event_context_lines(&notice, &events, 50, 8).is_empty());
-    }
-
-    #[test]
-    fn header_arrow_marks_only_the_sorted_column_and_keeps_total_width() {
-        for width in [60, 80, 120] {
-            let columns = derive_feed_columns(width, 40, 0);
-            let baseline = build_feed_header(&columns, TIME_DESCENDING).0.width();
-            for column in 0..8 {
-                for descending in [false, true] {
-                    let sort = SortState { column, descending };
-                    let (line, spans) = build_feed_header(&columns, sort);
-                    let text = line_text(&line);
-                    let arrow = if descending { '↓' } else { '↑' };
-                    let visible = spans.iter().any(|span| span.column == column);
-                    assert_eq!(line.width(), baseline, "{width}/{column}");
-                    assert_eq!(text.matches(['↑', '↓']).count(), usize::from(visible));
-                    assert_eq!(text.contains(arrow), visible, "{width}/{column}: {text}");
-                }
-            }
-        }
+        assert!(build_event_context_lines(KO, &notice, &events, 50, 8).is_empty());
     }
 }

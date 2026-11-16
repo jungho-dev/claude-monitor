@@ -35,7 +35,7 @@ fn fixture_home(name: &str) -> PathBuf {
 // 2. 임시 데이터 폴더 ---------------------------------------------------------
 fn temp_data_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "rap-inv-{name}-{}-{}",
+        "cm-inv-{name}-{}-{}",
         std::process::id(),
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
     ));
@@ -360,7 +360,7 @@ fn doctor_registered_home_passes_settings_checks() {
     assert_eq!(pick(&findings, "port-admin")[0].level, "warn");
     assert_eq!(
         pick(&findings, "port-admin")[0].fix_hint,
-        "rust-agents-proxy serve"
+        "claude-monitor serve"
     );
     assert_eq!(pick(&findings, "port-gateway")[0].level, "warn");
     assert_eq!(pick(&findings, "relay-target")[0].level, "warn");
@@ -491,7 +491,7 @@ fn doctor_detects_listening_port_and_healthy_relay_target() {
 #[test]
 fn doctor_warns_when_data_dir_is_missing() {
     let data_dir = std::env::temp_dir().join(format!(
-        "rap-inv-missing-{}-{}",
+        "cm-inv-missing-{}-{}",
         std::process::id(),
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
     ));
@@ -556,7 +556,7 @@ fn doctor_fails_when_allowlist_is_empty_array() {
 
 // 23. 불일치 허용 목록 --------------------------------------------------------
 #[test]
-fn doctor_fails_when_allowlist_lacks_rap_url() {
+fn doctor_fails_when_allowlist_lacks_cm_url() {
     let data_dir = temp_data_dir("mismatched-allowlist");
     let config = doctor_config("home_mismatched_allowlist", data_dir.clone(), None);
     let _cleanup = (
@@ -653,9 +653,9 @@ fn doctor_reports_foreign_owned_otlp_port() {
     drop(foreign);
 }
 
-// 27. rap 소유 OTLP 포트 ------------------------------------------------------
+// 27. cm 소유 OTLP 포트 -------------------------------------------------------
 #[test]
-fn doctor_accepts_rap_owned_otlp_port_and_flags_unverified_owner() {
+fn doctor_accepts_cm_owned_otlp_port_and_flags_unverified_owner() {
     // 1. serve 가 otlp 를 잡았다고 응답
     let held = TcpListener::bind("127.0.0.1:0").expect("포트 점유");
     let otlp_port = held.local_addr().expect("주소").port();
@@ -665,7 +665,7 @@ fn doctor_accepts_rap_owned_otlp_port_and_flags_unverified_owner() {
         enabled: true,
         listening: true,
     }]);
-    let data_dir = temp_data_dir("rap-otlp");
+    let data_dir = temp_data_dir("cm-otlp");
     let mut config = doctor_config("home_registered", data_dir.clone(), None);
     let _cleanup = (
         TempDirGuard(data_dir.clone()),

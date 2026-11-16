@@ -154,7 +154,7 @@ async fn handle_otlp_request(
     let (counts, batch) = match inserted {
         Ok(Ok(stored)) => stored,
         Ok(Err(err)) => {
-            eprintln!("[rap] OTLP 적재 실패: {err:#}");
+            eprintln!("[cm] OTLP 적재 실패: {err:#}");
             return text_response(StatusCode::INTERNAL_SERVER_ERROR, "store failed");
         }
         Err(_) => return text_response(StatusCode::INTERNAL_SERVER_ERROR, "store failed"),

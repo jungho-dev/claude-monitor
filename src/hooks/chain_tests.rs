@@ -157,14 +157,14 @@ async fn chain_allow_with_rewrite_returns_updated_input() {
     let specific = &body["hookSpecificOutput"];
     assert_eq!(specific["hookEventName"], "PreToolUse");
     assert_eq!(specific["permissionDecision"], "allow");
-    assert_eq!(specific["permissionDecisionReason"], "[rap] rewrite");
+    assert_eq!(specific["permissionDecisionReason"], "[cm] rewrite");
     assert_eq!(
         specific["updatedInput"]["command"],
         "bat --plain --paging=never README.md"
     );
     assert_eq!(specific["updatedInput"]["description"], "설명 유지");
     let context = specific["additionalContext"].as_str().expect("문맥");
-    assert!(context.contains("[rap] 명령 자동 변환: cat → bat --plain --paging=never"));
+    assert!(context.contains("[cm] 명령 자동 변환: cat → bat --plain --paging=never"));
     assert!(context.contains("가드 재검사 통과"));
 
     // 가드에는 재작성된 명령과 나머지 필드가 전달됨
@@ -214,7 +214,7 @@ async fn chain_rewrite_merges_guard_context_and_keys() {
     let context = body["hookSpecificOutput"]["additionalContext"]
         .as_str()
         .expect("문맥");
-    assert!(context.starts_with("가드 안내\n[rap] 명령 자동 변환: ls → eza"));
+    assert!(context.starts_with("가드 안내\n[cm] 명령 자동 변환: ls → eza"));
     assert_eq!(
         body["hookSpecificOutput"]["updatedInput"]["command"],
         "eza -la ."
@@ -301,7 +301,7 @@ async fn chain_timeout_fails_closed() {
     )
     .await;
     assert_eq!(result.outcome, HookOutcome::Error);
-    assert_eq!(result.guard, "rap");
+    assert_eq!(result.guard, "cm");
     let body: Value = serde_json::from_slice(&result.body).expect("JSON");
     assert_eq!(body["hookSpecificOutput"]["permissionDecision"], "deny");
     assert_eq!(
@@ -333,7 +333,7 @@ async fn chain_bad_guard_replies_fail_closed() {
         )
         .await;
         assert_eq!(result.outcome, HookOutcome::Error, "응답 {status} {body:?}");
-        assert_eq!(result.guard, "rap");
+        assert_eq!(result.guard, "cm");
     }
 }
 
@@ -421,7 +421,7 @@ async fn chain_no_decision_rewrite_omits_permission_decision() {
         );
         assert_eq!(specific["updatedInput"]["description"], "설명 유지");
         let context = specific["additionalContext"].as_str().expect("문맥");
-        assert!(context.contains("[rap] 명령 자동 변환: ls → eza"));
+        assert!(context.contains("[cm] 명령 자동 변환: ls → eza"));
     }
 }
 
@@ -463,7 +463,7 @@ async fn chain_ask_with_rewrite_keeps_ask_and_updated_input() {
     );
     let context = specific["additionalContext"].as_str().expect("문맥");
     assert!(
-        context.starts_with("가드 안내\n[rap] 명령 자동 변환: cat → bat --plain --paging=never")
+        context.starts_with("가드 안내\n[cm] 명령 자동 변환: cat → bat --plain --paging=never")
     );
 
     // 가드는 재작성된 명령을 평가함
@@ -600,6 +600,11 @@ fn guard_label_and_legacy_names_are_extracted() {
         extract_legacy_names("(감지: git diff, cat)"),
         "git diff,cat"
     );
+    assert_eq!(
+        extract_legacy_names("[cli-guard]\nblocked (detected: grep, find)\n"),
+        "grep,find"
+    );
+    assert_eq!(extract_legacy_names("Detected: git push"), "");
     assert_eq!(extract_legacy_names("감지: curl https://x?token=1"), "");
     assert_eq!(extract_legacy_names("감지 항목 없음"), "");
 }
@@ -815,7 +820,7 @@ async fn oversized_guard_reply_fails_closed() {
     )
     .await;
     assert_eq!(result.outcome, HookOutcome::Error);
-    assert_eq!(result.guard, "rap");
+    assert_eq!(result.guard, "cm");
     let body: Value = serde_json::from_slice(&result.body).expect("JSON");
     assert_eq!(body["hookSpecificOutput"]["permissionDecision"], "deny");
 }

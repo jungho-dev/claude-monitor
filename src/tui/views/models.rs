@@ -6,6 +6,7 @@ use crate::tui::cards::CardId;
 use crate::tui::format::{
     fit_display, format_clock_time, format_compact, format_count, format_duration_ms, short_model,
 };
+use crate::tui::i18n::{self, Lang, Msg};
 use crate::tui::layout::{SplitAxis, SplitGroup};
 use crate::tui::sort::{compare_agent_row, compare_cache_break_row, compare_model_row, sort_rows};
 use crate::tui::state::{AppState, Panel};
@@ -29,49 +30,49 @@ const MODEL_DETAIL_HEIGHT: u16 = MODEL_DETAIL_LINES as u16 + DETAIL_BORDER_ROWS;
 const AGENT_DETAIL_HEIGHT: u16 = AGENT_DETAIL_LINES as u16 + DETAIL_BORDER_ROWS;
 
 // 모델 표 열 (정렬 열 번호와 순서 일치: sort.rs)
-const MODEL_COLUMNS: [ColumnSpec; 13] = [
-    ("모델", 16, ColumnFit::Grow, Alignment::Left),
-    ("요청", 6, ColumnFit::Fixed, Alignment::Right),
-    ("세션", 5, ColumnFit::Fixed, Alignment::Right),
-    ("에이전트", 8, ColumnFit::Fixed, Alignment::Right),
-    ("입력", 6, ColumnFit::Fixed, Alignment::Right),
-    ("출력", 6, ColumnFit::Fixed, Alignment::Right),
-    ("캐시읽기", 8, ColumnFit::Fixed, Alignment::Right),
-    ("캐시생성", 8, ColumnFit::Fixed, Alignment::Right),
-    ("적중", 6, ColumnFit::Fixed, Alignment::Right),
-    ("p50", 6, ColumnFit::Fixed, Alignment::Right),
-    ("p90", 6, ColumnFit::Fixed, Alignment::Right),
-    ("비용추정", 8, ColumnFit::Fixed, Alignment::Right),
-    ("최근", 8, ColumnFit::Fixed, Alignment::Right),
+pub const MODEL_COLUMNS: [ColumnSpec; 13] = [
+    (Msg::ColModel, 16, ColumnFit::Grow, Alignment::Left),
+    (Msg::ColRequests, 6, ColumnFit::Fixed, Alignment::Right),
+    (Msg::ColSessions, 5, ColumnFit::Fixed, Alignment::Right),
+    (Msg::ColAgents, 8, ColumnFit::Fixed, Alignment::Right),
+    (Msg::ColInput, 6, ColumnFit::Fixed, Alignment::Right),
+    (Msg::ColOutput, 6, ColumnFit::Fixed, Alignment::Right),
+    (Msg::ColCacheRead, 8, ColumnFit::Fixed, Alignment::Right),
+    (Msg::ColCacheWrite, 8, ColumnFit::Fixed, Alignment::Right),
+    (Msg::ColHit, 6, ColumnFit::Fixed, Alignment::Right),
+    (Msg::ColP50, 6, ColumnFit::Fixed, Alignment::Right),
+    (Msg::ColP90, 6, ColumnFit::Fixed, Alignment::Right),
+    (Msg::ColCostEst, 8, ColumnFit::Fixed, Alignment::Right),
+    (Msg::ColLast, 8, ColumnFit::Fixed, Alignment::Right),
 ];
 
 // 에이전트 표 열
-const AGENT_COLUMNS: [ColumnSpec; 14] = [
-    ("에이전트", 16, ColumnFit::Grow, Alignment::Left),
-    ("실행", 5, ColumnFit::Fixed, Alignment::Right),
-    ("요청", 6, ColumnFit::Fixed, Alignment::Right),
-    ("세션", 5, ColumnFit::Fixed, Alignment::Right),
-    ("입력", 6, ColumnFit::Fixed, Alignment::Right),
-    ("출력", 6, ColumnFit::Fixed, Alignment::Right),
-    ("캐시읽기", 8, ColumnFit::Fixed, Alignment::Right),
-    ("비용추정", 8, ColumnFit::Fixed, Alignment::Right),
-    ("p50", 6, ColumnFit::Fixed, Alignment::Right),
-    ("p90", 6, ColumnFit::Fixed, Alignment::Right),
-    ("도구", 6, ColumnFit::Fixed, Alignment::Right),
-    ("오류", 5, ColumnFit::Fixed, Alignment::Right),
-    ("주 모델", 14, ColumnFit::Shrink, Alignment::Left),
-    ("최근", 8, ColumnFit::Fixed, Alignment::Right),
+pub const AGENT_COLUMNS: [ColumnSpec; 14] = [
+    (Msg::ColAgent, 16, ColumnFit::Grow, Alignment::Left),
+    (Msg::ColRuns, 5, ColumnFit::Fixed, Alignment::Right),
+    (Msg::ColRequests, 6, ColumnFit::Fixed, Alignment::Right),
+    (Msg::ColSessions, 5, ColumnFit::Fixed, Alignment::Right),
+    (Msg::ColInput, 6, ColumnFit::Fixed, Alignment::Right),
+    (Msg::ColOutput, 6, ColumnFit::Fixed, Alignment::Right),
+    (Msg::ColCacheRead, 8, ColumnFit::Fixed, Alignment::Right),
+    (Msg::ColCostEst, 8, ColumnFit::Fixed, Alignment::Right),
+    (Msg::ColP50, 6, ColumnFit::Fixed, Alignment::Right),
+    (Msg::ColP90, 6, ColumnFit::Fixed, Alignment::Right),
+    (Msg::ColTools, 6, ColumnFit::Fixed, Alignment::Right),
+    (Msg::ColErrors, 5, ColumnFit::Fixed, Alignment::Right),
+    (Msg::ColTopModel, 14, ColumnFit::Shrink, Alignment::Left),
+    (Msg::ColLast, 8, ColumnFit::Fixed, Alignment::Right),
 ];
 
 // 캐시 붕괴 표 열
-const CACHE_BREAK_COLUMNS: [ColumnSpec; 7] = [
-    ("시각", 8, ColumnFit::Fixed, Alignment::Left),
-    ("에이전트", 12, ColumnFit::Shrink, Alignment::Left),
-    ("모델", 16, ColumnFit::Grow, Alignment::Left),
-    ("신규 캐시", 9, ColumnFit::Fixed, Alignment::Right),
-    ("직전 문맥", 9, ColumnFit::Fixed, Alignment::Right),
-    ("간격", 6, ColumnFit::Fixed, Alignment::Right),
-    ("추정 원인", 16, ColumnFit::Grow, Alignment::Left),
+pub const CACHE_BREAK_COLUMNS: [ColumnSpec; 7] = [
+    (Msg::ColTime, 8, ColumnFit::Fixed, Alignment::Left),
+    (Msg::ColAgent, 12, ColumnFit::Shrink, Alignment::Left),
+    (Msg::ColModel, 16, ColumnFit::Grow, Alignment::Left),
+    (Msg::ColNewCache, 9, ColumnFit::Fixed, Alignment::Right),
+    (Msg::ColPrevContext, 9, ColumnFit::Fixed, Alignment::Right),
+    (Msg::ColGap, 6, ColumnFit::Fixed, Alignment::Right),
+    (Msg::ColLikelyCause, 16, ColumnFit::Grow, Alignment::Left),
 ];
 
 // 1. 모델 탭 ------------------------------------------------------------------
@@ -81,9 +82,10 @@ pub fn render_models_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
         return;
     }
     let table_cut = (u32::from(area.height) * 40 / 100) as u16;
-    let detail_cut = table_cut + MODEL_DETAIL_HEIGHT.min(area.height.saturating_sub(table_cut + 3));
+    // 낮은 화면에서도 캐시 붕괴 표가 머리글과 한 행(4줄)은 갖도록 상세 카드가 먼저 줄어듦
+    let detail_cut = table_cut + MODEL_DETAIL_HEIGHT.min(area.height.saturating_sub(table_cut + 4));
     let panes = state.card_layout.split_cards(
-        &mut state.hit_areas.split_hits,
+        &mut state.hit_areas,
         SplitGroup::ModelsRows,
         SplitAxis::Rows,
         area,
@@ -146,30 +148,23 @@ pub fn render_models_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 panes[0],
                 CardTable {
                     card: CardId::ModelTable,
-                    title: format!("모델 통계 · 추정 (API 단가) · 합계 ${cost_total:.2}"),
+                    title: i18n::model_table_title(state.lang, cost_total),
                     hint: String::new(),
                     columns: MODEL_COLUMNS.to_vec(),
                     rows,
+                    aux_lines: Vec::new(),
                 },
             );
         }
         None => {
-            let (message, color) = panel_message(&state.snapshot.model_stats)
-                .unwrap_or((String::new(), theme::FG_DIM));
-            render_notice_card(
-                frame,
-                state,
-                CardId::ModelTable,
-                panes[0],
-                "모델 통계 (추정)",
-                &message,
-                color,
-            );
+            let note = panel_message(state.lang, &state.snapshot.model_stats).unwrap_or_default();
+            let title = i18n::text(state.lang, Msg::TitleModelStatsPending);
+            render_notice_card(frame, state, CardId::ModelTable, panes[0], title, note);
         }
     }
     let selected = state.card_views[CardId::ModelTable as usize].selected;
     let selected_model = models.as_ref().and_then(|sorted| sorted.get(selected));
-    let (detail_title, detail_lines) = build_model_detail(selected_model);
+    let (detail_title, detail_lines) = build_model_detail(state.lang, selected_model);
     render_text_card(
         frame,
         state,
@@ -178,8 +173,6 @@ pub fn render_models_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
             card: CardId::ModelDetail,
             title: detail_title,
             hint: String::new(),
-            header: None,
-            header_cells: Vec::new(),
             lines: detail_lines,
         },
     );
@@ -232,37 +225,30 @@ pub fn render_models_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 panes[2],
                 CardTable {
                     card: CardId::CacheBreaks,
-                    title: format!("캐시 붕괴 후보 · {}건", sorted.len()),
+                    title: i18n::cache_breaks_title(state.lang, sorted.len()),
                     hint: String::new(),
                     columns: CACHE_BREAK_COLUMNS.to_vec(),
                     rows,
+                    aux_lines: Vec::new(),
                 },
             );
         }
         None => {
-            let (message, color) = panel_message(&state.snapshot.cache_breaks)
-                .unwrap_or((String::new(), theme::FG_DIM));
-            render_notice_card(
-                frame,
-                state,
-                CardId::CacheBreaks,
-                panes[2],
-                "캐시 붕괴 후보",
-                &message,
-                color,
-            );
+            let note = panel_message(state.lang, &state.snapshot.cache_breaks).unwrap_or_default();
+            let title = i18n::text(state.lang, Msg::TitleCacheBreaks);
+            render_notice_card(frame, state, CardId::CacheBreaks, panes[2], title, note);
         }
     }
 }
 
 // 2. 모델 상세 ----------------------------------------------------------------
 // 제목과 항목 줄 (캐시 적중과 추정 비용 포함)
-fn build_model_detail(row: Option<&ModelStatsRow>) -> (String, Vec<Line<'static>>) {
+fn build_model_detail(lang: Lang, row: Option<&ModelStatsRow>) -> (String, Vec<Line<'static>>) {
     let Some(row) = row else {
         return (
-            "모델 상세".to_string(),
+            i18n::text(lang, Msg::TitleModelDetail).to_string(),
             vec![Line::from(Span::styled(
-                "선택한 모델 없음",
+                i18n::text(lang, Msg::NoModelSelected),
                 theme::STYLE_DIM,
             ))],
         );
@@ -270,7 +256,7 @@ fn build_model_detail(row: Option<&ModelStatsRow>) -> (String, Vec<Line<'static>
     let wait = |millis: Option<i64>| millis.map_or("-".to_string(), format_duration_ms);
     let pairs: [(&str, String); MODEL_DETAIL_LINES] = [
         (
-            "요청 / 세션 / 종류",
+            i18n::text(lang, Msg::ModelCounts),
             format!(
                 "{} / {} / {}",
                 format_count(i64::try_from(row.requests).unwrap_or(i64::MAX)),
@@ -279,7 +265,7 @@ fn build_model_detail(row: Option<&ModelStatsRow>) -> (String, Vec<Line<'static>
             ),
         ),
         (
-            "입력 / 출력",
+            i18n::text(lang, Msg::InOut),
             format!(
                 "{} / {}",
                 format_compact(row.input_tokens),
@@ -287,23 +273,26 @@ fn build_model_detail(row: Option<&ModelStatsRow>) -> (String, Vec<Line<'static>
             ),
         ),
         (
-            "캐시 읽기 / 생성",
-            format!(
-                "{} / {}  (적중 {:.1}%)",
-                format_compact(row.cache_read_tokens),
-                format_compact(row.cache_creation_tokens),
-                row.cache_hit_ratio * 100.0
+            i18n::text(lang, Msg::CacheReadWrite),
+            i18n::cache_read_write_value(
+                lang,
+                &format_compact(row.cache_read_tokens),
+                &format_compact(row.cache_creation_tokens),
+                row.cache_hit_ratio * 100.0,
             ),
         ),
         (
-            "대기 p50 / p90",
+            i18n::text(lang, Msg::WaitP50P90),
             format!("{} / {}", wait(row.wait_p50_ms), wait(row.wait_p90_ms)),
         ),
         (
-            "비용 (추정)",
-            format!("${:.2}  (API 단가 기준)", row.cost_usd_estimate),
+            i18n::text(lang, Msg::CostEstimate),
+            i18n::cost_value(lang, row.cost_usd_estimate),
         ),
-        ("마지막 요청", format_clock_time(&row.last_ts)),
+        (
+            i18n::text(lang, Msg::LastRequest),
+            format_clock_time(&row.last_ts),
+        ),
     ];
     let lines = pairs
         .into_iter()
@@ -314,10 +303,11 @@ fn build_model_detail(row: Option<&ModelStatsRow>) -> (String, Vec<Line<'static>
             ])
         })
         .collect();
+    let base = i18n::text(lang, Msg::TitleModelDetail);
     let title = if row.model.is_empty() {
-        "모델 상세".to_string()
+        base.to_string()
     } else {
-        format!("모델 상세 · {}", row.model)
+        format!("{base} · {}", row.model)
     };
     (title, lines)
 }
@@ -330,7 +320,7 @@ pub fn render_agents_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
     }
     let detail_height = AGENT_DETAIL_HEIGHT.min(area.height.saturating_sub(5));
     let panes = state.card_layout.split_cards(
-        &mut state.hit_areas.split_hits,
+        &mut state.hit_areas,
         SplitGroup::AgentsRows,
         SplitAxis::Rows,
         area,
@@ -412,35 +402,25 @@ pub fn render_agents_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 panes[0],
                 CardTable {
                     card: CardId::AgentTable,
-                    title: format!(
-                        "에이전트 통계 · {}종 · 추정 (API 단가) · 합계 ${cost_total:.2}",
-                        sorted.len()
-                    ),
+                    title: i18n::agent_table_title(state.lang, sorted.len(), cost_total),
                     hint: String::new(),
                     columns: AGENT_COLUMNS.to_vec(),
                     rows,
+                    aux_lines: Vec::new(),
                 },
             );
         }
         None => {
-            let (message, color) = panel_message(&state.snapshot.agent_stats)
-                .unwrap_or((String::new(), theme::FG_DIM));
-            render_notice_card(
-                frame,
-                state,
-                CardId::AgentTable,
-                panes[0],
-                "에이전트 통계 (추정)",
-                &message,
-                color,
-            );
+            let note = panel_message(state.lang, &state.snapshot.agent_stats).unwrap_or_default();
+            let title = i18n::text(state.lang, Msg::TitleAgentStatsPending);
+            render_notice_card(frame, state, CardId::AgentTable, panes[0], title, note);
         }
     }
 
     // 2. 선택 에이전트 상세
     let selected = state.card_views[CardId::AgentTable as usize].selected;
     let selected_agent = agents.as_ref().and_then(|sorted| sorted.get(selected));
-    let (detail_title, detail_lines) = build_agent_detail(selected_agent);
+    let (detail_title, detail_lines) = build_agent_detail(state.lang, selected_agent);
     render_text_card(
         frame,
         state,
@@ -449,8 +429,6 @@ pub fn render_agents_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
             card: CardId::AgentDetail,
             title: detail_title,
             hint: String::new(),
-            header: None,
-            header_cells: Vec::new(),
             lines: detail_lines,
         },
     );
@@ -458,12 +436,12 @@ pub fn render_agents_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
 
 // 4. 에이전트 상세 ------------------------------------------------------------
 // 제목과 항목 줄 (도구 오류율, 주 모델, 추정 비용 포함)
-fn build_agent_detail(row: Option<&AgentStatsRow>) -> (String, Vec<Line<'static>>) {
+fn build_agent_detail(lang: Lang, row: Option<&AgentStatsRow>) -> (String, Vec<Line<'static>>) {
     let Some(row) = row else {
         return (
-            "에이전트 상세".to_string(),
+            i18n::text(lang, Msg::TitleAgentDetail).to_string(),
             vec![Line::from(Span::styled(
-                "선택한 에이전트 없음",
+                i18n::text(lang, Msg::NoAgentSelected),
                 theme::STYLE_DIM,
             ))],
         );
@@ -481,7 +459,7 @@ fn build_agent_detail(row: Option<&AgentStatsRow>) -> (String, Vec<Line<'static>
     };
     let pairs: [(&str, String); AGENT_DETAIL_LINES] = [
         (
-            "실행 / 요청 / 세션",
+            i18n::text(lang, Msg::AgentCounts),
             format!(
                 "{} / {} / {}",
                 format_count(i64::try_from(row.runs).unwrap_or(i64::MAX)),
@@ -490,7 +468,7 @@ fn build_agent_detail(row: Option<&AgentStatsRow>) -> (String, Vec<Line<'static>
             ),
         ),
         (
-            "입력 / 출력",
+            i18n::text(lang, Msg::InOut),
             format!(
                 "{} / {}",
                 format_compact(row.input_tokens),
@@ -498,32 +476,33 @@ fn build_agent_detail(row: Option<&AgentStatsRow>) -> (String, Vec<Line<'static>
             ),
         ),
         (
-            "캐시 읽기 / 생성",
-            format!(
-                "{} / {}  (적중 {:.1}%)",
-                format_compact(row.cache_read_tokens),
-                format_compact(row.cache_creation_tokens),
-                row.cache_hit_ratio * 100.0
+            i18n::text(lang, Msg::CacheReadWrite),
+            i18n::cache_read_write_value(
+                lang,
+                &format_compact(row.cache_read_tokens),
+                &format_compact(row.cache_creation_tokens),
+                row.cache_hit_ratio * 100.0,
             ),
         ),
         (
-            "대기 p50 / p90",
+            i18n::text(lang, Msg::WaitP50P90),
             format!("{} / {}", wait(row.wait_p50_ms), wait(row.wait_p90_ms)),
         ),
         (
-            "도구 호출 / 오류",
-            format!(
-                "{} / {}  (오류율 {error_rate:.1}%)",
-                format_count(i64::try_from(row.tool_calls).unwrap_or(i64::MAX)),
-                format_count(i64::try_from(row.tool_errors).unwrap_or(i64::MAX)),
+            i18n::text(lang, Msg::AgentToolCalls),
+            i18n::tool_calls_value(
+                lang,
+                &format_count(i64::try_from(row.tool_calls).unwrap_or(i64::MAX)),
+                &format_count(i64::try_from(row.tool_errors).unwrap_or(i64::MAX)),
+                error_rate,
             ),
         ),
         (
-            "비용 (추정)",
-            format!("${:.2}  (API 단가 기준)", row.cost_usd_estimate),
+            i18n::text(lang, Msg::CostEstimate),
+            i18n::cost_value(lang, row.cost_usd_estimate),
         ),
         (
-            "주 모델 / 마지막 요청",
+            i18n::text(lang, Msg::AgentTopLast),
             format!("{top_model} / {}", format_clock_time(&row.last_ts)),
         ),
     ];
@@ -536,10 +515,11 @@ fn build_agent_detail(row: Option<&AgentStatsRow>) -> (String, Vec<Line<'static>
             ])
         })
         .collect();
+    let base = i18n::text(lang, Msg::TitleAgentDetail);
     let title = if row.agent.is_empty() {
-        "에이전트 상세".to_string()
+        base.to_string()
     } else {
-        format!("에이전트 상세 · {}", row.agent)
+        format!("{base} · {}", row.agent)
     };
     (title, lines)
 }
@@ -547,6 +527,8 @@ fn build_agent_detail(row: Option<&AgentStatsRow>) -> (String, Vec<Line<'static>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const KO: Lang = Lang::Ko;
 
     fn line_text(line: &Line<'_>) -> String {
         line.spans
@@ -572,7 +554,7 @@ mod tests {
             cost_usd_estimate: 12.345,
             last_ts: "2026-11-15T01:00:00Z".to_string(),
         };
-        let (title, lines) = build_model_detail(Some(&row));
+        let (title, lines) = build_model_detail(KO, Some(&row));
         assert_eq!(title, "모델 상세 · claude-sonnet-5-5");
         let text: Vec<String> = lines.iter().map(line_text).collect();
         assert!(text.iter().any(|line| line.contains("900 / 3 / 2")));
@@ -580,7 +562,7 @@ mod tests {
         assert!(text.iter().any(|line| line.contains("1.2s / -")));
         assert!(text.iter().any(|line| line.contains("$12.35")));
 
-        let (empty_title, empty_lines) = build_model_detail(None);
+        let (empty_title, empty_lines) = build_model_detail(KO, None);
         assert_eq!(empty_title, "모델 상세");
         assert_eq!(empty_lines.len(), 1);
     }
@@ -598,25 +580,25 @@ mod tests {
             cost_usd_estimate: 1.5,
             ..AgentStatsRow::default()
         };
-        let (title, lines) = build_agent_detail(Some(&row));
+        let (title, lines) = build_agent_detail(KO, Some(&row));
         assert_eq!(title, "에이전트 상세 · worker");
         let text: Vec<String> = lines.iter().map(line_text).collect();
         assert!(text.iter().any(|line| line.contains("3 / 40 / 2")));
         assert!(text.iter().any(|line| line.contains("오류율 10.0%")));
         assert!(text.iter().any(|line| line.contains("claude-sonnet-5-5")));
 
-        let (empty_title, _) = build_agent_detail(None);
+        let (empty_title, _) = build_agent_detail(KO, None);
         assert_eq!(empty_title, "에이전트 상세");
     }
 
     #[test]
     fn detail_titles_drop_the_separator_when_the_name_is_empty() {
         let nameless_model = ModelStatsRow::default();
-        let (title, _) = build_model_detail(Some(&nameless_model));
+        let (title, _) = build_model_detail(KO, Some(&nameless_model));
         assert_eq!(title, "모델 상세");
 
         let nameless_agent = AgentStatsRow::default();
-        let (title, _) = build_agent_detail(Some(&nameless_agent));
+        let (title, _) = build_agent_detail(KO, Some(&nameless_agent));
         assert_eq!(title, "에이전트 상세");
     }
 }

@@ -1,14 +1,15 @@
 //! tui/views/common.rs
-//! 탭 공용 그리기: 클릭·마우스 강조 카드, 안내 카드, DB 빈 상태, 표·텍스트 카드, 열 폭 결정, 정렬 머리글.
+//! 탭 공용 그리기: 클릭·마우스 강조 카드, 안내 카드, DB 빈 상태, 표·텍스트 카드, 열 폭 결정, 스크롤바.
 
 use crate::core::config::DB_FILE_NAME;
 use crate::tui::cards::{
-    CardId, CardKind, ColumnHit, HeaderHit, HeaderSpan, MAX_TABLE_COLUMNS, RowHit, ScrollHit,
-    scroll_thumb,
+    CardId, CardKind, ColumnHit, HeaderHit, MAX_COLUMN_WIDTH, MAX_TABLE_COLUMNS, RowHit, ScrollHit,
+    TitleHit, scroll_thumb,
 };
-use crate::tui::format::fit_display;
+use crate::tui::format::{fit_display, fit_title_segments};
+use crate::tui::i18n::{self, Lang, Msg};
 use crate::tui::layout::SplitAxis;
-use crate::tui::sort::{SortState, sort_spec};
+use crate::tui::sort::sort_spec;
 use crate::tui::state::{AppState, DbState, Panel};
 use crate::tui::theme;
 use ratatui::Frame;
@@ -24,16 +25,28 @@ const MIN_COLUMN_WIDTH: u16 = 3;
 const TABLE_COLUMN_GAP: u16 = 1;
 
 // 표 열 맞춤: 숫자·짧은 열은 고정, 글자 열은 좁아지면 먼저 줄고(Shrink), 남는 폭은 맨 오른쪽 Grow 열이 가짐
+// Keep·GrowKeep 은 명세 폭을 읽을 수 있는 최소 폭으로 지키는 글자 열 (그 폭보다 좁아지면 줄이지 않고 오른쪽 열을 먼저 숨김),
+// GrowKeep 은 Grow 처럼 남는 폭도 받음
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnFit {
     Fixed,
     Shrink,
     Grow,
+    Keep,
+    GrowKeep,
 }
 
-// 열 명세 (머리글, 고정 열 최소 폭, 맞춤 규칙, 정렬)
+// 열 명세 (머리글 문구 키, 고정 열 최소 폭 또는 Keep 열 지킬 폭, 맞춤 규칙, 정렬)
 // 글자 열의 폭은 머리글·가장 넓은 칸의 표시 폭(자연 폭)이 정함
-pub type ColumnSpec = (&'static str, u16, ColumnFit, Alignment);
+pub type ColumnSpec = (Msg, u16, ColumnFit, Alignment);
+
+// 패널 상태 안내 (hint = 다음 행동 한 줄의 문구 키)
+#[derive(Clone, Default)]
+pub struct PanelNote {
+    pub message: String,
+    pub color: Color,
+    pub hint: Option<Msg>,
+}
 
 // 열 폭 계획 한 칸 (natural = 자연 폭, floor = 줄일 수 있는 최소 폭, user = 끌어 정한 폭)
 #[derive(Debug, Clone, Copy)]
@@ -48,21 +61,21 @@ pub struct ColumnPlan {
 pub type TableCell = Vec<Span<'static>>;
 
 // 표 카드 그리기 입력 (머리글 1행 고정, rows 는 정렬을 마친 전체 행)
+// aux_lines = 표 영역 아래 이어지는 보조 줄 영역 (마지막 행 뒤로 같은 스크롤에 이어지고 열 폭·정렬에 속하지 않음)
 pub struct CardTable {
     pub card: CardId,
     pub title: String,
     pub hint: String,
     pub columns: Vec<ColumnSpec>,
     pub rows: Vec<Vec<TableCell>>,
+    pub aux_lines: Vec<Line<'static>>,
 }
 
-// 텍스트 카드 그리기 입력 (header 는 스크롤되지 않는 머리글 줄, header_cells 는 그 줄의 정렬 열 구간)
+// 텍스트 카드 그리기 입력
 pub struct TextCard {
     pub card: CardId,
     pub title: String,
     pub hint: String,
-    pub header: Option<Line<'static>>,
-    pub header_cells: Vec<HeaderSpan>,
     pub lines: Vec<Line<'static>>,
 }
 
@@ -80,10 +93,37 @@ pub fn interactive_card(
 ) -> Block<'static> {
     state.hit_areas.card_rects.push((id, area));
 
-    // 1. 강조 단계: 클릭한 카드는 그 탭에서만 유효, 없으면 탭의 주 카드
+    // 1. 이동 중인 카드는 제목에 이동 표시, 제목이 카드 폭(테두리 2열과 양옆 공백 2열 제외)을 넘으면 구간을 덜어내 정렬 표시를 남김
+    // 제목 글자 영역은 길게 누르기 대상으로 등록 (좌우 테두리 안쪽까지만)
+    let lifted = state.card_move.is_some_and(|moving| moving.card == id);
+    let title_room = usize::from(area.width).saturating_sub(4);
+    let shown_title = if lifted {
+        let prefix_width = Span::raw(i18n::card_moving(state.lang, "")).width();
+        let fitted = fit_title_segments(title, title_room.saturating_sub(prefix_width));
+        format!(" {} ", i18n::card_moving(state.lang, &fitted))
+    } else {
+        format!(" {} ", fit_title_segments(title, title_room))
+    };
+    let title_width = Line::from(shown_title.as_str()).width() as u16;
+    let title_rect = Rect::new(
+        area.x.saturating_add(1),
+        area.y,
+        title_width.min(area.width.saturating_sub(2)),
+        1.min(area.height),
+    );
+    if !title_rect.is_empty() {
+        state.hit_areas.title_hits.push(TitleHit {
+            card: id,
+            rect: title_rect,
+        });
+    }
+
+    // 2. 강조 단계: 클릭한 카드는 그 탭에서만 유효, 없으면 탭의 주 카드
     let focused = state.focused_card_id() == id;
     let hovered = state.hover_card == Some(id);
-    let border = if tone == theme::COLOR_CRIT {
+    let border = if lifted {
+        theme::FG_ACCENT
+    } else if tone == theme::COLOR_CRIT {
         tone
     } else if focused {
         theme::BORDER_FOCUS
@@ -93,8 +133,16 @@ pub fn interactive_card(
         tone
     };
 
-    // 2. 선택 카드는 색 외에도 선 굵기·제목 반전으로 구분
-    let (border_type, title_style) = if focused {
+    // 3. 선택 카드는 색 외에도 선 굵기·제목 반전으로 구분, 이동 중 카드는 점선·강조색 반전 제목 (이중선은 겹침 창 전용)
+    let (border_type, title_style) = if lifted {
+        (
+            BorderType::LightDoubleDashed,
+            Style::default()
+                .fg(theme::FG_ON_ACCENT)
+                .bg(theme::FG_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if focused {
         (
             BorderType::Thick,
             Style::default()
@@ -121,12 +169,11 @@ pub fn interactive_card(
         .borders(Borders::ALL)
         .border_type(border_type)
         .border_style(Style::default().fg(border))
-        .title(Span::styled(format!(" {title} "), title_style))
+        .title(Span::styled(shown_title, title_style))
         .style(Style::default().bg(theme::BG_PANEL));
 
-    // 3. 보조 문구
-    let needed =
-        Line::from(format!(" {title} ")).width() + Line::from(format!(" {hint} ")).width() + 4;
+    // 4. 보조 문구
+    let needed = title_width as usize + Line::from(format!(" {hint} ")).width() + 4;
     if hint.is_empty() || needed > area.width as usize {
         return block;
     }
@@ -134,12 +181,20 @@ pub fn interactive_card(
 }
 
 // 2. 패널 상태 안내 -----------------------------------------------------------
-// Ready 가 아니면 (문구, 색), 준비되면 None (소유값이라 이후 state 변경과 충돌 없음)
-pub fn panel_message<T>(panel: &Panel<T>) -> Option<(String, Color)> {
+// Ready 가 아니면 안내(문구, 색, 다음 행동), 준비되면 None (소유값이라 이후 state 변경과 충돌 없음)
+pub fn panel_message<T>(lang: Lang, panel: &Panel<T>) -> Option<PanelNote> {
     match panel {
         Panel::Ready(_) => None,
-        Panel::Pending => Some(("집계 대기 중".to_string(), theme::FG_DIM)),
-        Panel::Failed(text) => Some((text.clone(), theme::COLOR_CRIT)),
+        Panel::Pending => Some(PanelNote {
+            message: i18n::text(lang, Msg::PanelPending).to_string(),
+            color: theme::FG_DIM,
+            hint: Some(Msg::PanelPendingHint),
+        }),
+        Panel::Failed(failure) => Some(PanelNote {
+            message: i18n::failure_text(lang, failure),
+            color: theme::COLOR_CRIT,
+            hint: Some(Msg::RetryHint),
+        }),
     }
 }
 
@@ -151,35 +206,49 @@ pub fn render_notice_card(
     id: CardId,
     area: Rect,
     title: &str,
-    message: &str,
-    color: Color,
+    note: PanelNote,
 ) {
     let block = interactive_card(state, id, area, title, "", theme::BORDER_DIM);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let hint = match message {
-        "집계 대기 중" => "첫 집계가 끝나면 자동 표시",
-        "이벤트 없음" => "Claude Code 세션이 시작되면 실시간 표시",
-        _ if color == theme::COLOR_CRIT => "r 키로 다시 시도",
-        _ => "",
-    };
-    let headline = Span::styled(message.to_string(), Style::default().fg(color));
+    let hint = note.hint.map_or("", |msg| i18n::text(state.lang, msg));
+    let headline = Span::styled(note.message, Style::default().fg(note.color));
     render_empty_state(frame, inner, headline, hint);
 }
 
 // 4. DB 빈 상태 ---------------------------------------------------------------
 // DB 가 열리지 않았으면 안내를 그리고 true (호출한 탭은 본문을 그리지 않음)
 pub fn render_db_gate(frame: &mut Frame, state: &mut AppState, area: Rect) -> bool {
+    let lang = state.lang;
     let db_path = state.config.data_dir.join(DB_FILE_NAME);
     let (headline, detail, color) = match &state.snapshot.db_state {
         DbState::Open => return false,
-        DbState::Pending => ("첫 집계 대기 중", String::new(), theme::FG_DIM),
-        DbState::Missing => ("DB 없음", db_path.display().to_string(), theme::COLOR_WARN),
-        DbState::Failed(text) => ("DB 열기 실패", text.clone(), theme::COLOR_CRIT),
+        DbState::Pending => (
+            i18n::text(lang, Msg::GatePending),
+            String::new(),
+            theme::FG_DIM,
+        ),
+        DbState::Missing => (
+            i18n::text(lang, Msg::GateNoDb),
+            db_path.display().to_string(),
+            theme::COLOR_WARN,
+        ),
+        DbState::Failed(failure) => (
+            i18n::text(lang, Msg::GateOpenFailed),
+            i18n::failure_text(lang, failure),
+            theme::COLOR_CRIT,
+        ),
     };
     let needs_serve = !matches!(state.snapshot.db_state, DbState::Pending);
 
-    let block = interactive_card(state, CardId::Gate, area, "집계", "", theme::BORDER_DIM);
+    let block = interactive_card(
+        state,
+        CardId::Gate,
+        area,
+        i18n::text(lang, Msg::GateTitle),
+        "",
+        theme::BORDER_DIM,
+    );
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.height == 0 {
@@ -195,7 +264,7 @@ pub fn render_db_gate(frame: &mut Frame, state: &mut AppState, area: Rect) -> bo
     if needs_serve {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "serve 또는 index 실행 필요",
+            i18n::text(lang, Msg::GateRunServe),
             theme::STYLE_ACCENT,
         )));
     }
@@ -212,6 +281,7 @@ pub fn render_db_gate(frame: &mut Frame, state: &mut AppState, area: Rect) -> bo
 
 // 5. 표 카드 ------------------------------------------------------------------
 // 자연 폭 기반 열 폭 결정, 정렬 머리글·열 경계·본문 행 클릭 영역 등록, 선택 행 띠, 위치 표시, 오른쪽 거터 스크롤바
+// 표 영역(머리글과 행) 아래에 보조 줄 영역이 같은 스크롤로 이어지고, 본문이 한 줄뿐인 낮은 카드는 머리글 대신 첫 줄을 보임
 pub fn render_card_table(frame: &mut Frame, state: &mut AppState, area: Rect, table: CardTable) {
     let CardTable {
         card,
@@ -219,20 +289,29 @@ pub fn render_card_table(frame: &mut Frame, state: &mut AppState, area: Rect, ta
         hint,
         columns,
         rows,
+        aux_lines,
     } = table;
     let sort = sort_spec(card).map(|_| state.card_sorts[card as usize]);
+    let lang = state.lang;
+    let labels: Vec<&'static str> = columns
+        .iter()
+        .map(|spec| i18n::text(lang, spec.0))
+        .collect();
 
     // 1. 제목 (정렬 열과 방향 덧붙임)
     let title =
-        match sort.and_then(|current| columns.get(current.column).map(|spec| (spec.0, current))) {
-            Some((label, current)) => format!("{title} · 정렬 {label}{}", current.sort_arrow()),
+        match sort.and_then(|current| labels.get(current.column).map(|label| (*label, current))) {
+            Some((label, current)) => i18n::sort_title(lang, &title, label, current.sort_arrow()),
             None => title,
         };
     let block = interactive_card(state, card, area, &title, &hint, theme::BORDER_DIM)
         .padding(Padding::horizontal(1));
     let inner = block.inner(area);
-    let total = rows.len();
-    let visible = (inner.height as usize).saturating_sub(1);
+    let table_total = rows.len();
+    let total = table_total + aux_lines.len();
+    let header_height = u16::from(inner.height > 1);
+    let body_height = inner.height - header_height;
+    let visible = usize::from(body_height);
     let selectable = card.kind() == CardKind::Selectable;
 
     // 2. 보기 상태 보정
@@ -243,12 +322,12 @@ pub fn render_card_table(frame: &mut Frame, state: &mut AppState, area: Rect, ta
     view.selected = view.selected.min(total.saturating_sub(1));
     let (scroll, selected) = (view.scroll, view.selected);
 
-    // 3. 열 폭 계획 (자연 폭 = 머리글·가장 넓은 칸, 숫자·고정 열은 선호 폭 이상으로 줄지 않음)
+    // 3. 열 폭 계획 (자연 폭 = 머리글·가장 넓은 칸, 숫자·고정 열은 선호 폭 이상으로 줄지 않음, Keep 열은 지킬 폭 아래로 줄지 않음)
     let plans: Vec<ColumnPlan> = columns
         .iter()
         .enumerate()
         .map(|(index, spec)| {
-            let label_width = Span::raw(spec.0).width() + usize::from(sort.is_some());
+            let label_width = Span::raw(labels[index]).width() + usize::from(sort.is_some());
             let content_width = rows
                 .iter()
                 .map(|row| {
@@ -258,15 +337,19 @@ pub fn render_card_table(frame: &mut Frame, state: &mut AppState, area: Rect, ta
                 .max()
                 .unwrap_or(0);
             let widest = u16::try_from(label_width.max(content_width)).unwrap_or(u16::MAX);
-            let fixed = spec.2 == ColumnFit::Fixed;
-            let natural = if fixed { spec.1.max(widest) } else { widest };
+            let natural = if spec.2 == ColumnFit::Fixed {
+                spec.1.max(widest)
+            } else {
+                widest
+            };
+            let floor = match spec.2 {
+                ColumnFit::Fixed => natural,
+                ColumnFit::Keep | ColumnFit::GrowKeep => spec.1.max(MIN_COLUMN_WIDTH).min(natural),
+                ColumnFit::Shrink | ColumnFit::Grow => MIN_COLUMN_WIDTH.min(natural),
+            };
             ColumnPlan {
                 natural,
-                floor: if fixed {
-                    natural
-                } else {
-                    MIN_COLUMN_WIDTH.min(natural)
-                },
+                floor,
                 fit: spec.2,
                 user: state.column_widths[card as usize]
                     .get(index)
@@ -284,25 +367,24 @@ pub fn render_card_table(frame: &mut Frame, state: &mut AppState, area: Rect, ta
         .fold(0u16, |sum, index| sum.saturating_add(plans[*index].floor));
     let shown_gaps = (shown.len().saturating_sub(1)) as u16 * TABLE_COLUMN_GAP;
 
-    // 4. 머리글 (정렬 열 화살표 유지, 정렬·열 경계 클릭 영역은 열 좌표와 동일)
+    // 4. 머리글 (정렬 열 화살표 유지, 정렬·열 경계 클릭 영역은 열 좌표와 동일, 머리글이 없는 낮은 카드는 영역 없음)
     let mut header_cells: Vec<Cell<'static>> = Vec::new();
     let mut cursor = inner.x;
     for (position, index) in shown.iter().enumerate() {
         let spec = columns[*index];
         let width = widths[*index];
         let active = sort.is_some_and(|current| current.column == *index);
+        let name = labels[*index];
         let label = match sort {
-            Some(current) if active && Span::raw(spec.0).width() + 1 > usize::from(width) => {
-                let head = fit_display(spec.0, usize::from(width).saturating_sub(1));
+            Some(current) if active && Span::raw(name).width() + 1 > usize::from(width) => {
+                let head = fit_display(name, usize::from(width).saturating_sub(1));
                 format!("{}{}", head.trim_end(), current.sort_arrow())
             }
-            Some(current) if active => format!("{}{}", spec.0, current.sort_arrow()),
-            _ if Span::raw(spec.0).width() > usize::from(width) => {
-                fit_display(spec.0, usize::from(width))
-                    .trim_end()
-                    .to_string()
+            Some(current) if active => format!("{name}{}", current.sort_arrow()),
+            _ if Span::raw(name).width() > usize::from(width) => {
+                fit_display(name, usize::from(width)).trim_end().to_string()
             }
-            _ => spec.0.to_string(),
+            _ => name.to_string(),
         };
         let cell = Cell::from(Line::from(label).alignment(spec.3));
         header_cells.push(if active {
@@ -310,7 +392,7 @@ pub fn render_card_table(frame: &mut Frame, state: &mut AppState, area: Rect, ta
         } else {
             cell
         });
-        if sort.is_some() && inner.height > 0 {
+        if sort.is_some() && header_height > 0 {
             state.hit_areas.header_cells.push(HeaderHit {
                 card,
                 column: *index,
@@ -319,7 +401,7 @@ pub fn render_card_table(frame: &mut Frame, state: &mut AppState, area: Rect, ta
         }
 
         // 열 경계 (마지막 보이는 열 오른쪽은 경계 없음, 폭 범위 = 다른 열 최소 폭을 남긴 만큼)
-        if position + 1 < shown.len() && *index < MAX_TABLE_COLUMNS && inner.height > 0 {
+        if position + 1 < shown.len() && *index < MAX_TABLE_COLUMNS && header_height > 0 {
             let others_floor = (shown_floors - plans[*index].floor).saturating_add(shown_gaps);
             state.hit_areas.column_hits.push(ColumnHit {
                 card,
@@ -337,17 +419,18 @@ pub fn render_card_table(frame: &mut Frame, state: &mut AppState, area: Rect, ta
         cursor += width + TABLE_COLUMN_GAP;
     }
 
-    // 5. 본문 행 클릭 영역 (머리글 1행 제외)
+    // 5. 본문 행 클릭 영역 (머리글 행 제외, 보조 줄은 행이 아님)
+    let body = Rect::new(inner.x, inner.y + header_height, inner.width, body_height);
     if selectable && visible > 0 {
         state.hit_areas.row_hits.push(RowHit {
             card,
-            rect: Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1),
+            rect: body,
             offset: scroll,
-            len: total,
+            len: table_total,
         });
     }
 
-    // 6. 표 그리기 (보이는 행만, 칸은 폭에 맞춰 끝 말줄임)
+    // 6. 표 그리기 (보이는 행만, 칸은 폭에 맞춰 끝 말줄임) 뒤에 이어서 보조 줄
     let mut block = block;
     if total > visible && visible > 0 {
         block = block.title_bottom(
@@ -363,10 +446,12 @@ pub fn render_card_table(frame: &mut Frame, state: &mut AppState, area: Rect, ta
             .right_aligned(),
         );
     }
+    frame.render_widget(block, area);
+    let table_part = (scroll + visible).min(table_total) - scroll.min(table_total);
     let body_rows: Vec<Row<'static>> = rows
         .into_iter()
         .skip(scroll)
-        .take(visible)
+        .take(table_part)
         .map(|row| {
             let cells: Vec<Cell<'static>> = row
                 .into_iter()
@@ -384,28 +469,51 @@ pub fn render_card_table(frame: &mut Frame, state: &mut AppState, area: Rect, ta
         .iter()
         .map(|index| Constraint::Length(widths[*index]))
         .collect();
-    let drawn = Table::new(body_rows, constraints)
-        .header(Row::new(header_cells).style(theme::STYLE_TABLE_HEADER))
-        .block(block)
-        .column_spacing(1);
-    frame.render_widget(drawn, area);
-    if total == 0 && inner.height > 1 {
+    let table_rect = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        header_height + table_part as u16,
+    );
+    if !table_rect.is_empty() {
+        let mut drawn = Table::new(body_rows, constraints).column_spacing(1);
+        if header_height > 0 {
+            drawn = drawn.header(Row::new(header_cells).style(theme::STYLE_TABLE_HEADER));
+        }
+        frame.render_widget(drawn, table_rect);
+    }
+    let aux_start = scroll.saturating_sub(table_total);
+    let aux_rows = (visible - table_part).min(aux_lines.len().saturating_sub(aux_start));
+    if aux_rows > 0 {
+        let aux_shown: Vec<Line<'static>> = aux_lines
+            .into_iter()
+            .skip(aux_start)
+            .take(aux_rows)
+            .map(|line| Line::from(clip_spans_to_width(line.spans, usize::from(inner.width))))
+            .collect();
+        let aux_rect = Rect::new(
+            inner.x,
+            body.y + table_part as u16,
+            inner.width,
+            aux_rows as u16,
+        );
+        frame.render_widget(Paragraph::new(aux_shown), aux_rect);
+    }
+    if total == 0 && header_height > 0 && body_height > 0 {
         let headline = Span::styled(
-            format!("선택 구간({})에 기록 없음", state.window.window_label()),
+            i18n::no_records_in_window(lang, state.window.window_label(lang)),
             theme::STYLE_TEXT,
         );
-        let empty_area = Rect::new(inner.x, inner.y + 1, inner.width, inner.height - 1);
-        render_empty_state(frame, empty_area, headline, "w 키로 구간 변경");
+        render_empty_state(
+            frame,
+            body,
+            headline,
+            i18n::text(lang, Msg::ChangeWindowHint),
+        );
     }
 
     // 7. 선택 행 띠 (머리글 행 제외)
-    let body = Rect::new(
-        inner.x,
-        inner.y + 1,
-        inner.width,
-        inner.height.saturating_sub(1),
-    );
-    if selectable && total > 0 && (scroll..scroll + visible).contains(&selected) {
+    if selectable && table_total > 0 && (scroll..scroll + visible).contains(&selected) {
         let focused = state.focused_card_id() == card;
         let row_y = body.y + (selected - scroll) as u16;
         paint_selection_band(frame.buffer_mut(), area, row_y, focused);
@@ -416,7 +524,7 @@ pub fn render_card_table(frame: &mut Frame, state: &mut AppState, area: Rect, ta
 }
 
 // 6. 텍스트 카드 --------------------------------------------------------------
-// 줄 단위 스크롤, 고정 머리글 줄, 선택 줄 띠와 클릭 영역, 일반 문장 줄바꿈 (반환 = 입력 줄별 시작 행)
+// 줄 단위 스크롤, 선택 줄 띠와 클릭 영역, 일반 문장 줄바꿈 (반환 = 입력 줄별 시작 행)
 pub fn render_text_card(
     frame: &mut Frame,
     state: &mut AppState,
@@ -427,26 +535,15 @@ pub fn render_text_card(
         card,
         title,
         hint,
-        header,
-        header_cells,
         lines,
     } = spec;
     let block = interactive_card(state, card, area, &title, &hint, theme::BORDER_DIM)
         .padding(Padding::horizontal(1));
-    let inner = block.inner(area);
-    let header_line = header.filter(|_| inner.height > 0);
-    let header_height = u16::from(header_line.is_some());
-    let body = Rect::new(
-        inner.x,
-        inner.y + header_height,
-        inner.width,
-        inner.height - header_height,
-    );
+    let body = block.inner(area);
     let selectable = card.kind() == CardKind::Selectable;
 
-    // 1. 줄 배치 (선택·머리글 카드는 줄 수 고정, 그 밖은 일반 문장 줄바꿈)
-    let wrap_prose = !selectable && header_line.is_none();
-    let (lines, row_starts) = layout_text_lines(lines, usize::from(body.width), wrap_prose);
+    // 1. 줄 배치 (선택 카드는 줄 수 고정, 그 밖은 일반 문장 줄바꿈)
+    let (lines, row_starts) = layout_text_lines(lines, usize::from(body.width), !selectable);
     let total = lines.len();
     let visible = body.height as usize;
 
@@ -458,7 +555,7 @@ pub fn render_text_card(
     view.selected = view.selected.min(total.saturating_sub(1));
     let (scroll, selected) = (view.scroll, view.selected);
 
-    // 3. 행 클릭 영역과 머리글 열 클릭 영역
+    // 3. 행 클릭 영역
     if selectable && visible > 0 {
         state.hit_areas.row_hits.push(RowHit {
             card,
@@ -466,19 +563,6 @@ pub fn render_text_card(
             offset: scroll,
             len: total,
         });
-    }
-    if header_line.is_some() {
-        for span in &header_cells {
-            let room = inner.width.saturating_sub(span.start);
-            let cell_width = span.width.min(room);
-            if cell_width > 0 {
-                state.hit_areas.header_cells.push(HeaderHit {
-                    card,
-                    column: span.column,
-                    rect: Rect::new(inner.x + span.start, inner.y, cell_width, 1),
-                });
-            }
-        }
     }
 
     // 4. 줄 그리기
@@ -499,12 +583,6 @@ pub fn render_text_card(
     }
     let shown: Vec<Line<'static>> = lines.into_iter().skip(scroll).take(visible).collect();
     frame.render_widget(block, area);
-    if let Some(header_line) = header_line {
-        frame.render_widget(
-            Paragraph::new(header_line).style(theme::STYLE_TABLE_HEADER),
-            Rect::new(inner.x, inner.y, inner.width, 1),
-        );
-    }
     frame.render_widget(Paragraph::new(shown), body);
 
     // 5. 선택 줄 띠
@@ -520,7 +598,7 @@ pub fn render_text_card(
 }
 
 // 7. 카드 스크롤바 ------------------------------------------------------------
-// 오른쪽 거터(테두리 바로 안쪽 열)가 ░ 트랙, 썸은 █, 그린 경우만 클릭 영역 등록
+// 오른쪽 거터(테두리 바로 안쪽 열)가 ░ 트랙, 썸은 █, 두 칸 이상 트랙만 클릭 영역 등록 (한 칸 트랙은 한 칸 썸만 그림)
 // body = 스크롤되는 본문 행 범위 (표는 머리글 행 제외)
 pub fn render_card_scrollbar(
     frame: &mut Frame,
@@ -567,14 +645,16 @@ pub fn render_card_scrollbar(
         buf[(gutter_x, y)].set_symbol("█").set_fg(thumb_color);
     }
 
-    // 4. 클릭 영역 등록 (거터와 테두리 2열)
-    state.hit_areas.scroll_hits.push(ScrollHit {
-        card,
-        track: Rect::new(gutter_x, body.y, 2, body.height),
-        total: view.total,
-        visible: view.visible,
-        scroll: view.scroll,
-    });
+    // 4. 클릭 영역 등록 (거터와 테두리 2열, 한 칸 트랙은 끌 곳이 없어 등록하지 않음)
+    if body.height >= 2 {
+        state.hit_areas.scroll_hits.push(ScrollHit {
+            card,
+            track: Rect::new(gutter_x, body.y, 2, body.height),
+            total: view.total,
+            visible: view.visible,
+            scroll: view.scroll,
+        });
+    }
 }
 
 // 8. 카드 경계 드래그 손잡이 --------------------------------------------------
@@ -651,12 +731,14 @@ pub fn render_empty_state(frame: &mut Frame, rect: Rect, headline: Span<'static>
 pub fn resolve_column_widths(plans: &[ColumnPlan], total: u16) -> Vec<u16> {
     let total = u32::from(total);
     for shown in (1..=plans.len()).rev() {
-        // 1. 보이는 열의 시작 폭과 사이 간격 합
+        // 1. 보이는 열의 시작 폭과 사이 간격 합 (열 폭 상한 적용)
         let mut widths: Vec<u16> = plans[..shown]
             .iter()
-            .map(|plan| match plan.user {
-                Some(user) => user.max(plan.floor),
-                None => plan.natural,
+            .map(|plan| {
+                plan.user
+                    .unwrap_or(plan.natural)
+                    .min(MAX_COLUMN_WIDTH)
+                    .max(plan.floor)
             })
             .collect();
         let gaps = (shown as u32 - 1) * u32::from(TABLE_COLUMN_GAP);
@@ -685,10 +767,10 @@ pub fn resolve_column_widths(plans: &[ColumnPlan], total: u16) -> Vec<u16> {
             }
         }
 
-        // 3. 남는 폭은 맨 오른쪽 Grow 열 (끌어 정한 열이면 그대로 둠)
+        // 3. 남는 폭은 맨 오른쪽 Grow·GrowKeep 열 (끌어 정한 열이면 그대로 둠)
         let absorber = (0..shown)
             .rev()
-            .find(|index| plans[*index].fit == ColumnFit::Grow)
+            .find(|index| matches!(plans[*index].fit, ColumnFit::Grow | ColumnFit::GrowKeep))
             .filter(|index| plans[*index].user.is_none());
         if let Some(index) = absorber {
             widths[index] += total.saturating_sub(used) as u16;
@@ -739,93 +821,46 @@ pub fn clip_spans_to_width(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<
     clipped
 }
 
-// 13. 정렬 헤더 줄 ------------------------------------------------------------
-// 고정 폭 열 하나 (column = 정렬 열 번호, lead = 앞 간격 칸 수, right = 오른쪽 정렬)
-pub struct HeaderCell {
-    pub column: usize,
-    pub label: &'static str,
-    pub width: usize,
-    pub lead: usize,
-    pub right: bool,
-}
-
-// 열 간격이 모두 한 칸인 표의 머리글 (specs = 머리글, 폭, 오른쪽 정렬 여부, 열 번호는 순서)
-pub fn build_uniform_sort_header(
-    specs: &[(&'static str, usize, bool)],
-    sort: SortState,
-) -> (Line<'static>, Vec<HeaderSpan>) {
-    let cells: Vec<HeaderCell> = specs
+// 12-1. 항목 묶음 맞춤 --------------------------------------------------------
+// 항목 사이 간격은 gaps 순서대로 시도해 전부 들어가는 첫 간격을 쓰고, 어느 간격으로도 안 들어가면 마지막 간격으로 앞 항목부터 담음
+// 항목은 중간에서 잘리지 않고 통째로 빠지며, 첫 항목 하나가 폭을 넘을 때만 말줄임
+pub fn pack_spans_to_width(
+    items: Vec<Vec<Span<'static>>>,
+    gaps: &[usize],
+    width: usize,
+) -> Vec<Span<'static>> {
+    let item_widths: Vec<usize> = items
         .iter()
-        .enumerate()
-        .map(|(column, (label, width, right))| HeaderCell {
-            column,
-            label,
-            width: *width,
-            lead: 1,
-            right: *right,
-        })
+        .map(|item| item.iter().map(Span::width).sum())
         .collect();
-    build_sort_header(&cells, sort)
-}
-
-// 정렬 열에 화살표를 붙인 머리글 줄과 열 클릭 구간 (글자가 폭을 넘치면 이웃 간격 한 칸을 씁음)
-pub fn build_sort_header(
-    cells: &[HeaderCell],
-    sort: SortState,
-) -> (Line<'static>, Vec<HeaderSpan>) {
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut hits: Vec<HeaderSpan> = Vec::new();
-    let mut cursor = 0usize;
-    let mut owed = 0usize;
-    for (position, cell) in cells.iter().enumerate() {
-        // 1. 글자 (정렬 열은 화살표)
-        let active = cell.column == sort.column;
-        let text = if active {
-            format!("{}{}", cell.label, sort.sort_arrow())
-        } else {
-            cell.label.to_string()
-        };
-        let text_width = Span::raw(text.as_str()).width();
-        let overflow = text_width.saturating_sub(cell.width);
-
-        // 2. 앞 간격 (앞 열이 넘친 칸과 오른쪽 정렬 넘침만큼 줄임)
-        let mut lead = if position == 0 { 0 } else { cell.lead };
-        lead = lead.saturating_sub(owed);
-        owed = 0;
-        if cell.right {
-            lead = lead.saturating_sub(overflow);
+    let all_widths: usize = item_widths.iter().sum();
+    let gap_count = items.len().saturating_sub(1);
+    let gap = gaps
+        .iter()
+        .copied()
+        .find(|gap| all_widths + gap * gap_count <= width)
+        .or(gaps.last().copied())
+        .unwrap_or(1);
+    let mut packed: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    for (index, (item, item_width)) in items.into_iter().zip(item_widths).enumerate() {
+        let separator = if index == 0 { 0 } else { gap };
+        if used + separator + item_width > width {
+            if index == 0 {
+                packed = clip_spans_to_width(item, width);
+            }
+            break;
         }
-        if lead > 0 {
-            spans.push(Span::raw(" ".repeat(lead)));
-            cursor += lead;
+        if separator > 0 {
+            packed.push(Span::raw(" ".repeat(separator)));
         }
-
-        // 3. 칸 채움과 클릭 구간
-        let gap_fill = " ".repeat(cell.width.saturating_sub(text_width));
-        let padded = if cell.right {
-            format!("{gap_fill}{text}")
-        } else {
-            format!("{text}{gap_fill}")
-        };
-        if !cell.right {
-            owed = overflow;
-        }
-        hits.push(HeaderSpan {
-            column: cell.column,
-            start: cursor as u16,
-            width: cell.width.max(text_width) as u16,
-        });
-        cursor += Span::raw(padded.as_str()).width();
-        spans.push(if active {
-            Span::styled(padded, theme::STYLE_ACCENT)
-        } else {
-            Span::raw(padded)
-        });
+        packed.extend(item);
+        used += separator + item_width;
     }
-    (Line::from(spans), hits)
+    packed
 }
 
-// 14. 텍스트 줄 배치 ----------------------------------------------------------
+// 13. 텍스트 줄 배치 ----------------------------------------------------------
 // 박스 표 줄은 끝 말줄임, 일반 줄은 wrap_prose 일 때 줄바꿈 (반환 = 줄 목록, 입력 줄별 시작 행)
 pub fn layout_text_lines(
     lines: Vec<Line<'static>>,
@@ -873,7 +908,7 @@ pub fn layout_text_lines(
     (laid_out, row_starts)
 }
 
-// 15. 스타일 유지 줄바꿈 ------------------------------------------------------
+// 14. 스타일 유지 줄바꿈 ------------------------------------------------------
 // 공백 뒤 줄나눔, 긴 낱말은 글자 단위, 이어지는 줄은 앞 공백·불릿만큼 들여쓰기
 fn wrap_styled_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
     let Line {
@@ -963,7 +998,7 @@ fn wrap_styled_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
-// 16. 열 경계 손잡이 ----------------------------------------------------------
+// 15. 열 경계 손잡이 ----------------------------------------------------------
 // 평소에는 아무것도 그리지 않고, 마우스 아래는 머리글 칸 하나·끌는 동안은 표 높이 전체 세로선
 pub fn render_column_handles(frame: &mut Frame, state: &AppState) {
     let dragging = state.column_drag.map(|drag| (drag.card, drag.column));
@@ -1148,6 +1183,76 @@ mod tests {
         let mut plans = sample_plans();
         plans[1].user = Some(12);
         assert_eq!(resolve_column_widths(&plans, 100), vec![10, 12, 6]);
+    }
+
+    #[test]
+    fn a_huge_dragged_width_is_capped_and_resolves_without_a_long_shrink_loop() {
+        let started = std::time::Instant::now();
+
+        // 상한보다 넓은 지정 폭은 상한으로, 남는 폭은 끌어 정한 열이 받지 않음
+        let mut plans = sample_plans();
+        plans[1].user = Some(u16::MAX);
+        assert_eq!(
+            resolve_column_widths(&plans, 2_000),
+            vec![10, MAX_COLUMN_WIDTH, 6]
+        );
+
+        // 전체 폭에 맞아야 하면 끌지 않은 열과 끌어 정한 열 순으로 줄여 맞춤
+        for total in [100u16, 60, 26, 9] {
+            let widths = resolve_column_widths(&plans, total);
+            let shown = widths.iter().filter(|width| **width > 0).count() as u16;
+            let used = widths.iter().sum::<u16>() + shown.saturating_sub(1);
+            assert!(used <= total, "{total}: {widths:?}");
+        }
+
+        // 모든 열이 최대 지정 폭이어도 결과가 즐시 나옴
+        let mut plans = vec![plan(10, ColumnFit::Shrink, Some(u16::MAX)); MAX_TABLE_COLUMNS];
+        plans[MAX_TABLE_COLUMNS - 1].fit = ColumnFit::Grow;
+        let widths = resolve_column_widths(&plans, 100);
+        assert!(widths.iter().sum::<u16>() + (MAX_TABLE_COLUMNS as u16 - 1) <= 100);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn keep_columns_stop_shrinking_at_their_floor_and_the_right_most_column_hides_first() {
+        let text = |natural: u16, floor: u16, fit: ColumnFit| ColumnPlan {
+            natural,
+            floor,
+            fit,
+            user: None,
+        };
+        // 이름(GrowKeep, 지킬 폭 8), 에이전트(Keep, 지킬 폭 8), 숫자 둘
+        let keep_plans = vec![
+            text(30, 8, ColumnFit::GrowKeep),
+            text(20, 8, ColumnFit::Keep),
+            plan(6, ColumnFit::Fixed, None),
+            plan(7, ColumnFit::Fixed, None),
+        ];
+
+        // 넓으면 남는 폭은 GrowKeep 이 받음 (Keep 은 받지 않음)
+        assert_eq!(resolve_column_widths(&keep_plans, 100), vec![64, 20, 6, 7]);
+
+        // 좁으면 글자 열이 지킬 폭까지 줄고 숫자 열은 그대로
+        let widths = resolve_column_widths(&keep_plans, 40);
+        assert_eq!((widths[2], widths[3]), (6, 7));
+        assert!(widths[0] >= 8 && widths[1] >= 8, "{widths:?}");
+        assert_eq!(widths.iter().sum::<u16>() + 3, 40);
+
+        // 지킬 폭 아래로는 줄지 않고 맨 오른쪽 열을 숨김
+        let widths = resolve_column_widths(&keep_plans, 30);
+        assert_eq!(widths[3], 0);
+        assert!(widths[0] >= 8 && widths[1] >= 8, "{widths:?}");
+        assert_eq!(widths[0] + widths[1] + widths[2] + 2, 30);
+
+        // 같은 폭에서 Shrink·Grow 열이면 3칸까지 줄여 네 열이 모두 보임
+        let shrink_plans = vec![
+            plan(30, ColumnFit::Grow, None),
+            plan(20, ColumnFit::Shrink, None),
+            plan(6, ColumnFit::Fixed, None),
+            plan(7, ColumnFit::Fixed, None),
+        ];
+        let widths = resolve_column_widths(&shrink_plans, 30);
+        assert!(widths.iter().all(|width| *width > 0), "{widths:?}");
     }
 
     // 긴 글자가 들어 있는 훅 표 한 행 (자연 폭이 큰 경로·가드·상세)

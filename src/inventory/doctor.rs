@@ -22,7 +22,7 @@ const WATCHED_ENV_KEYS: [&str; 7] = [
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
     "DISABLE_TELEMETRY",
 ];
-const SERVE_HINT: &str = "rust-agents-proxy serve";
+const SERVE_HINT: &str = "claude-monitor serve";
 
 // 1. 진단 실행 ----------------------------------------------------------------
 pub fn run_doctor(config: &AppConfig) -> anyhow::Result<Vec<DoctorFinding>> {
@@ -60,7 +60,7 @@ fn check_storage(config: &AppConfig, findings: &mut Vec<DoctorFinding>) {
             fix_hint: format!("{SERVE_HINT} (첫 기동 때 폴더와 DB 생성)"),
         });
     } else {
-        let probe = data_dir.join(format!(".rap-doctor-{}", std::process::id()));
+        let probe = data_dir.join(format!(".cm-doctor-{}", std::process::id()));
         let writable = fs::write(&probe, b"probe").is_ok();
         let _ = fs::remove_file(&probe);
         findings.push(DoctorFinding {
@@ -74,7 +74,8 @@ fn check_storage(config: &AppConfig, findings: &mut Vec<DoctorFinding>) {
             fix_hint: if writable {
                 String::new()
             } else {
-                "폴더 권한 확인 또는 rap.toml 의 data_dir 변경".to_string()
+                "폴더 권한 확인 또는 CM_DATA_DIR 환경 변수나 config.toml 의 data_dir 로 폴더 변경"
+                    .to_string()
             },
         });
     }
@@ -93,7 +94,7 @@ fn check_storage(config: &AppConfig, findings: &mut Vec<DoctorFinding>) {
         fix_hint: if exists {
             String::new()
         } else {
-            format!("{SERVE_HINT} 또는 rust-agents-proxy index")
+            format!("{SERVE_HINT} 또는 claude-monitor index")
         },
     });
 }
@@ -109,28 +110,28 @@ fn check_ports(config: &AppConfig, findings: &mut Vec<DoctorFinding>) {
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
         let listening = TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok();
 
-        // 선택 서버는 수신 중이어도 rap 소유 여부 확인
+        // 선택 서버는 수신 중이어도 cm 소유 여부 확인
         if listening && matches!(name, "otlp" | "gateway") {
             let status =
                 serve_status.get_or_insert_with(|| fetch_status_blocking(config.ports.admin).ok());
-            let rap_owned = status.as_ref().map(|snapshot| {
+            let cm_owned = status.as_ref().map(|snapshot| {
                 snapshot
                     .ports
                     .iter()
                     .any(|row| row.name == name && row.listening)
             });
-            let (level, message, hint) = match rap_owned {
+            let (level, message, hint) = match cm_owned {
                 Some(true) => ("ok", format!("{name} 포트 {port} 수신 중"), String::new()),
                 Some(false) => (
                     "warn",
                     format!(
                         "{name} 포트 {port} 를 다른 프로세스가 점유 (serve 는 바인드 실패로 서버 생략)"
                     ),
-                    "점유 프로세스 종료 또는 rap.toml 의 ports 변경 후 serve 재시작".to_string(),
+                    "점유 프로세스 종료 또는 ~/.config/claude-monitor/config.toml 의 ports 변경 후 serve 재시작".to_string(),
                 ),
                 None => (
                     "warn",
-                    format!("{name} 포트 {port} 수신 중이나 rap 소유 확인 불가 (serve 미응답)"),
+                    format!("{name} 포트 {port} 수신 중이나 cm 소유 확인 불가 (serve 미응답)"),
                     SERVE_HINT.to_string(),
                 ),
             };
@@ -167,7 +168,7 @@ fn check_relay_target(config: &AppConfig, findings: &mut Vec<DoctorFinding>) {
             level: "warn".to_string(),
             topic: "relay-target".to_string(),
             message: format!("relay_target 은 http:// 만 지원: {target}"),
-            fix_hint: "rap.toml 의 hooks.relay_target 을 http://127.0.0.1:<포트> 로 수정"
+            fix_hint: "~/.config/claude-monitor/config.toml 의 hooks.relay_target 을 http://127.0.0.1:<포트> 로 수정"
                 .to_string(),
         });
         return;
@@ -236,13 +237,13 @@ fn check_hook_registration(
     inventory: &Inventory,
     findings: &mut Vec<DoctorFinding>,
 ) {
-    // 1. rap 훅 등록 여부
+    // 1. cm 훅 등록 여부
     let hooks_port = config.ports.hooks;
     let prefixes = [
         format!("http://127.0.0.1:{hooks_port}/"),
         format!("http://localhost:{hooks_port}/"),
     ];
-    let rap_hooks: Vec<&HookEntry> = inventory
+    let cm_hooks: Vec<&HookEntry> = inventory
         .hooks
         .iter()
         .filter(|hook| {
@@ -252,14 +253,14 @@ fn check_hook_registration(
                     .any(|prefix| hook.target.starts_with(prefix))
         })
         .collect();
-    if rap_hooks.is_empty() {
+    if cm_hooks.is_empty() {
         let snippet = format!(
             "{{\"matcher\":\"^Bash$\",\"hooks\":[{{\"type\":\"http\",\"url\":\"http://127.0.0.1:{hooks_port}/hook/pretool-chain\",\"timeout\":10,\"onFailure\":\"block\"}}]}}"
         );
         findings.push(DoctorFinding {
             level: "warn".to_string(),
             topic: "hook-registration".to_string(),
-            message: format!("settings.json 에 rap 훅 포트 {hooks_port} 등록 없음"),
+            message: format!("settings.json 에 cm 훅 포트 {hooks_port} 등록 없음"),
             fix_hint: format!(
                 "settings.json hooks.PreToolUse 에서 ^Bash$ 항목 ({}/hook/pretool-guard) 을 다음 항목으로 교체 (onFailure block, timeout 10 유지): {snippet}",
                 config.hooks.relay_target.trim_end_matches('/')
@@ -269,13 +270,13 @@ fn check_hook_registration(
         findings.push(DoctorFinding {
             level: "ok".to_string(),
             topic: "hook-registration".to_string(),
-            message: format!("rap 훅 등록 {}건 (포트 {hooks_port})", rap_hooks.len()),
+            message: format!("cm 훅 등록 {}건 (포트 {hooks_port})", cm_hooks.len()),
             fix_hint: String::new(),
         });
     }
 
     // 2. 기존 가드 직접 등록 잔존 (병렬 실행 시 재작성이 거부에 짐)
-    let chain_registered = rap_hooks
+    let chain_registered = cm_hooks
         .iter()
         .any(|hook| hook.event == "PreToolUse" && hook.target.ends_with("/hook/pretool-chain"));
     let legacy_left = inventory.hooks.iter().any(|hook| {
@@ -326,11 +327,11 @@ fn check_hook_registration(
     });
     let add_hint = format!("settings.json allowedHttpHookUrls 에 \"{required}\" 추가");
     let restricted = inventory.http_hook_allowlist_defined;
-    if rap_hooks.is_empty() {
+    if cm_hooks.is_empty() {
         findings.push(DoctorFinding {
             level: "warn".to_string(),
             topic: "http-allowlist".to_string(),
-            message: "rap 훅 미등록 (허용 URL 필요 여부 판단 불가)".to_string(),
+            message: "cm 훅 미등록 (허용 URL 필요 여부 판단 불가)".to_string(),
             fix_hint: if allowed || !restricted {
                 String::new()
             } else {
@@ -349,7 +350,7 @@ fn check_hook_registration(
         findings.push(DoctorFinding {
             level: "ok".to_string(),
             topic: "http-allowlist".to_string(),
-            message: "allowedHttpHookUrls 에 rap 훅 URL 포함".to_string(),
+            message: "allowedHttpHookUrls 에 cm 훅 URL 포함".to_string(),
             fix_hint: String::new(),
         });
     } else if inventory.http_hook_allowlist.is_empty() {
@@ -357,16 +358,15 @@ fn check_hook_registration(
         findings.push(DoctorFinding {
             level: "fail".to_string(),
             topic: "http-allowlist".to_string(),
-            message:
-                "allowedHttpHookUrls 가 빈 배열이라 모든 HTTP 훅 차단 (rap 훅이 실행되지 않음)"
-                    .to_string(),
+            message: "allowedHttpHookUrls 가 빈 배열이라 모든 HTTP 훅 차단 (cm 훅이 실행되지 않음)"
+                .to_string(),
             fix_hint: add_hint,
         });
     } else {
         findings.push(DoctorFinding {
             level: "fail".to_string(),
             topic: "http-allowlist".to_string(),
-            message: "rap 훅이 등록됐으나 allowedHttpHookUrls 에 URL 없음 (훅이 실행되지 않음)"
+            message: "cm 훅이 등록됐으나 allowedHttpHookUrls 에 URL 없음 (훅이 실행되지 않음)"
                 .to_string(),
             fix_hint: add_hint,
         });
@@ -399,7 +399,7 @@ fn check_telemetry(
         problems.push("OTEL_LOGS_EXPORTER=otlp 필요");
     }
     if !endpoint_ok {
-        problems.push("OTEL_EXPORTER_OTLP_ENDPOINT 이 rap otlp 포트를 가리키지 않음");
+        problems.push("OTEL_EXPORTER_OTLP_ENDPOINT 이 cm otlp 포트를 가리키지 않음");
     }
     if watched
         .get("OTEL_EXPORTER_OTLP_PROTOCOL")
@@ -413,7 +413,7 @@ fn check_telemetry(
         findings.push(DoctorFinding {
             level: "ok".to_string(),
             topic: "telemetry".to_string(),
-            message: "텔레메트리 env 가 rap otlp 포트를 가리킴".to_string(),
+            message: "텔레메트리 env 가 cm otlp 포트를 가리킴".to_string(),
             fix_hint: String::new(),
         });
     } else {
@@ -448,7 +448,7 @@ fn check_gateway(
             message: format!(
                 "ANTHROPIC_BASE_URL 이 게이트웨이 포트 {gateway_port} 를 가리키나 gateway.enabled=false (API 호출 연결 실패)"
             ),
-            fix_hint: "rap.toml 의 [gateway] enabled = false 제거(기본 true) 후 serve 재시작, 또는 settings.json env 의 ANTHROPIC_BASE_URL 제거".to_string(),
+            fix_hint: "~/.config/claude-monitor/config.toml 의 [gateway] enabled = false 제거(기본 true) 후 serve 재시작, 또는 settings.json env 의 ANTHROPIC_BASE_URL 제거".to_string(),
         });
     }
 
@@ -501,7 +501,8 @@ fn check_projects_dir(config: &AppConfig, findings: &mut Vec<DoctorFinding>) {
         fix_hint: if exists {
             String::new()
         } else {
-            "rap.toml 의 claude_home 또는 indexer.projects_dir 확인".to_string()
+            "~/.config/claude-monitor/config.toml 의 claude_home 또는 indexer.projects_dir 확인"
+                .to_string()
         },
     });
 }

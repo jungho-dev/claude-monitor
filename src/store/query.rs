@@ -1109,7 +1109,7 @@ mod tests {
     fn queries_cover_seeded_rows() {
         // 1. 시드 적재
         let dir = unique_temp_dir("query-seed");
-        let store = Store::open_store(&dir.join("rap.sqlite")).expect("DB 열기");
+        let store = Store::open_store(&dir.join("cm.sqlite")).expect("DB 열기");
         let batch = IngestBatch {
             api_requests: vec![
                 api_row(
@@ -1293,7 +1293,7 @@ mod tests {
     // 통계 시드 (메인·하위 두 종류·모델 두 개)
     fn seed_stats_store(label: &str) -> (Store, std::path::PathBuf) {
         let dir = unique_temp_dir(label);
-        let store = Store::open_store(&dir.join("rap.sqlite")).expect("DB 열기");
+        let store = Store::open_store(&dir.join("cm.sqlite")).expect("DB 열기");
         let opus = "claude-opus-5-5";
         let sonnet = "claude-sonnet-5";
         let batch = IngestBatch {

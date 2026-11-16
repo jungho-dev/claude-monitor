@@ -10,7 +10,8 @@ use crate::store::query::{
     AgentStatsRow, CacheBreakRow, HookStatRow, ModelStatsRow, ToolLatencyRow,
 };
 use crate::tui::format::fit_display;
-use crate::tui::state::{DashboardSnapshot, DbState, Panel, ToastLevel, UiMessage, WindowKind};
+use crate::tui::i18n::Failure;
+use crate::tui::state::{DashboardSnapshot, DbState, Panel, UiMessage, WindowKind};
 use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveDate, SecondsFormat, Utc};
 use std::cell::Cell;
 use std::fs;
@@ -47,6 +48,15 @@ pub enum AdminAction {
     GenerateReport(NaiveDate),
 }
 
+// 관리 요청 결과 (문구는 UI 스레드가 화면 언어로 만듦, 본문은 데이터라 번역하지 않음)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminOutcome {
+    NoToken,
+    Done(String),
+    Failed(Failure),
+    Waiting,
+}
+
 // 3. panic 격리 ---------------------------------------------------------------
 // 오류는 본문, panic 은 내부 오류로 변환
 pub fn guard_panel<T>(work: impl FnOnce() -> anyhow::Result<T>) -> Panel<T> {
@@ -56,14 +66,14 @@ pub fn guard_panel<T>(work: impl FnOnce() -> anyhow::Result<T>) -> Panel<T> {
 
     match outcome {
         Ok(Ok(loaded)) => Panel::Ready(loaded),
-        Ok(Err(err)) => Panel::Failed(format!("{err:#}")),
+        Ok(Err(err)) => Panel::Failed(Failure::Error(format!("{err:#}"))),
         Err(payload) => {
             let message = payload
                 .downcast_ref::<String>()
                 .map(String::as_str)
                 .or_else(|| payload.downcast_ref::<&str>().copied())
                 .unwrap_or("");
-            Panel::Failed(format!("내부 오류: {message}"))
+            Panel::Failed(Failure::Internal(message.to_string()))
         }
     }
 }
@@ -96,7 +106,7 @@ pub fn spawn_poller(
 ) -> anyhow::Result<Sender<PollCommand>> {
     let (command_tx, command_rx) = mpsc::channel();
     thread::Builder::new()
-        .name("rap-tui-poller".to_string())
+        .name("cm-tui-poller".to_string())
         .spawn(move || run_poll_loop(config, ui_tx, command_rx))?;
     Ok(command_tx)
 }
@@ -171,7 +181,7 @@ fn collect_snapshot(
 
     // 1. 관리 포트 상태 (연결 실패는 serve 미실행)
     snapshot.status = match guard_panel(|| admin::fetch_status_blocking(config.ports.admin)) {
-        Panel::Failed(_) => Panel::Failed("serve 미실행".to_string()),
+        Panel::Failed(_) => Panel::Failed(Failure::ServeOff),
         other => other,
     };
 
@@ -185,12 +195,12 @@ fn collect_snapshot(
     if store.is_none() {
         match guard_panel(|| Store::open_read_only(&db_path)) {
             Panel::Ready(opened) => *store = Some(opened),
-            Panel::Failed(text) => {
-                snapshot.db_state = DbState::Failed(text);
+            Panel::Failed(failure) => {
+                snapshot.db_state = DbState::Failed(failure);
                 return snapshot;
             }
             Panel::Pending => {
-                snapshot.db_state = DbState::Failed("DB 열기 실패".to_string());
+                snapshot.db_state = DbState::Failed(Failure::DbOpenFailed);
                 return snapshot;
             }
         }
@@ -268,7 +278,7 @@ fn build_window_bounds(now: DateTime<Utc>, window: WindowKind) -> WindowBounds {
 // 8. 설정 적재 스레드 ---------------------------------------------------------
 pub fn spawn_settings_load(config: AppConfig, ui_tx: Sender<UiMessage>) {
     let _ = thread::Builder::new()
-        .name("rap-tui-settings".to_string())
+        .name("cm-tui-settings".to_string())
         .spawn(move || {
             let inventory = guard_panel(|| inventory::load_inventory(&config.claude_home));
             let doctor = guard_panel(|| inventory::run_doctor_checks(&config));
@@ -281,7 +291,7 @@ pub fn spawn_settings_load(config: AppConfig, ui_tx: Sender<UiMessage>) {
 pub fn load_report_body(config: &AppConfig, date: NaiveDate) -> Panel<Option<String>> {
     let db_path = config.data_dir.join(DB_FILE_NAME);
     if !db_path.is_file() {
-        return Panel::Failed("DB 없음: serve 또는 index 실행 필요".to_string());
+        return Panel::Failed(Failure::DbMissing);
     }
     guard_panel(|| {
         let store = Store::open_read_only(&db_path)?;
@@ -292,7 +302,7 @@ pub fn load_report_body(config: &AppConfig, date: NaiveDate) -> Panel<Option<Str
 // 10. 리포트 적재 스레드 ------------------------------------------------------
 pub fn spawn_report_load(config: AppConfig, ui_tx: Sender<UiMessage>, date: NaiveDate) {
     let _ = thread::Builder::new()
-        .name("rap-tui-report".to_string())
+        .name("cm-tui-report".to_string())
         .spawn(move || {
             let body = load_report_body(&config, date);
             let _ = ui_tx.send(UiMessage::Report { date, body });
@@ -303,15 +313,14 @@ pub fn spawn_report_load(config: AppConfig, ui_tx: Sender<UiMessage>, date: Naiv
 // 토큰 파일 없음 또는 빈 값은 serve 미실행으로 안내, 리포트 생성 성공 시 본문 재적재
 pub fn spawn_admin_action(config: AppConfig, ui_tx: Sender<UiMessage>, action: AdminAction) {
     let _ = thread::Builder::new()
-        .name("rap-tui-admin".to_string())
+        .name("cm-tui-admin".to_string())
         .spawn(move || {
             // 1. 요청 경로
-            let (request_path, label) = match action {
-                AdminAction::Reindex => ("/api/reindex".to_string(), "재색인"),
-                AdminAction::GenerateReport(date) => (
-                    format!("/api/report?date={}", date.format("%Y-%m-%d")),
-                    "리포트 생성",
-                ),
+            let request_path = match action {
+                AdminAction::Reindex => "/api/reindex".to_string(),
+                AdminAction::GenerateReport(date) => {
+                    format!("/api/report?date={}", date.format("%Y-%m-%d"))
+                }
             };
 
             // 2. 토큰 읽기
@@ -319,9 +328,9 @@ pub fn spawn_admin_action(config: AppConfig, ui_tx: Sender<UiMessage>, action: A
                 .map(|text| text.trim().to_string())
                 .unwrap_or_default();
             if token.is_empty() {
-                let _ = ui_tx.send(UiMessage::Toast {
-                    text: "serve 실행 후 사용 가능".to_string(),
-                    level: ToastLevel::Error,
+                let _ = ui_tx.send(UiMessage::Admin {
+                    action,
+                    outcome: AdminOutcome::NoToken,
                 });
                 return;
             }
@@ -330,19 +339,20 @@ pub fn spawn_admin_action(config: AppConfig, ui_tx: Sender<UiMessage>, action: A
             let outcome = guard_panel(|| {
                 admin::post_admin_blocking(config.ports.admin, &request_path, &token)
             });
-            let (text, level) = match outcome {
-                Panel::Ready(response) => (
-                    format!(
-                        "{label} 완료 {}",
-                        fit_display(&response, RESPONSE_PREVIEW_WIDTH).trim_end()
-                    ),
-                    ToastLevel::Success,
+            let result = match outcome {
+                Panel::Ready(response) => AdminOutcome::Done(
+                    fit_display(&response, RESPONSE_PREVIEW_WIDTH)
+                        .trim_end()
+                        .to_string(),
                 ),
-                Panel::Failed(reason) => (format!("{label} 실패: {reason}"), ToastLevel::Error),
-                Panel::Pending => (format!("{label} 대기"), ToastLevel::Info),
+                Panel::Failed(reason) => AdminOutcome::Failed(reason),
+                Panel::Pending => AdminOutcome::Waiting,
             };
-            let succeeded = level == ToastLevel::Success;
-            let _ = ui_tx.send(UiMessage::Toast { text, level });
+            let succeeded = matches!(result, AdminOutcome::Done(_));
+            let _ = ui_tx.send(UiMessage::Admin {
+                action,
+                outcome: result,
+            });
 
             // 4. 리포트 생성 후 본문 갱신
             if let (true, AdminAction::GenerateReport(date)) = (succeeded, action) {
@@ -364,13 +374,17 @@ mod tests {
         assert!(matches!(ready, Panel::Ready(7)));
 
         let failed: Panel<i32> = guard_panel(|| anyhow::bail!("연결 거부"));
-        assert!(matches!(&failed, Panel::Failed(text) if text.contains("연결 거부")));
+        assert!(
+            matches!(&failed, Panel::Failed(Failure::Error(text)) if text.contains("연결 거부"))
+        );
 
         let todo_panel: Panel<i32> = guard_panel(|| todo!("worker: someone"));
-        assert!(matches!(&todo_panel, Panel::Failed(text) if text.starts_with("내부 오류")));
+        assert!(matches!(&todo_panel, Panel::Failed(Failure::Internal(_))));
 
         let crashed: Panel<i32> = guard_panel(|| panic!("boom"));
-        assert!(matches!(&crashed, Panel::Failed(text) if text.contains("boom")));
+        assert!(
+            matches!(&crashed, Panel::Failed(Failure::Internal(text)) if text.contains("boom"))
+        );
 
         // panic 뒤 격리 표시는 해제
         assert!(!QUIET_PANIC.with(Cell::get));
@@ -466,9 +480,9 @@ mod tests {
     #[test]
     fn report_body_reports_missing_database() {
         let mut config = crate::tui::test_support::sample_config();
-        config.data_dir = std::env::temp_dir().join("rap-tui-test-no-such-dir");
+        config.data_dir = std::env::temp_dir().join("cm-tui-test-no-such-dir");
         let date = NaiveDate::from_ymd_opt(2026, 11, 14).unwrap();
         let body = load_report_body(&config, date);
-        assert!(matches!(&body, Panel::Failed(text) if text.contains("serve 또는 index")));
+        assert!(matches!(&body, Panel::Failed(Failure::DbMissing)));
     }
 }

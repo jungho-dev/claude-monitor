@@ -55,7 +55,7 @@ pub fn record_hook_event(ctx: &Arc<AppContext>, mut row: HookEventRow) {
             ..Default::default()
         };
         if let Err(err) = store_ctx.store.insert_batch(&batch) {
-            eprintln!("[rap] 훅 이벤트 기록 실패: {err:#}");
+            eprintln!("[cm] 훅 이벤트 기록 실패: {err:#}");
         }
     });
 }

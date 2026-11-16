@@ -7,17 +7,18 @@ use crate::tui::cards::CardId;
 use crate::tui::format::{
     fit_display, format_compact, format_count, format_duration_ms, pad_left_display,
 };
+use crate::tui::i18n::{self, Msg};
 use crate::tui::layout::{SplitAxis, SplitGroup};
 use crate::tui::sort::{compare_event_row, sort_rows};
 use crate::tui::state::{AppState, DbState, Panel};
 use crate::tui::theme;
 use crate::tui::views::common::{
-    TextCard, clip_spans_to_width, interactive_card, panel_message, render_db_gate,
-    render_notice_card, render_text_card,
+    CardTable, PanelNote, TableCell, TextCard, clip_spans_to_width, interactive_card,
+    pack_spans_to_width, panel_message, render_card_table, render_db_gate, render_notice_card,
+    render_text_card,
 };
 use crate::tui::views::feed::{
-    FEED_COLUMN_LABELS, build_event_context_lines, build_event_detail_lines, build_feed_header,
-    build_feed_line, derive_feed_columns, feed_agent_width, feed_event_name,
+    FEED_COLUMNS, build_event_context_lines, build_event_detail_lines, build_feed_row,
 };
 use chrono::{DateTime, NaiveDateTime, Utc};
 use ratatui::Frame;
@@ -69,7 +70,7 @@ pub fn render_overview_tab(frame: &mut Frame, area: Rect, state: &mut AppState) 
     let kpi_cut = HEADER_HEIGHT + KPI_HEIGHT;
     let (header_area, kpi_area, trend_area, feed_area) = if area.height >= FULL_LAYOUT_MIN_HEIGHT {
         let rows = state.card_layout.split_cards(
-            &mut state.hit_areas.split_hits,
+            &mut state.hit_areas,
             SplitGroup::OverviewRows,
             SplitAxis::Rows,
             area,
@@ -79,7 +80,7 @@ pub fn render_overview_tab(frame: &mut Frame, area: Rect, state: &mut AppState) 
         (rows[0], rows[1], Some(rows[2]), rows[3])
     } else {
         let rows = state.card_layout.split_cards(
-            &mut state.hit_areas.split_hits,
+            &mut state.hit_areas,
             SplitGroup::OverviewCompactRows,
             SplitAxis::Rows,
             area,
@@ -101,11 +102,12 @@ pub fn render_overview_tab(frame: &mut Frame, area: Rect, state: &mut AppState) 
 // 2. 서버 상태 카드 -----------------------------------------------------------
 // 항목 이름은 흐리게, 값은 본문색, 항목 사이는 3칸
 fn render_status_header(frame: &mut Frame, state: &mut AppState, area: Rect) {
+    let lang = state.lang;
     let block = interactive_card(
         state,
         CardId::ServerStatus,
         area,
-        "서버 상태",
+        i18n::text(lang, Msg::TitleServerStatus),
         "",
         theme::BORDER_DIM,
     );
@@ -113,50 +115,64 @@ fn render_status_header(frame: &mut Frame, state: &mut AppState, area: Rect) {
     frame.render_widget(block, area);
     let snapshot = &state.snapshot;
 
-    // 1. serve 실행 상태 줄
-    let mut status_spans: Vec<Span<'static>> = Vec::new();
+    // 1. serve 실행 상태 줄 (항목은 폭에 맞게 뒤쪽부터 통째로 덜어냄)
+    let mut status_items: Vec<Vec<Span<'static>>> = Vec::new();
     match &snapshot.status {
         Panel::Ready(status) => {
-            status_spans.push(Span::styled("● serve 실행 중", theme::STYLE_OK));
+            status_items.push(vec![Span::styled(
+                format!("● {}", i18n::text(lang, Msg::ServeRunning)),
+                theme::STYLE_OK,
+            )]);
             let pairs = [
                 (
-                    "가동",
+                    i18n::text(lang, Msg::StatusUptime),
                     format_duration_ms(
                         i64::try_from(status.uptime_secs).unwrap_or(i64::MAX) * 1_000,
                     ),
                 ),
                 ("pid", status.pid.to_string()),
-                ("버전", format!("v{}", status.version)),
                 (
-                    "OTLP 배치",
+                    i18n::text(lang, Msg::StatusVersion),
+                    format!("v{}", status.version),
+                ),
+                (
+                    i18n::text(lang, Msg::StatusOtlpBatches),
                     format_count(i64::try_from(status.counters.otlp_batches).unwrap_or(0)),
                 ),
                 (
-                    "색인 횟수",
+                    i18n::text(lang, Msg::StatusIndexRuns),
                     format_count(i64::try_from(status.counters.index_runs).unwrap_or(0)),
                 ),
                 (
-                    "훅 호출",
+                    i18n::text(lang, Msg::StatusHookCalls),
                     format_count(i64::try_from(status.counters.hook_calls).unwrap_or(0)),
                 ),
             ];
             for (label, value) in pairs {
-                status_spans.push(Span::raw("   "));
-                status_spans.push(Span::styled(format!("{label} "), theme::STYLE_DIM));
-                status_spans.push(Span::styled(value, theme::STYLE_TEXT));
+                status_items.push(vec![
+                    Span::styled(format!("{label} "), theme::STYLE_DIM),
+                    Span::styled(value, theme::STYLE_TEXT),
+                ]);
             }
         }
         Panel::Pending => {
-            status_spans.push(Span::styled("○ 상태 확인 중", theme::STYLE_DIM));
-        }
-        Panel::Failed(text) => {
-            status_spans.push(Span::styled(format!("○ {text}"), theme::STYLE_CRIT));
-            status_spans.push(Span::styled(
-                "   serve 명령으로 상주 실행",
+            status_items.push(vec![Span::styled(
+                format!("○ {}", i18n::text(lang, Msg::ServeChecking)),
                 theme::STYLE_DIM,
-            ));
+            )]);
+        }
+        Panel::Failed(failure) => {
+            status_items.push(vec![Span::styled(
+                format!("○ {}", i18n::failure_text(lang, failure)),
+                theme::STYLE_CRIT,
+            )]);
+            status_items.push(vec![Span::styled(
+                i18n::text(lang, Msg::ServeRunHint),
+                theme::STYLE_DIM,
+            )]);
         }
     }
+    let status_spans = pack_spans_to_width(status_items, &[3, 1], usize::from(inner.width));
 
     // 2. 포트 줄 (서버 응답이 없으면 설정 포트를 흐리게)
     let known = matches!(snapshot.status, Panel::Ready(_));
@@ -189,28 +205,32 @@ fn render_status_header(frame: &mut Frame, state: &mut AppState, area: Rect) {
             },
         ],
     };
-    let mut port_spans: Vec<Span<'static>> = Vec::new();
+    // 켜짐은 채운 점, 꺼짐·알 수 없음은 빈 점, 켜야 하는데 닫힘은 빈 점에 굵은 적색 (색만으로 구분하지 않음)
+    let mut port_items: Vec<Vec<Span<'static>>> = Vec::new();
     for port in &ports {
         let (dot, dot_style) = if !known || !port.enabled {
             ("○", theme::STYLE_DIM)
         } else if port.listening {
             ("●", theme::STYLE_OK)
         } else {
-            ("●", theme::STYLE_CRIT)
+            ("○", theme::STYLE_CRIT.add_modifier(Modifier::BOLD))
         };
-        port_spans.push(Span::styled(dot, dot_style));
-        port_spans.push(Span::styled(format!(" {} ", port.name), theme::STYLE_DIM));
-        port_spans.push(Span::styled(format!("{}   ", port.port), theme::STYLE_TEXT));
+        port_items.push(vec![
+            Span::styled(dot, dot_style),
+            Span::styled(format!(" {} ", port.name), theme::STYLE_DIM),
+            Span::styled(port.port.to_string(), theme::STYLE_TEXT),
+        ]);
     }
     let gateway_on = ports
         .iter()
         .find(|port| port.name == "gateway")
         .map_or(state.config.gateway.enabled, |port| port.enabled);
-    port_spans.push(if gateway_on {
-        Span::styled("게이트웨이 ON", theme::STYLE_OK)
+    port_items.push(vec![if gateway_on {
+        Span::styled(i18n::text(lang, Msg::GatewayOn), theme::STYLE_OK)
     } else {
-        Span::styled("게이트웨이 OFF", theme::STYLE_DIM)
-    });
+        Span::styled(i18n::text(lang, Msg::GatewayOff), theme::STYLE_DIM)
+    }]);
+    let port_spans = pack_spans_to_width(port_items, &[3, 1], usize::from(inner.width));
 
     frame.render_widget(
         Paragraph::new(vec![Line::from(status_spans), Line::from(port_spans)]),
@@ -222,19 +242,14 @@ fn render_status_header(frame: &mut Frame, state: &mut AppState, area: Rect) {
 // 값 줄은 숫자 굵게·라벨 흐리게, 폭이 모자라면 짧은 형태로, 보조 줄은 흐리게
 fn render_kpi_cards(frame: &mut Frame, state: &mut AppState, area: Rect) {
     // 1. 집계 준비 확인
+    let lang = state.lang;
+    let word = |msg: Msg| i18n::text(lang, msg);
     let overview = match &state.snapshot.overview {
         Panel::Ready(stats) => stats.clone(),
         other => {
-            let (message, color) = panel_message(other).unwrap_or((String::new(), theme::FG_DIM));
-            render_notice_card(
-                frame,
-                state,
-                CardId::KpiRequests,
-                area,
-                "요약 지표",
-                &message,
-                color,
-            );
+            let note = panel_message(lang, other).unwrap_or_default();
+            let title = word(Msg::TitleSummary);
+            render_notice_card(frame, state, CardId::KpiRequests, area, title, note);
             return;
         }
     };
@@ -280,29 +295,29 @@ fn render_kpi_cards(frame: &mut Frame, state: &mut AppState, area: Rect) {
         .map_or("-".to_string(), format_duration_ms);
     let cards: [(&str, &str, Vec<Line<'static>>, Vec<Line<'static>>); 6] = [
         (
-            "요청",
-            "요청",
+            word(Msg::KpiRequests),
+            word(Msg::KpiRequestsShort),
             vec![Line::from(vec![
                 Span::styled(
                     format_count(i64::try_from(overview.api_requests).unwrap_or(i64::MAX)),
                     strong,
                 ),
-                Span::styled(" 건", dim),
+                Span::styled(format!(" {}", word(Msg::KpiRequestsUnit)), dim),
             ])],
             vec![Line::from(Span::styled(
-                format!("세션 {}", overview.sessions),
+                i18n::sessions_detail(lang, overview.sessions),
                 dim,
             ))],
         ),
         (
-            "입력/출력 토큰",
-            "토큰 입/출력",
+            word(Msg::KpiTokens),
+            word(Msg::KpiTokensShort),
             vec![
                 Line::from(vec![
-                    Span::styled("입력 ", dim),
+                    Span::styled(format!("{} ", word(Msg::KpiInput)), dim),
                     Span::styled(input_text.clone(), strong),
                     Span::raw("  "),
-                    Span::styled("출력 ", dim),
+                    Span::styled(format!("{} ", word(Msg::KpiOutput)), dim),
                     Span::styled(output_text.clone(), strong),
                 ]),
                 Line::from(vec![
@@ -318,30 +333,35 @@ fn render_kpi_cards(frame: &mut Frame, state: &mut AppState, area: Rect) {
             ],
             vec![
                 Line::from(Span::styled(
-                    format!(
-                        "캐시 생성 {}",
-                        format_compact(overview.cache_creation_tokens)
+                    i18n::cache_write_detail(
+                        lang,
+                        &format_compact(overview.cache_creation_tokens),
+                        false,
                     ),
                     dim,
                 )),
                 Line::from(Span::styled(
-                    format!("생성 {}", format_compact(overview.cache_creation_tokens)),
+                    i18n::cache_write_detail(
+                        lang,
+                        &format_compact(overview.cache_creation_tokens),
+                        true,
+                    ),
                     dim,
                 )),
             ],
         ),
         (
-            "캐시 적중률",
-            "캐시 적중률",
+            word(Msg::KpiCache),
+            word(Msg::KpiCacheShort),
             vec![Line::from("")],
             vec![Line::from(Span::styled(
-                format!("읽기 {}", format_compact(overview.cache_read_tokens)),
+                i18n::cache_read_detail(lang, &format_compact(overview.cache_read_tokens)),
                 dim,
             ))],
         ),
         (
-            "모델 대기",
-            "모델 대기",
+            word(Msg::KpiWait),
+            word(Msg::KpiWaitShort),
             vec![
                 Line::from(vec![
                     Span::styled("p50 ", dim),
@@ -362,19 +382,19 @@ fn render_kpi_cards(frame: &mut Frame, state: &mut AppState, area: Rect) {
                 ]),
             ],
             vec![
-                Line::from(Span::styled("모델 응답 대기", dim)),
-                Line::from(Span::styled("응답 대기", dim)),
+                Line::from(Span::styled(word(Msg::KpiWaitDetail), dim)),
+                Line::from(Span::styled(word(Msg::KpiWaitDetailShort), dim)),
             ],
         ),
         (
-            "도구 호출/오류",
-            "도구",
+            word(Msg::KpiTools),
+            word(Msg::KpiToolsShort),
             vec![
                 Line::from(vec![
-                    Span::styled("호출 ", dim),
+                    Span::styled(format!("{} ", word(Msg::KpiCalls)), dim),
                     Span::styled(format_count(tool_calls), strong),
                     Span::raw("  "),
-                    Span::styled("오류 ", dim),
+                    Span::styled(format!("{} ", word(Msg::KpiErrors)), dim),
                     Span::styled(format_count(tool_errors), error_style),
                 ]),
                 Line::from(vec![
@@ -389,22 +409,22 @@ fn render_kpi_cards(frame: &mut Frame, state: &mut AppState, area: Rect) {
                 ]),
             ],
             vec![Line::from(Span::styled(
-                format!("오류율 {error_rate:.1}%"),
+                i18n::error_rate_detail(lang, error_rate),
                 dim,
             ))],
         ),
         (
-            "훅 거부/재작성",
-            "훅",
+            word(Msg::KpiHooks),
+            word(Msg::KpiHooksShort),
             vec![
                 Line::from(vec![
-                    Span::styled("거부 ", dim),
+                    Span::styled(format!("{} ", word(Msg::KpiDeny)), dim),
                     Span::styled(
                         format_count(hook_denials),
                         theme::STYLE_CRIT.add_modifier(Modifier::BOLD),
                     ),
                     Span::raw("  "),
-                    Span::styled("재작성 ", dim),
+                    Span::styled(format!("{} ", word(Msg::KpiRewrite)), dim),
                     Span::styled(
                         format_count(hook_rewrites),
                         theme::STYLE_OK.add_modifier(Modifier::BOLD),
@@ -434,8 +454,14 @@ fn render_kpi_cards(frame: &mut Frame, state: &mut AppState, area: Rect) {
                 ]),
             ],
             vec![
-                Line::from(Span::styled(format!("재작성 비율 {rewrite_share}"), dim)),
-                Line::from(Span::styled(format!("비율 {rewrite_share}"), dim)),
+                Line::from(Span::styled(
+                    i18n::rewrite_share_detail(lang, &rewrite_share, false),
+                    dim,
+                )),
+                Line::from(Span::styled(
+                    i18n::rewrite_share_detail(lang, &rewrite_share, true),
+                    dim,
+                )),
             ],
         ),
     ];
@@ -449,7 +475,7 @@ fn render_kpi_cards(frame: &mut Frame, state: &mut AppState, area: Rect) {
         .map(|column| column.right() - area.x)
         .collect();
     let columns = state.card_layout.split_cards(
-        &mut state.hit_areas.split_hits,
+        &mut state.hit_areas,
         SplitGroup::OverviewKpiCols,
         SplitAxis::Columns,
         area,
@@ -539,12 +565,14 @@ fn render_kpi_cards(frame: &mut Frame, state: &mut AppState, area: Rect) {
 
 // 4. 절약 카드와 분당 추이 ----------------------------------------------------
 fn render_savings_and_trends(frame: &mut Frame, state: &mut AppState, area: Rect) {
+    let lang = state.lang;
+    let word = |msg: Msg| i18n::text(lang, msg);
     // 1. 카드 분할 (절약 30%를 31~40열로, 나머지 둘은 균등)
     let width = u32::from(area.width);
     let first_cut = (width * 30 / 100).clamp(31, 40);
     let second_cut = first_cut + 1 + width.saturating_sub(first_cut + 1) / 2;
     let panes = state.card_layout.split_cards(
-        &mut state.hit_areas.split_hits,
+        &mut state.hit_areas,
         SplitGroup::OverviewTrendCols,
         SplitAxis::Columns,
         area,
@@ -569,7 +597,7 @@ fn render_savings_and_trends(frame: &mut Frame, state: &mut AppState, area: Rect
                 state,
                 CardId::SavingsEffect,
                 panes[0],
-                "훅 재작성 효과",
+                word(Msg::TitleSavings),
                 "",
                 theme::BORDER_DIM,
             )
@@ -579,7 +607,7 @@ fn render_savings_and_trends(frame: &mut Frame, state: &mut AppState, area: Rect
             let lines = vec![
                 Line::from(vec![
                     Span::styled(
-                        fit_display("오늘 절약 시간", SAVINGS_LABEL_WIDTH),
+                        fit_display(word(Msg::SavingsSaved), SAVINGS_LABEL_WIDTH),
                         theme::STYLE_DIM,
                     ),
                     Span::styled(
@@ -592,7 +620,7 @@ fn render_savings_and_trends(frame: &mut Frame, state: &mut AppState, area: Rect
                 ]),
                 Line::from(vec![
                     Span::styled(
-                        fit_display("거부 손실 추정", SAVINGS_LABEL_WIDTH),
+                        fit_display(word(Msg::SavingsLoss), SAVINGS_LABEL_WIDTH),
                         theme::STYLE_DIM,
                     ),
                     Span::styled(
@@ -605,7 +633,7 @@ fn render_savings_and_trends(frame: &mut Frame, state: &mut AppState, area: Rect
                 ]),
                 Line::from(vec![
                     Span::styled(
-                        fit_display("순효과", SAVINGS_LABEL_WIDTH),
+                        fit_display(word(Msg::SavingsNet), SAVINGS_LABEL_WIDTH),
                         theme::STYLE_TEXT,
                     ),
                     Span::styled(
@@ -624,41 +652,57 @@ fn render_savings_and_trends(frame: &mut Frame, state: &mut AppState, area: Rect
             frame.render_widget(Paragraph::new(lines), inner);
         }
         None => {
-            let (message, color) =
-                panel_message(&state.snapshot.today).unwrap_or((String::new(), theme::FG_DIM));
+            let note = panel_message(lang, &state.snapshot.today).unwrap_or_default();
             render_notice_card(
                 frame,
                 state,
                 CardId::SavingsEffect,
                 panes[0],
-                "훅 재작성 효과",
-                &message,
-                color,
+                word(Msg::TitleSavings),
+                note,
             );
         }
     }
 
-    // 3. 분당 추이가 준비되지 않으면 두 카드를 하나의 안내 카드로 (사이 경계는 제거)
-    if let Some((message, color)) = panel_message(&state.snapshot.minutes) {
-        state
-            .hit_areas
-            .split_hits
-            .retain(|hit| !(hit.group == SplitGroup::OverviewTrendCols && hit.index == 1));
-        let trend_area = Rect::new(
-            panes[1].x,
-            panes[1].y,
-            panes[2].right() - panes[1].x,
-            panes[1].height,
-        );
-        render_notice_card(
-            frame,
-            state,
-            CardId::TrendRequests,
-            trend_area,
-            "분당 추이",
-            &message,
-            color,
-        );
+    // 3. 분당 추이가 준비되지 않으면 두 카드가 이웃한 칸일 때 하나의 안내 카드로 (사이 경계는 제거),
+    // 순서를 바꿔 떨어져 있으면 카드마다 안내 카드
+    if let Some(note) = panel_message(lang, &state.snapshot.minutes) {
+        let request_slot = state.card_layout.slot_of(SplitGroup::OverviewTrendCols, 1);
+        let token_slot = state.card_layout.slot_of(SplitGroup::OverviewTrendCols, 2);
+        match (request_slot, token_slot) {
+            (Some(request_slot), Some(token_slot)) if request_slot.abs_diff(token_slot) == 1 => {
+                let joint = request_slot.min(token_slot);
+                state.hit_areas.split_hits.retain(|hit| {
+                    !(hit.group == SplitGroup::OverviewTrendCols && hit.index == joint)
+                });
+                render_notice_card(
+                    frame,
+                    state,
+                    CardId::TrendRequests,
+                    panes[1].union(panes[2]),
+                    word(Msg::TitleTrend),
+                    note,
+                );
+            }
+            _ => {
+                render_notice_card(
+                    frame,
+                    state,
+                    CardId::TrendRequests,
+                    panes[1],
+                    word(Msg::TitleRequestsPerMin),
+                    note.clone(),
+                );
+                render_notice_card(
+                    frame,
+                    state,
+                    CardId::TrendTokens,
+                    panes[2],
+                    word(Msg::TitleTokensPerMin),
+                    note,
+                );
+            }
+        }
         return;
     }
 
@@ -674,14 +718,14 @@ fn render_savings_and_trends(frame: &mut Frame, state: &mut AppState, area: Rect
     let trends: [(CardId, &str, &Vec<u64>, Color, Rect); 2] = [
         (
             CardId::TrendRequests,
-            "분당 요청",
+            word(Msg::TitleRequestsPerMin),
             &request_series,
             theme::CHART_REQUESTS,
             panes[1],
         ),
         (
             CardId::TrendTokens,
-            "분당 출력 토큰",
+            word(Msg::TitleTokensPerMin),
             &token_series,
             theme::CHART_TOKENS,
             panes[2],
@@ -693,16 +737,26 @@ fn render_savings_and_trends(frame: &mut Frame, state: &mut AppState, area: Rect
             state,
             card,
             rect,
-            &format!("{title} (최대 {})", format_compact(peak as i64)),
+            &i18n::trend_title(lang, title, &format_compact(peak as i64)),
             "",
             theme::BORDER_DIM,
         );
         if rect.width >= 24 {
             block = block
                 .title_bottom(
-                    Line::from(Span::styled(" 60분 전 ", theme::STYLE_DIM)).left_aligned(),
+                    Line::from(Span::styled(
+                        format!(" {} ", word(Msg::TrendMinutesAgo)),
+                        theme::STYLE_DIM,
+                    ))
+                    .left_aligned(),
                 )
-                .title_bottom(Line::from(Span::styled(" 지금 ", theme::STYLE_DIM)).right_aligned());
+                .title_bottom(
+                    Line::from(Span::styled(
+                        format!(" {} ", word(Msg::TrendNow)),
+                        theme::STYLE_DIM,
+                    ))
+                    .right_aligned(),
+                );
         }
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
@@ -766,19 +820,13 @@ fn build_minute_series(
 // 피드는 고정 머리글과 열 격자, 상세는 선택 이벤트 항목과 같은 종류 맥락
 fn render_feed_row(frame: &mut Frame, state: &mut AppState, area: Rect) {
     // 1. 이벤트 준비 확인
+    let lang = state.lang;
     let events = match &state.snapshot.events {
         Panel::Ready(rows) => rows.clone(),
         other => {
-            let (message, color) = panel_message(other).unwrap_or((String::new(), theme::FG_DIM));
-            render_notice_card(
-                frame,
-                state,
-                CardId::EventFeed,
-                area,
-                "실시간 이벤트",
-                &message,
-                color,
-            );
+            let note = panel_message(lang, other).unwrap_or_default();
+            let title = i18n::text(lang, Msg::TitleLiveEvents);
+            render_notice_card(frame, state, CardId::EventFeed, area, title, note);
             return;
         }
     };
@@ -786,14 +834,18 @@ fn render_feed_row(frame: &mut Frame, state: &mut AppState, area: Rect) {
         let feed_view = &mut state.card_views[CardId::EventFeed as usize];
         feed_view.total = 0;
         feed_view.visible = 0;
+        let note = PanelNote {
+            message: i18n::text(lang, Msg::NoEvents).to_string(),
+            color: theme::FG_DIM,
+            hint: Some(Msg::NoEventsHint),
+        };
         render_notice_card(
             frame,
             state,
             CardId::EventFeed,
             area,
-            "실시간 이벤트 (0건)",
-            "이벤트 없음",
-            theme::FG_DIM,
+            &i18n::live_events_title(lang, 0),
+            note,
         );
         return;
     }
@@ -807,7 +859,7 @@ fn render_feed_row(frame: &mut Frame, state: &mut AppState, area: Rect) {
         total_width - detail_width - 1
     };
     let columns = state.card_layout.split_cards(
-        &mut state.hit_areas.split_hits,
+        &mut state.hit_areas,
         SplitGroup::OverviewFeedCols,
         SplitAxis::Columns,
         area,
@@ -815,27 +867,14 @@ fn render_feed_row(frame: &mut Frame, state: &mut AppState, area: Rect) {
         &[24, 20],
     );
 
-    // 3. 피드 줄 (테두리 2열과 안쪽 여백 2열 제외)
-    let line_width = columns[0].width.saturating_sub(4) as usize;
-    let longest_name = events
-        .iter()
-        .map(|event| Span::raw(feed_event_name(event)).width())
-        .max()
-        .unwrap_or(0);
-    let longest_agent = events.iter().map(feed_agent_width).max().unwrap_or(0);
-    let feed_columns = derive_feed_columns(line_width, longest_name, longest_agent);
+    // 3. 피드 표 (정렬한 행, 열 폭은 다른 표 카드와 같은 규칙: 자연 폭, 끌어 정한 폭, 머리글 정렬)
     let feed_sort = state.card_sorts[CardId::EventFeed as usize];
     let mut sorted = events.clone();
     sort_rows(&mut sorted, feed_sort, compare_event_row);
-    let feed_lines: Vec<Line<'static>> = sorted
+    let feed_rows: Vec<Vec<TableCell>> = sorted
         .iter()
-        .map(|event| build_feed_line(event, &feed_columns))
+        .map(|event| build_feed_row(lang, event))
         .collect();
-    let (feed_header, feed_header_cells) = build_feed_header(&feed_columns, feed_sort);
-    let sort_label = FEED_COLUMN_LABELS
-        .get(feed_sort.column)
-        .copied()
-        .unwrap_or("");
     let (api_count, tool_count, hook_count) =
         events
             .iter()
@@ -845,20 +884,17 @@ fn render_feed_row(frame: &mut Frame, state: &mut AppState, area: Rect) {
                 LiveEvent::Hook(_) => (counts.0, counts.1, counts.2 + 1),
                 LiveEvent::Notice { .. } => counts,
             });
-    render_text_card(
+    render_card_table(
         frame,
         state,
         columns[0],
-        TextCard {
+        CardTable {
             card: CardId::EventFeed,
-            title: format!("실시간 이벤트 ({}건)", events.len()),
-            hint: format!(
-                "API {api_count} · 도구 {tool_count} · 훅 {hook_count} · 정렬 {sort_label}{}",
-                feed_sort.sort_arrow()
-            ),
-            header: Some(feed_header),
-            header_cells: feed_header_cells,
-            lines: feed_lines,
+            title: i18n::live_events_title(lang, events.len()),
+            hint: i18n::feed_hint(lang, api_count, tool_count, hook_count),
+            columns: FEED_COLUMNS.to_vec(),
+            rows: feed_rows,
+            aux_lines: Vec::new(),
         },
     );
 
@@ -867,11 +903,12 @@ fn render_feed_row(frame: &mut Frame, state: &mut AppState, area: Rect) {
         .selected
         .min(sorted.len() - 1);
     let detail_inner_width = columns[1].width.saturating_sub(4) as usize;
-    let mut detail_lines = build_event_detail_lines(&sorted[selected], detail_inner_width);
+    let mut detail_lines = build_event_detail_lines(lang, &sorted[selected], detail_inner_width);
     let spare_rows =
         usize::from(columns[1].height.saturating_sub(2)).saturating_sub(detail_lines.len());
     if spare_rows >= 4 {
         detail_lines.extend(build_event_context_lines(
+            lang,
             &sorted[selected],
             &events,
             detail_inner_width,
@@ -884,10 +921,8 @@ fn render_feed_row(frame: &mut Frame, state: &mut AppState, area: Rect) {
         columns[1],
         TextCard {
             card: CardId::EventDetail,
-            title: "이벤트 상세".to_string(),
+            title: i18n::text(lang, Msg::TitleEventDetail).to_string(),
             hint: String::new(),
-            header: None,
-            header_cells: Vec::new(),
             lines: detail_lines,
         },
     );

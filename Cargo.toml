@@ -1,16 +1,36 @@
 # Cargo.toml
 
 [package]
-name = "rust-agents-proxy"
+name = "claude-monitor"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 license = "Apache-2.0"
 description = "Always-on localhost hub for Claude Code: OTLP intake, transcript index, hook speedups, API gateway, and a live TUI."
 readme = "README.md"
+repository = "https://github.com/jungho-dev/claude-monitor"
+documentation = "https://docs.rs/claude-monitor"
+keywords = ["claude-code", "otlp", "hooks", "gateway", "tui"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = [
+  "/.cargo",
+  "/.cbmignore",
+  "/.claude",
+  "/.cmd",
+  "/.docs",
+  "/.github",
+  "/.vscode",
+  "/.gitignore",
+  "/.gitignore-private",
+  "/.gitignore-public",
+  "/CLAUDE.md",
+  "/assets/icon/*.webp",
+  "/assets/icon/build_icon.py",
+  "/vendor",
+]
 
 [[bin]]
-name = "rust-agents-proxy"
+name = "claude-monitor"
 path = "src/main.rs"
 
 [dependencies]

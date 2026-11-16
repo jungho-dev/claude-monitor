@@ -368,7 +368,7 @@ mod tests {
     fn store_recovers_after_poisoned_lock() {
         // 1. 잠금 보유 중 panic 으로 오염
         let dir = std::env::temp_dir().join(format!(
-            "rap-store-poison-{}-{}",
+            "cm-store-poison-{}-{}",
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));

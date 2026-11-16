@@ -1,5 +1,5 @@
 //! tui/theme.rs
-//! 다크 테마 팔레트: 서피스 단계, 텍스트, 상태·이벤트 종류·스크롤바·분할선 색.
+//! 다크 테마 팔레트: 서피스 단계, 텍스트, 상태·최상단 고정·이벤트 종류·스크롤바·분할선 색.
 //! 외곽선 단계: 평소 240 둥근선, 호버 67 둥근선, 포커스 39 굵은선·반전 제목, 경보 203 최우선.
 
 use ratatui::style::{Color, Modifier, Style};
@@ -40,9 +40,12 @@ pub const COLOR_WARN: Color = Color::Indexed(220);
 pub const COLOR_CRIT: Color = Color::Indexed(203);
 // 오류 알림 채움 바탕 (흰 글자와 함께)
 pub const COLOR_CRIT_BG: Color = Color::Indexed(160);
+// 창 최상단 고정 상태 전용 채움 바탕 (흰 글자와 함께, 경고·오류·포커스·선택 어느 색과도 겹치지 않음)
+pub const PIN_BG: Color = Color::Indexed(97);
 
 // 4. 이벤트 종류·차트 색 ------------------------------------------------------
-pub const COLOR_API: Color = Color::Indexed(81);
+// API 는 강조색(81)과 구분되는 자기 색
+pub const COLOR_API: Color = Color::Indexed(111);
 pub const COLOR_TOOL: Color = Color::Indexed(177);
 pub const COLOR_HOOK: Color = Color::Indexed(215);
 pub const COLOR_NOTICE: Color = Color::Indexed(250);
@@ -72,6 +75,11 @@ pub const STYLE_ACCENT: Style = Style::new().fg(FG_ACCENT).add_modifier(Modifier
 pub const STYLE_OK: Style = Style::new().fg(COLOR_OK);
 pub const STYLE_WARN: Style = Style::new().fg(COLOR_WARN);
 pub const STYLE_CRIT: Style = Style::new().fg(COLOR_CRIT);
+// 최상단 고정 배지·칩 (색 외에 낱말 Pinned·Pin ON 을 함께 표시)
+pub const STYLE_PINNED: Style = Style::new()
+    .fg(FG_STRONG)
+    .bg(PIN_BG)
+    .add_modifier(Modifier::BOLD);
 pub const STYLE_TABLE_HEADER: Style = Style::new().fg(FG_DIM).add_modifier(Modifier::BOLD);
 pub const STYLE_SELECTED_ROW: Style = Style::new().bg(BG_SELECTED).fg(FG_STRONG);
 // 포커스가 아닌 카드의 선택 행 (바탕만 칠해 종류별 글자색 유지)
@@ -85,17 +93,6 @@ pub fn outcome_style(outcome: &str) -> Style {
         "rewrite" => STYLE_OK.add_modifier(Modifier::BOLD),
         "error" => STYLE_WARN,
         _ => STYLE_DIM,
-    }
-}
-
-// 판정 문자열 -> 한글 라벨
-pub fn outcome_label(outcome: &str) -> &'static str {
-    match outcome {
-        "allow" => "허용",
-        "deny" => "거부",
-        "rewrite" => "재작성",
-        "error" => "오류",
-        _ => "-",
     }
 }
 
@@ -119,13 +116,46 @@ mod tests {
     }
 
     #[test]
-    fn outcome_label_translates_known_outcomes_to_korean() {
-        assert_eq!(outcome_label("allow"), "허용");
-        assert_eq!(outcome_label("deny"), "거부");
-        assert_eq!(outcome_label("rewrite"), "재작성");
-        assert_eq!(outcome_label("error"), "오류");
-        assert_eq!(outcome_label(""), "-");
-        assert_eq!(outcome_label("unknown"), "-");
+    fn the_pinned_fill_is_its_own_color_and_keeps_the_strong_text_readable() {
+        for reserved in [
+            COLOR_WARN,
+            COLOR_OK,
+            COLOR_CRIT,
+            COLOR_CRIT_BG,
+            BORDER_FOCUS,
+            BORDER_HOVER,
+            FG_ACCENT,
+            BG_SELECTED,
+            BG_TONAL,
+            BG_BAR,
+            BG_PANEL,
+            BG_BASE,
+        ] {
+            assert_ne!(PIN_BG, reserved);
+        }
+        assert_eq!(STYLE_PINNED.bg, Some(PIN_BG));
+        assert_eq!(STYLE_PINNED.fg, Some(FG_STRONG));
+        assert!(STYLE_PINNED.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn event_kind_and_chart_colors_are_unique_and_never_reuse_accent_or_focus() {
+        let kinds = [
+            COLOR_API,
+            COLOR_TOOL,
+            COLOR_HOOK,
+            COLOR_NOTICE,
+            CHART_REQUESTS,
+            CHART_TOKENS,
+        ];
+        for (index, color) in kinds.iter().enumerate() {
+            assert_ne!(*color, FG_ACCENT);
+            assert_ne!(*color, BORDER_FOCUS);
+            assert_ne!(*color, COLOR_OK);
+            assert_ne!(*color, COLOR_WARN);
+            assert_ne!(*color, COLOR_CRIT);
+            assert!(!kinds[..index].contains(color), "{color:?}");
+        }
     }
 
     #[test]

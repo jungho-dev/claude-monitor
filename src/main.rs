@@ -1,19 +1,19 @@
 //! main.rs
-//! rust-agents-proxy 명령 진입점 (serve, tui, index, report, hook, status, doctor).
+//! claude-monitor 명령 진입점 (serve, tui, index, report, hook, status, doctor).
 
 use chrono::{Duration, Local, NaiveDate};
 use clap::{Parser, Subcommand};
-use rust_agents_proxy::core::config::{AppConfig, DB_FILE_NAME};
-use rust_agents_proxy::store::Store;
-use rust_agents_proxy::{hooks, inventory, net, report, serve, transcript, tui};
+use claude_monitor::core::config::{AppConfig, DB_FILE_NAME};
+use claude_monitor::store::Store;
+use claude_monitor::{hooks, inventory, net, report, serve, transcript, tui};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 // 1. 명령줄 -------------------------------------------------------------------
 #[derive(Debug, Parser)]
-#[command(name = "rust-agents-proxy", version, about = "Claude Code 로컬 허브")]
+#[command(name = "claude-monitor", version, about = "Claude Code 로컬 허브")]
 struct CliArgs {
-    /// rap.toml 경로 (기본: 데이터 폴더)
+    /// 설정 파일 경로 (기본: ~/.config/claude-monitor/config.toml, CM_CONFIG 로도 지정)
     #[arg(long, global = true)]
     config: Option<PathBuf>,
     #[command(subcommand)]

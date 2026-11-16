@@ -3,13 +3,13 @@
 ## Source Tree
 
 ```markdown
-rust-agents-proxy/
+claude-monitor/
 ├── src/
-│   ├── main.rs : binary entry, clap commands (serve, tui, index, report, hook, status, doctor), no-command launch (detached serve, then dashboard), exit codes
+│   ├── main.rs : binary entry, clap commands (serve, start, tui, index, report, hook, status, doctor), no-command launch (detached serve, then dashboard), exit codes
 │   ├── lib.rs : library root, public modules
 │   ├── core/
 │   │   ├── mod.rs : core module gateway
-│   │   ├── config.rs : rap.toml loader, port, gateway, hook, indexer, and report settings, data directory and Claude home resolution
+│   │   ├── config.rs : config.toml loader (~/.config/claude-monitor/config.toml), port, gateway, hook, indexer, and report settings, data directory (default ~/.config/claude-monitor, the folder of config.toml; CM_DATA_DIR overrides) and Claude home resolution
 │   │   ├── context.rs : AppContext shared by every port and task, live counters, live-event broadcast channel
 │   │   └── model.rs : row types, DataSource, HookOutcome, LiveEvent, status snapshot, deny round-trip constant
 │   ├── serve/
@@ -65,45 +65,44 @@ rust-agents-proxy/
 │   │   ├── mod.rs : standby monitor thread, sleep postponement (direct Win32 declaration), gap ledger, hint text
 │   │   └── tests.rs : gap detection, hold and release, hint selection, hook answer tests
 │   └── tui/
-│       ├── mod.rs : terminal setup and restore, redraw-on-change event loop, command dispatch
-│       ├── state.rs : tabs, card focus, layout and scroll, window, panel data, key handling, selection kept across snapshots
+│       ├── mod.rs : terminal setup and restore, redraw-on-change event loop (calls AppState::tick and shortens the wait to the press deadline), state load at start, SaveState queues a write on the state writer thread owned by the terminal guard, command dispatch, resize cancels a card move
+│       ├── state.rs : tabs, card focus, layout and scroll, window, display language, press and move state, panel data, key handling (Shift+arrow, l, L), selection kept across snapshots
 │       ├── cards.rs : card ids and kinds, per-card scroll and selection, click actions, mouse hit areas, scrollbar thumb math
-│       ├── layout.rs : card boundary drag resize, ratios per group, card area split, drag areas
-│       ├── mouse.rs : hover, click, boundary drag, wheel, scrollbar track click and thumb drag
+│       ├── layout.rs : card boundary drag resize, ratios and card order per group, card area split, drag areas
+│       ├── card_move.rs : card move state machine (impl AppState): 400 ms title press, preview, commit, cancel, Shift+arrow one-slot move; time comes in as an Instant argument (AppState::tick), so tests inject the clock
+│       ├── layout_store.rs : state file tui.toml in the home config folder: load at start, state text and save request build, atomic write (temporary file, then rename; the whole symbolic link chain, 16 links at most, is resolved first so every link survives), start-up removal of stale temporary files only (older than 10 minutes, never the running process's), skip invalid entries with one notice, copy an unreadable file to `.bak`
+│       ├── state_writer.rs : state writer thread: channel of save requests coalesced to the latest per path, flush and join on drop (waits at most 5 seconds, then reports it so the terminal guard warns on stderr), failures sent back as UiMessage::StateSaveFailed
+│       ├── i18n.rs : message catalog with English and Korean text per entry (default English), format functions for texts with values, help rows
+│       ├── mouse.rs : hover, click, title press, boundary drag, card move preview and commit, wheel, scrollbar track click and thumb drag; a move without a button, a new press, a tab switch, or a resize ends every drag like a release, and a moved drag saves
 │       ├── poller.rs : background collection (heavy panels every 10 s), settings, report, and admin-request threads
-│       ├── format.rs : number, time, and token formats, display-width fitting
+│       ├── format.rs : number, time, and token formats, display-width fitting, card title segment fitting
 │       ├── sort.rs : sortable table column state
-│       ├── theme.rs : dark palette
+│       ├── theme.rs : dark palette (the pinned state has its own fill, apart from warn; every event kind, including API, has its own indexed color apart from the accent)
 │       ├── win_ctrl.rs : always-on-top window and classic console font apply and restore (direct Win32 declarations)
 │       ├── test_support.rs : synthetic configuration and snapshots
 │       └── views/
 │           ├── mod.rs : frame assembly, app bar (badge only), tab bar (seven tabs, no gaps then numbered compact labels when narrow), footer, help overlay
-│           ├── common.rs : card frame, panel states, empty database state, scroll table and text card, card scrollbar, boundary handles
-│           ├── overview.rs : status header, KPI cards, saved time, per-minute trend, live feed
-│           ├── tables.rs : tools, hooks, and models tabs
-│           ├── settings.rs : inventory and doctor results
-│           └── report.rs : daily report viewer
+│           ├── common.rs : card frame, panel states, empty database state, scroll table card (column fit rules, aux line region, header drop on one-row cards) and text card, card scrollbar (one-cell thumb on a one-row body), boundary handles
+│           ├── overview.rs : status header, KPI cards, saved time, per-minute trend
+│           ├── feed.rs : live event feed table columns and row cells, detail and same-kind context lines
+│           ├── tables.rs : tools and hooks tabs
+│           ├── models.rs : models and agents tabs, stats tables, detail card, cache-break candidates
+│           ├── settings.rs : hook, MCP, agent, and doctor table cards with their auxiliary lines
+│           ├── report.rs : daily report viewer
+│           └── render_matrix.rs : buffer render checks (test only): every tab in both languages at 60x16, 100x30, and 130x40, exact cells, hit areas, source rule scans
 ├── tests/
 │   └── fixtures/ : fixture Claude homes (inventory), transcripts, and OTLP payloads read by unit tests
 ├── assets/icon/
-│   ├── build_icon.py : renders the two SVG sources into the multi-size ico with ImageMagick
-│   ├── rust-agents-proxy.svg : large icon source
-│   ├── rust-agents-proxy-small.svg : small icon source for 32 px and below
-│   ├── rust-agents-proxy.ico : generated icon
-│   └── rust-agents-proxy.rc : icon, version info, and manifest resources
-├── .cargo/config.toml : project vendor source, gnullvm clang, ar, windres, and linker paths
-├── .cmd/
-│   ├── build.cmd : zero-downtime release build, Authenticode signing
-│   ├── install-task.ps1 : Task Scheduler registration of serve
-│   └── sign.ps1 : exe signing (organization or local self-signed certificate)
-├── build.rs : windres resources, libunwind.dll copy for gnullvm
+│   ├── claude-monitor.webp, claude-monitor-small.webp : lossless WebP masters (a 1024 px tile for 40 px and larger, a 256 px hexagon crop for 32 px and smaller)
+│   ├── build_icon.py : renders the two WebP masters into the multi-size ico with ImageMagick
+│   └── claude-monitor.ico : generated icon, embedded by build.rs
+├── docs/
+│   └── config.example.toml : full configuration example with defaults
+├── build.rs : writes the resource script (icon, English VERSIONINFO, asInvoker manifest) into OUT_DIR, compiles it with the windres for the target architecture and drops an object with the wrong COFF machine type (optional: only a warning when no tool works), libunwind.dll copy for gnullvm
 ├── Cargo.toml : package metadata, dependencies, release profile (panic = "unwind")
-├── rap.example.toml : full configuration example with defaults
-├── vendor/ : gitignored vendored crates, regenerated with cargo vendor
-├── README.md : usage guide
-├── README-KO.md : usage guide in Korean
-├── ARCHITECTURE-KO.md : this file in Korean
-├── CLAUDE.md : project rules for agents
+├── README.md : install and usage guide
+├── README-ko.md : usage guide in Korean
+├── ARCHITECTURE-ko.md : this file in Korean
 └── LICENSE.md : Apache-2.0
 ```
 
@@ -113,22 +112,23 @@ rust-agents-proxy/
 
 1. **Processes**
     - `serve` is the one resident process; it owns the writable database and every port.
-    - `tui`, `status`, `doctor`, `index`, `report`, and `hook` are short-lived processes of the same exe.
+    - `tui`, `start`, `status`, `doctor`, `index`, `report`, and `hook` are short-lived processes of the same exe; `start` runs only the launcher step below and exits without the dashboard.
     - Launcher: with no command the exe probes the admin port; when it does not answer, it starts `serve` detached (no console, breaking away from the parent job when allowed, stderr to `serve.log`), waits up to 8 seconds for the port, and then runs the dashboard in the launcher process.
     - `tui` opens the database read-only and calls the admin API only for server status, reindex, and report generation.
+    - The one file `tui` writes is its own state file `tui.toml` in `~/.config/claude-monitor/`, next to `config.toml` even when `data_dir` moves (display language, card orders, split ratios, column widths); see Dashboard State.
     - `index` and `report` open their own writable connection; SQLite WAL mode with a 5-second busy timeout lets them run beside `serve`.
 2. **Runtimes inside serve**
-    - The main thread blocks on a multi-thread tokio runtime named `rap-main`.
+    - The main thread blocks on a multi-thread tokio runtime named `cm-main`.
     - It runs one task each for admin, OTLP, hooks (when `hooks.enabled`), the transcript indexer (when `indexer.enabled`), and the report scheduler (when `report.enabled`).
-    - The gateway runs on a dedicated OS thread, `rap-gateway`, with its own multi-thread runtime of 2 workers; the gateway is on by default and is skipped only when `gateway.enabled = false`.
+    - The gateway runs on a dedicated OS thread, `cm-gateway`, with its own multi-thread runtime of 2 workers; the gateway is on by default and is skipped only when `gateway.enabled = false`.
     - The split keeps long streaming relays apart from hook and indexing load.
-    - With `power.enabled` (the default), a plain OS thread `rap-power` ticks every 5 seconds; `SetThreadExecutionState` binds the sleep postponement to the calling thread, so this one thread both sets and clears it.
+    - With `power.enabled` (the default), a plain OS thread `cm-power` ticks every 5 seconds; `SetThreadExecutionState` binds the sleep postponement to the calling thread, so this one thread both sets and clears it.
 3. **Failure isolation**
     - The release profile sets `panic = "unwind"` so a panic stays inside one task.
     - Every accepted connection is its own tokio task, so a handler panic ends that connection only.
     - Start order: the gateway upstream is validated, the ports are bound in the order admin, OTLP, hooks, gateway and kept until the servers take them over, and only then the store is opened and `admin.token` is written, so a second `serve` that loses the admin bind never overwrites the token.
     - Required: admin, and hooks when `hooks.enabled`; a bind failure or an end or panic of either stops `serve` with a non-zero exit code.
-    - A failure to create the `rap-power` thread is printed and `serve` continues without the standby monitor.
+    - A failure to create the `cm-power` thread is printed and `serve` continues without the standby monitor.
     - Optional: OTLP and gateway; a bind failure skips that server with a warning, and an end of OTLP, the indexer, the report scheduler, or the gateway thread is logged and sent as a warn `Notice` live event while `serve` keeps running.
     - With `hooks.enabled = false` the hooks port is not taken.
     - `Ctrl+C` leaves the wait loop and aborts every task.
@@ -171,7 +171,7 @@ flowchart LR
     GW["Gateway 47332<br/>on by default"]
     GD["Guard 47321<br/>external"]
     API["Anthropic API<br/>external"]
-    DB[("rap.sqlite<br/>WAL")]
+    DB[("cm.sqlite<br/>WAL")]
     OUT["Admin 47330, dashboard, daily report"]
     CC --> IDX
     CC --> OT
@@ -206,12 +206,12 @@ flowchart LR
     - A failure hint covers gaps overlapping the tool run (`duration_ms` plus one tick) whatever `active` says; a prompt hint, and the conditional hint for a failure without `duration_ms`, cover `active` gaps ended within `power.hint_window_secs`, once per session and gap start time.
     - When the monitor has not ticked for longer than the threshold, the hint route treats the time since the last tick as a pending gap with the last tick's `active`; it shares the start time of the gap recorded later, so one standby never produces two prompt hints.
     - The monitor records a gap before it stores the new tick time, so a hook arriving in between still sees either the pending or the recorded gap.
-    - A drop guard on the `rap-power` thread sets the last tick time to 0 and sends a warn notice when the thread ends, so a dead monitor never turns into a permanent pending gap.
+    - A drop guard on the `cm-power` thread sets the last tick time to 0 and sends a warn notice when the thread ends, so a dead monitor never turns into a permanent pending gap.
 6. **Gateway path**
     - A tap around the response body records timing and token usage when the body ends or is dropped, including on abort.
     - Only `POST /v1/messages` is tapped; the first `content_block_delta` event marks the first token.
     - An upstream connection error returns `502`; response headers that miss `gateway.upstream_timeout_secs` return `504`, and the streamed body has no deadline.
-    - The author's setup routes Claude Code through it with `ANTHROPIC_BASE_URL=http://127.0.0.1:47332` and `ANTHROPIC_DEFAULT_HAIKU_MODEL`, so Claude Code's own API traffic passes this path.
+    - Claude Code's own API traffic passes this path when its `env` sets `ANTHROPIC_BASE_URL=http://127.0.0.1:47332` (plus `ANTHROPIC_DEFAULT_HAIKU_MODEL`).
 7. **Views**
     - The admin API, the dashboard, and the daily report all read the same aggregate queries in `store/query.rs`.
     - The dashboard has seven tabs on keys `1`-`7` (overview, tools, hooks, models, agents, settings, report) and no gateway tab; gateway timing stays available through `GET /api/gateway` and the report, and the overview server-status card shows the gateway port as a status dot.
@@ -234,7 +234,7 @@ config:
 sequenceDiagram
     autonumber
     participant C as Claude Code
-    participant R as rap hooks 47333
+    participant R as cm hooks 47333
     participant G as Guard 47321
     C->>R: POST /hook/pretool-chain
     Note over R: rewrite cat, ls, eza, git diff
@@ -258,11 +258,33 @@ sequenceDiagram
 
 2. **Rules**
     - The guard always sees the final command, never the original when a rewrite applied.
-    - rap never synthesizes a decision the guard did not give: an explicit allow keeps allow, no decision returns `updatedInput` without `permissionDecision`, and ask returns ask with `updatedInput`.
+    - cm never synthesizes a decision the guard did not give: an explicit allow keeps allow, no decision returns `updatedInput` without `permissionDecision`, and ask returns ask with `updatedInput`.
     - A guard answer that carries its own `updatedInput` wins over the rewrite.
     - A decision other than allow, ask, or deny (for example `defer`) on a rewritten command drops the rewrite and sends the original command to the guard again with the same deadline; that second answer is returned as it is, and a failed second call is fail-closed.
     - A command containing `>|` is never rewritten.
     - The deadline is `hooks.guard_deadline_ms` (3000 ms), well under the 10-second hook timeout in `settings.json`.
+
+---
+
+## Dashboard State
+
+1. **Modules**
+    - `tui/i18n.rs` holds every screen text as one catalog entry with its English and Korean text; English is the default, and values such as paths, model and tool names, and log text pass through untranslated.
+    - `tui/card_move.rs` holds the press and move state machine; `AppState::tick(now)` enters move mode once a title press is older than 400 ms, independent of mouse motion, and the event loop passes the real clock while tests pass their own `Instant`.
+    - `tui/layout_store.rs` loads and saves the state file; `AppState::load_tui_state` runs once at start and `AppState::build_state_save` builds the file text when the loop dispatches `UiCommand::SaveState`, and `tui/state_writer.rs` writes it.
+    - `tui/state_writer.rs` runs one writer thread fed by a channel: queued requests for the same path collapse into the latest one, a failed write returns as `UiMessage::StateSaveFailed` and becomes an error toast, and `TerminalGuard` drops the writer after restoring the terminal, which writes the last queued request and joins the thread on every exit path, waiting at most 5 seconds before it warns on stderr instead of hanging.
+2. **Card move**
+    - Only card groups whose slot holds exactly one card are reorderable; the overview stacked-row groups are not.
+    - Press, preview, and commit run on mouse events, and the slot sizes stay with the slots while the cards move between them.
+    - `Esc`, a tab switch, or a resize cancels the move and restores the order from before the press.
+    - A commit that changes the order and `Shift+arrow` return `UiCommand::SaveState`.
+3. **State file**
+    - `~/.config/claude-monitor/tui.toml` (next to `config.toml`; it stays there when `data_dir` moves and falls back to `<data_dir>` only when no home folder resolves; name from `TUI_STATE_FILE_NAME` in `core/config.rs`) holds `version = 1`, `language`, `[orders]`, `[ratios]`, and `[column_widths]` keyed by stable group and table names (`event_feed`, `tool_table`, `hook_table`, `model_table`, `cache_breaks`, `agent_table`, `settings_hooks`, `settings_mcp`, `settings_agents`, `settings_doctor`); only entries that differ from the default layout are written, and a width list with a wrong length or a width above 512 is skipped.
+    - The write goes to a temporary file in the same folder and then renames over the target, so an interrupted write leaves the old file intact, and it never runs on the input thread.
+    - When `tui.toml` is a symbolic link, the save follows the whole link chain (16 links at most; a deeper chain fails the save), creates the temporary file in the real file's folder, syncs it, and renames it over the real file, never over a link; the start-up cleanup of leftover temporary files looks in both folders and removes only stale ones (not modified for 10 minutes and not tagged with the running process id), so another instance's live temporary file survives.
+    - An unreadable or other-version file is copied to `tui.toml.bak` at start, before the first save overwrites it.
+    - A missing file means the defaults; an unreadable file, an unsupported version, or an invalid entry is skipped with one notice.
+    - Every per-user file lives under `~/.config/claude-monitor/` (see README Data Directory).
 
 ---
 
@@ -319,7 +341,7 @@ sequenceDiagram
 2. **Browser and rebinding defense**
     - `net/common.rs` checks every request on every port: the `Host` header must be `127.0.0.1:<port>` or `localhost:<port>`, and any `Origin` or `Sec-Fetch-Site` header is rejected with `403`.
 3. **Admin token**
-    - Every `POST` on the admin port needs the `x-rap-token` header.
+    - Every `POST` on the admin port needs the `x-cm-token` header.
     - The token is 32 bytes from the OS random source, hex-encoded, written to `admin.token` at each start; the code sets no file permission, so the file inherits the data directory's access rules.
     - The comparison is an HMAC-SHA-256 tag check through `ring`, which is constant time and leaks no length.
 4. **Fail-closed chain**
@@ -334,8 +356,9 @@ sequenceDiagram
 7. **Configuration access**
     - The inventory reads `settings.json` and `.claude.json` for hook entries, MCP names, and env key names; env values serve comparisons only and are never printed or stored.
 8. **Child processes**
-    - Only `serve::ensure_background_serve` spawns a child: the same exe as `serve`, detached, once per no-command launch when the admin port does not answer; `build.rs` spawns build tools at build time.
+    - Only `serve::ensure_background_serve` spawns a child: the same exe as `serve`, detached, once per no-command or `start` launch when the admin port does not answer; `build.rs` spawns build tools at build time.
     - The hook chain, intake, indexing, and dashboard paths spawn nothing.
 9. **OS power request**
-    - The only added OS import is `kernel32!SetThreadExecutionState`, called with `ES_CONTINUOUS | ES_SYSTEM_REQUIRED` or `ES_CONTINUOUS`; `ES_DISPLAY_REQUIRED` is never set, so the screen-off and lock policy keeps working.
+    - The standby monitor's only OS import is `kernel32!SetThreadExecutionState`, called with `ES_CONTINUOUS | ES_SYSTEM_REQUIRED` or `ES_CONTINUOUS`; `ES_DISPLAY_REQUIRED` is never set, so the screen-off and lock policy keeps working.
+    - The dashboard declares its own window and console-font calls in `tui/win_ctrl.rs` (`user32`, `kernel32`); they touch only the terminal window that runs the dashboard.
     - The standby hint route reads `hook_event_name`, `session_id`, and `duration_ms` only; the error text, tool input, and prompt text are never read into a stored value or a log.

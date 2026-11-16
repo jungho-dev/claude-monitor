@@ -63,7 +63,7 @@ fn bind_planned_listeners(config: &AppConfig) -> anyhow::Result<PlannedListeners
             Err(err) if matches!(name, "admin" | "hooks") => {
                 bail!("{name} 포트 {port} 사용 불가 (다른 serve 실행 중일 수 있음): {err}")
             }
-            Err(err) => eprintln!("[rap] {name} 포트 {port} 사용 불가, 해당 서버 생략: {err}"),
+            Err(err) => eprintln!("[cm] {name} 포트 {port} 사용 불가, 해당 서버 생략: {err}"),
         }
     }
     let admin = bound.remove("admin").context("관리 리스너 없음")?;
@@ -131,7 +131,7 @@ pub fn run_serve(config: AppConfig) -> anyhow::Result<()> {
     if ctx.config.power.enabled
         && let Err(err) = power::spawn_power_monitor(Arc::clone(&ctx))
     {
-        eprintln!("[rap] 대기 감시 스레드 생성 실패 (serve 계속): {err}");
+        eprintln!("[cm] 대기 감시 스레드 생성 실패 (serve 계속): {err}");
     }
 
     // 6. 게이트웨이 전용 런타임 (훅·색인 부하와 스트리밍 중계 분리)
@@ -141,11 +141,11 @@ pub fn run_serve(config: AppConfig) -> anyhow::Result<()> {
         let (gateway_exit_tx, receiver) = oneshot::channel::<String>();
         gateway_exit_rx = Some(receiver);
         thread::Builder::new()
-            .name("rap-gateway".to_string())
+            .name("cm-gateway".to_string())
             .spawn(move || {
                 let exit_reason = match Builder::new_multi_thread()
                     .worker_threads(2)
-                    .thread_name("rap-gateway-worker")
+                    .thread_name("cm-gateway-worker")
                     .enable_all()
                     .build()
                 {
@@ -160,7 +160,7 @@ pub fn run_serve(config: AppConfig) -> anyhow::Result<()> {
                     }
                     Err(err) => format!("런타임 생성 실패: {err}"),
                 };
-                eprintln!("[rap] 게이트웨이 종료: {exit_reason}");
+                eprintln!("[cm] 게이트웨이 종료: {exit_reason}");
                 let _ = gateway_exit_tx.send(exit_reason);
             })
             .context("게이트웨이 스레드 생성 실패")?;
@@ -168,7 +168,7 @@ pub fn run_serve(config: AppConfig) -> anyhow::Result<()> {
 
     // 7. 주 런타임 (관리, OTLP, 훅, 색인, 리포트)
     let runtime = Builder::new_multi_thread()
-        .thread_name("rap-main")
+        .thread_name("cm-main")
         .enable_all()
         .build()
         .context("주 런타임 생성 실패")?;
@@ -193,7 +193,7 @@ pub fn run_serve(config: AppConfig) -> anyhow::Result<()> {
             tasks.spawn(async move { ("report", scheduler.await) });
         }
         eprintln!(
-            "[rap] serve 시작: admin {} / otlp {} / hooks {} / gateway {} ({})",
+            "[cm] serve 시작: admin {} / otlp {} / hooks {} / gateway {} ({})",
             ctx.config.ports.admin,
             ctx.config.ports.otlp,
             ctx.config.ports.hooks,
@@ -208,7 +208,7 @@ pub fn run_serve(config: AppConfig) -> anyhow::Result<()> {
         // 8. 종료 신호와 작업 감독
         let notice_ctx = Arc::clone(&ctx);
         let notify = move |text: &str| {
-            eprintln!("[rap] {text}");
+            eprintln!("[cm] {text}");
             let _ = notice_ctx.live_tx.send(LiveEvent::Notice {
                 ts: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
                 level: "warn".to_string(),
@@ -217,7 +217,7 @@ pub fn run_serve(config: AppConfig) -> anyhow::Result<()> {
         };
         let outcome: anyhow::Result<()> = tokio::select! {
             Ok(()) = tokio::signal::ctrl_c() => {
-                eprintln!("[rap] 종료 신호 수신");
+                eprintln!("[cm] 종료 신호 수신");
                 Ok(())
             }
             supervised = supervise(tasks, gateway_exit_rx, notify) => supervised,
@@ -240,11 +240,11 @@ async fn supervise(
                 let (name, outcome) = match joined {
                     Some(Ok(finished)) => finished,
                     Some(Err(err)) => {
-                        eprintln!("[rap] 작업 panic: {err}");
+                        eprintln!("[cm] 작업 panic: {err}");
                         return Err(anyhow::anyhow!("작업 panic 으로 serve 중단: {err}"));
                     }
                     None => {
-                        eprintln!("[rap] 작업 종료: 실행 중인 작업 없음");
+                        eprintln!("[cm] 작업 종료: 실행 중인 작업 없음");
                         return Err(anyhow::anyhow!("작업 종료로 serve 중단: 실행 중인 작업 없음"));
                     }
                 };
@@ -255,7 +255,7 @@ async fn supervise(
 
                 // 2. 필수 작업은 중단, 선택 작업은 알림 후 계속
                 if matches!(name, "admin" | "hooks") {
-                    eprintln!("[rap] 작업 종료: {name}: {reason}");
+                    eprintln!("[cm] 작업 종료: {name}: {reason}");
                     return Err(anyhow::anyhow!("작업 종료로 serve 중단: {name}: {reason}"));
                 }
                 notify(&format!("{name} 종료 (serve 계속): {reason}"));
@@ -322,7 +322,7 @@ pub fn ensure_background_serve(
                 spawned = Some(child);
                 break;
             }
-            Err(err) => eprintln!("[rap] serve 분리 실행 재시도 (flags {flags:#x}): {err}"),
+            Err(err) => eprintln!("[cm] serve 분리 실행 재시도 (flags {flags:#x}): {err}"),
         }
     }
     let Some(mut child) = spawned else {

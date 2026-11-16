@@ -5,12 +5,15 @@ pub mod common;
 pub mod feed;
 pub mod models;
 pub mod overview;
+#[cfg(test)]
+mod render_matrix;
 pub mod report;
 pub mod settings;
 pub mod tables;
 
 use crate::tui::cards::{CardKind, UiAction, UiHitAreas};
 use crate::tui::format::fit_display;
+use crate::tui::i18n::{self, Lang, Msg};
 use crate::tui::poller::POLL_INTERVAL;
 use crate::tui::sort::sort_spec;
 use crate::tui::state::{ActiveTab, AppState, ToastLevel};
@@ -41,10 +44,7 @@ pub fn render_frame(frame: &mut Frame, state: &mut AppState) {
     // 1. 최소 크기 미달
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         let notice = Paragraph::new(Line::from(Span::styled(
-            format!(
-                "터미널 크기 부족 (최소 {MIN_WIDTH}x{MIN_HEIGHT}, 현재 {}x{})",
-                area.width, area.height
-            ),
+            i18n::too_small(state.lang, MIN_WIDTH, MIN_HEIGHT, area.width, area.height),
             theme::STYLE_WARN,
         )))
         .alignment(Alignment::Center);
@@ -80,7 +80,7 @@ pub fn render_frame(frame: &mut Frame, state: &mut AppState) {
     render_split_handles(frame, state);
     render_column_handles(frame, state);
     if state.show_help {
-        render_help_overlay(frame, area);
+        render_help_overlay(frame, area, state.lang);
     }
 }
 
@@ -88,6 +88,7 @@ pub fn render_frame(frame: &mut Frame, state: &mut AppState) {
 // 왼쪽 배지·최상단 표시, 오른쪽 구간과 갱신 신선도 (폴링 주기 3배 넘으면 지연 표시)
 fn render_app_bar(frame: &mut Frame, area: Rect, state: &AppState) {
     // 1. 신선도 표시
+    let lang = state.lang;
     let stale_secs =
         i64::try_from(POLL_INTERVAL.as_secs() * STALE_POLL_MULTIPLE).unwrap_or(i64::MAX);
     let freshness: Vec<Span<'static>> = match state.snapshot.taken_at {
@@ -107,15 +108,21 @@ fn render_app_bar(frame: &mut Frame, area: Rect, state: &AppState) {
             } else {
                 vec![
                     Span::styled("● ", theme::STYLE_WARN),
-                    Span::styled(format!("갱신 지연 {age_secs}s"), theme::STYLE_WARN),
+                    Span::styled(i18n::stale(lang, age_secs), theme::STYLE_WARN),
                 ]
             }
         }
-        None => vec![Span::styled("○ 대기", theme::STYLE_DIM)],
+        None => vec![Span::styled(
+            format!("○ {}", i18n::text(lang, Msg::AppBarWaiting)),
+            theme::STYLE_DIM,
+        )],
     };
     let mut right_spans = vec![
-        Span::styled("구간 ", theme::STYLE_DIM),
-        Span::styled(state.window.window_label(), theme::STYLE_ACCENT),
+        Span::styled(
+            format!("{} ", i18n::text(lang, Msg::AppBarWindow)),
+            theme::STYLE_DIM,
+        ),
+        Span::styled(state.window.window_label(lang), theme::STYLE_ACCENT),
         Span::raw("  "),
     ];
     right_spans.extend(freshness);
@@ -127,7 +134,7 @@ fn render_app_bar(frame: &mut Frame, area: Rect, state: &AppState) {
 
     // 2. 왼쪽 배지
     let mut left_spans = vec![Span::styled(
-        " rust-agents-proxy ",
+        " claude-monitor ",
         Style::default()
             .fg(theme::FG_ON_ACCENT)
             .bg(theme::FG_ACCENT)
@@ -136,11 +143,8 @@ fn render_app_bar(frame: &mut Frame, area: Rect, state: &AppState) {
     if state.always_on_top {
         left_spans.push(Span::raw("  "));
         left_spans.push(Span::styled(
-            " 최상단 ",
-            Style::default()
-                .fg(theme::FG_ON_ACCENT)
-                .bg(theme::COLOR_WARN)
-                .add_modifier(Modifier::BOLD),
+            format!(" {} ", i18n::text(lang, Msg::BadgePinned)),
+            theme::STYLE_PINNED,
         ));
     }
     frame.render_widget(
@@ -163,7 +167,7 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let tab_count = ActiveTab::ALL.len();
     let full_labels: usize = ActiveTab::ALL
         .iter()
-        .map(|tab| Span::raw(tab.tab_label()).width())
+        .map(|tab| Span::raw(tab.tab_label(state.lang)).width())
         .sum();
     let full_width = full_labels + 4 * tab_count + tab_count;
     let compact_width = full_labels + 4 * tab_count + 1;
@@ -195,7 +199,7 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 theme::BG_BASE,
             )
         };
-        let label = tab.tab_label();
+        let label = tab.tab_label(state.lang);
         let line = match level {
             2 => Line::from(vec![
                 Span::styled(format!("{}", index + 1), key_style),
@@ -234,34 +238,36 @@ fn render_footer(frame: &mut Frame, area: Rect, state: &mut AppState) {
 }
 
 // 5. 하단 버튼 줄 -------------------------------------------------------------
-// 칩 = 키 글자(강조색) + 이름, 폭이 모자라면 왼쪽 그룹의 뒤쪽부터 생략
+// 칩 = 키 글자(강조색) + 이름, 폭이 모자라면 왼쪽 그룹의 뒤쪽부터 생략 (언어 칩은 마지막까지 유지)
 fn render_footer_buttons(frame: &mut Frame, row: Rect, state: &mut AppState) {
     // 1. 칩 스타일 (핀 켜짐만 채움, 종료는 키 글자만 적색)
     let chip = Style::default().bg(theme::BG_TONAL);
     let key_style = chip.fg(theme::FG_ACCENT).add_modifier(Modifier::BOLD);
     let name_style = chip.fg(theme::FG_TEXT);
     let quit_key_style = chip.fg(theme::COLOR_CRIT).add_modifier(Modifier::BOLD);
-    let pin_on_style = Style::default()
-        .fg(theme::FG_ON_ACCENT)
-        .bg(theme::COLOR_WARN)
-        .add_modifier(Modifier::BOLD);
     let (pin_key, pin_name) = if state.always_on_top {
-        (pin_on_style, pin_on_style)
+        (theme::STYLE_PINNED, theme::STYLE_PINNED)
     } else {
         (key_style, name_style)
     };
+    let lang = state.lang;
     let pin_label = if state.always_on_top {
-        " 최상단 ON "
+        format!(" {} ", i18n::text(lang, Msg::ChipPinOn))
     } else {
-        " 최상단 OFF "
+        format!(" {} ", i18n::text(lang, Msg::ChipPinOff))
     };
-    let window_label = format!(" 구간 {} ", state.window.window_label());
+    let window_label = format!(
+        " {} {} ",
+        i18n::text(lang, Msg::AppBarWindow),
+        state.window.window_label(lang)
+    );
+    let chip_name = |msg: Msg| format!(" {} ", i18n::text(lang, msg));
     let left_chips: Vec<(UiAction, Line<'static>)> = vec![
         (
             UiAction::Reindex,
             Line::from(vec![
                 Span::styled(" [i]", key_style),
-                Span::styled(" 재색인 ", name_style),
+                Span::styled(chip_name(Msg::ChipReindex), name_style),
             ]),
         ),
         (
@@ -275,7 +281,7 @@ fn render_footer_buttons(frame: &mut Frame, row: Rect, state: &mut AppState) {
             UiAction::RefreshView,
             Line::from(vec![
                 Span::styled(" [r]", key_style),
-                Span::styled(" 새로고침 ", name_style),
+                Span::styled(chip_name(Msg::ChipRefresh), name_style),
             ]),
         ),
         (
@@ -289,28 +295,35 @@ fn render_footer_buttons(frame: &mut Frame, row: Rect, state: &mut AppState) {
             UiAction::ResetLayout,
             Line::from(vec![
                 Span::styled(" [l]", key_style),
-                Span::styled(" 배치 초기화 ", name_style),
+                Span::styled(chip_name(Msg::ChipResetLayout), name_style),
             ]),
         ),
     ];
+    let language_chip: (UiAction, Line<'static>) = (
+        UiAction::ToggleLanguage,
+        Line::from(vec![
+            Span::styled(" [L]", key_style),
+            Span::styled(chip_name(Msg::ChipLanguage), name_style),
+        ]),
+    );
     let right_chips: Vec<(UiAction, Line<'static>)> = vec![
         (
             UiAction::ShowHelp,
             Line::from(vec![
                 Span::styled(" [?]", key_style),
-                Span::styled(" 도움말 ", name_style),
+                Span::styled(chip_name(Msg::ChipHelp), name_style),
             ]),
         ),
         (
             UiAction::Quit,
             Line::from(vec![
                 Span::styled(" [q]", quit_key_style),
-                Span::styled(" 종료 ", name_style),
+                Span::styled(chip_name(Msg::ChipQuit), name_style),
             ]),
         ),
     ];
 
-    // 2. 배치 (오른쪽 그룹은 오른쪽 끝 1열 앞, 왼쪽 그룹은 남는 폭까지만)
+    // 2. 배치 (오른쪽 그룹은 오른쪽 끝 1열 앞, 왼쪽 그룹은 남는 폭까지만, 언어 칩은 맨 끝 자리를 남긴 채 다른 칩부터 생략)
     let row_end = row.x.saturating_add(row.width);
     let right_width: u16 = right_chips
         .iter()
@@ -320,13 +333,22 @@ fn render_footer_buttons(frame: &mut Frame, row: Rect, state: &mut AppState) {
     let right_start = row_end.saturating_sub(1 + right_width).max(row.x);
     let mut placed: Vec<(UiAction, Rect, Line<'static>)> = Vec::new();
     let mut cursor = row.x.saturating_add(1);
+    let language_width = language_chip.1.width() as u16;
     for (action, line) in left_chips {
         let width = line.width() as u16;
-        if cursor.saturating_add(width) >= right_start {
+        if cursor.saturating_add(width + 1 + language_width) >= right_start {
             break;
         }
         placed.push((action, Rect::new(cursor, row.y, width, row.height), line));
         cursor = cursor.saturating_add(width + 1);
+    }
+    if cursor.saturating_add(language_width) < right_start {
+        let (action, line) = language_chip;
+        placed.push((
+            action,
+            Rect::new(cursor, row.y, language_width, row.height),
+            line,
+        ));
     }
     let mut cursor = right_start;
     for (action, line) in right_chips {
@@ -372,30 +394,51 @@ fn render_footer_hints(frame: &mut Frame, row: Rect, state: &AppState) {
     }
 
     // 2. 맥락 안내 (포인터 > 포커스 카드 종류 > 탭), 꼬리 안내는 항상 마지막
+    let lang = state.lang;
+    let hint_texts = |msgs: &[Msg]| -> Vec<&'static str> {
+        msgs.iter().map(|msg| i18n::text(lang, *msg)).collect()
+    };
     let mut context_hints: Vec<&str> = Vec::new();
-    if state.split_hover.is_some() || state.split_drag.is_some() {
-        context_hints.extend(["드래그 카드 크기", "l 기본 배치"]);
-    }
-    if state.column_hover.is_some() || state.column_drag.is_some() {
-        context_hints.extend(["드래그 열 폭", "더블클릭 자동 폭", "l 기본 배치"]);
-    }
-    if state.scroll_hover.is_some() || state.scroll_drag.is_some() {
-        context_hints.extend(["드래그 스크롤", "트랙클릭 한 화면"]);
-    }
-    match state.focused_card_id().kind() {
-        CardKind::Selectable => {
-            context_hints.extend(["↑↓ 행 선택", "PgUp/PgDn 페이지", "Home/End 처음·끝"]);
+    if state.card_move.is_some() {
+        // 카드 이동 중에는 놓기·취소 안내가 맨 앞, 다른 맥락 안내는 생략
+        context_hints.extend(hint_texts(&[Msg::HintRelease, Msg::HintCancel]));
+    } else {
+        if state.split_hover.is_some() || state.split_drag.is_some() {
+            context_hints.extend(hint_texts(&[Msg::HintDragCardSize, Msg::HintResetLayout]));
         }
-        CardKind::Scrollable => context_hints.extend(["↑↓ 스크롤", "PgUp/PgDn 페이지"]),
-        CardKind::Static => {}
+        if state.column_hover.is_some() || state.column_drag.is_some() {
+            context_hints.extend(hint_texts(&[
+                Msg::HintDragColumnWidth,
+                Msg::HintDoubleClickAuto,
+                Msg::HintResetLayout,
+            ]));
+        }
+        if state.scroll_hover.is_some() || state.scroll_drag.is_some() {
+            context_hints.extend(hint_texts(&[Msg::HintDragScroll, Msg::HintTrackPage]));
+        }
+        match state.focused_card_id().kind() {
+            CardKind::Selectable => {
+                context_hints.extend(hint_texts(&[
+                    Msg::HintSelectRow,
+                    Msg::HintPage,
+                    Msg::HintFirstLast,
+                ]));
+            }
+            CardKind::Scrollable => {
+                context_hints.extend(hint_texts(&[Msg::HintScroll, Msg::HintPage]));
+            }
+            CardKind::Static => {}
+        }
+        if sort_spec(state.focused_card_id()).is_some()
+            || sort_spec(state.tab.main_card()).is_some()
+        {
+            context_hints.extend(hint_texts(&[Msg::HintSortColumn, Msg::HintSortOrder]));
+        }
+        if state.tab == ActiveTab::Report {
+            context_hints.extend(hint_texts(&[Msg::HintReportDate, Msg::HintGenerate]));
+        }
     }
-    if sort_spec(state.focused_card_id()).is_some() || sort_spec(state.tab.main_card()).is_some() {
-        context_hints.extend(["s 정렬 열", "S 오름·내림·기본"]);
-    }
-    if state.tab == ActiveTab::Report {
-        context_hints.extend(["←→ 날짜", "g 생성"]);
-    }
-    let tail_hints = ["Tab 다음 탭", "? 전체 단축키"];
+    let tail_hints = hint_texts(&[Msg::HintNextTab, Msg::HintAllKeys]);
 
     // 3. 남은 폭에 들어가는 안내만 (키 글자 강조, 구분은 공백 2칸)
     let mut room = (row.width as usize).saturating_sub(Line::from(spans.clone()).width());
@@ -445,39 +488,9 @@ fn render_footer_hints(frame: &mut Frame, row: Rect, state: &AppState) {
 
 // 7. 도움말 겹침 --------------------------------------------------------------
 // 바깥은 어둡게, 이중선 상자에 키보드·마우스 두 구역
-fn render_help_overlay(frame: &mut Frame, area: Rect) {
+fn render_help_overlay(frame: &mut Frame, area: Rect, lang: Lang) {
     // 1. 도움말 내용 (뜻이 빈 줄 = 구역 제목)
-    let help_rows: [(&str, &str); 20] = [
-        ("키보드", ""),
-        ("1-7, Tab, Shift-Tab", "탭 이동 (개요 ~ 리포트 일곱 탭)"),
-        ("↑ ↓ PgUp PgDn Home End", "선택 카드의 행 이동·스크롤"),
-        ("w", "집계 구간 전환 (1시간, 24시간, 7일)"),
-        ("s / S", "다음 정렬 열 / 오름 → 내림 → 기본 순환"),
-        ("←  →", "리포트 날짜 이동"),
-        ("g", "리포트 생성 (serve 실행 필요)"),
-        ("r", "설정·리포트 다시 불러오기, 그 외 즉시 갱신"),
-        ("i", "기록 재색인 요청 (serve 실행 필요)"),
-        ("t", "창 최상단 고정 켜기·끄기"),
-        ("l", "현재 탭 카드 크기·열 폭 기본 배치"),
-        ("?", "도움말 열기·닫기"),
-        ("q, Esc, Ctrl+C", "종료"),
-        ("마우스", ""),
-        ("탭·버튼 클릭", "탭 전환, 하단 버튼 실행"),
-        ("카드·행 클릭", "카드 선택(굵은 테두리), 표 행 선택"),
-        (
-            "표 머리글 클릭",
-            "그 열 정렬: 오름(↑) → 내림(↓) → 기본 순환",
-        ),
-        (
-            "열 경계 드래그",
-            "머리글 사이를 끌어 폭 조절, 더블클릭 자동 폭",
-        ),
-        (
-            "휠 / 경계 드래그",
-            "마우스 아래 카드 스크롤 / 카드 크기 조절",
-        ),
-        ("스크롤바", "썸 드래그 이동, 트랙 클릭 한 화면 이동"),
-    ];
+    let help_rows = i18n::help_rows(lang);
     let width = area.width.saturating_sub(4).min(76);
     let height = (help_rows.len() as u16 + 4).min(area.height.saturating_sub(2));
     let rect = Rect::new(
@@ -499,9 +512,16 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
         .border_style(Style::default().fg(theme::FG_ACCENT))
-        .title(Span::styled(" 도움말 ", theme::STYLE_STRONG))
+        .title(Span::styled(
+            format!(" {} ", i18n::text(lang, Msg::HelpTitle)),
+            theme::STYLE_STRONG,
+        ))
         .title_bottom(
-            Line::from(Span::styled(" 아무 키·클릭: 닫기 ", theme::STYLE_DIM)).right_aligned(),
+            Line::from(Span::styled(
+                format!(" {} ", i18n::text(lang, Msg::HelpClose)),
+                theme::STYLE_DIM,
+            ))
+            .right_aligned(),
         )
         .padding(Padding::horizontal(1))
         .style(Style::default().bg(theme::BG_PANEL));
@@ -550,7 +570,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
     if lines.len() > room {
         lines.truncate(room.saturating_sub(1));
         lines.push(Line::from(Span::styled(
-            "… (창을 키우면 전체 표시)",
+            i18n::text(lang, Msg::HelpTruncated),
             theme::STYLE_DIM,
         )));
     }
@@ -562,6 +582,7 @@ mod tests {
     use super::*;
     use crate::store::query::{HookStatRow, ToolLatencyRow};
     use crate::tui::cards::CardId;
+    use crate::tui::i18n::Failure;
     use crate::tui::sort::SortState;
     use crate::tui::state::{DbState, Panel, Toast, ToastLevel};
     use crate::tui::test_support::{
@@ -600,7 +621,7 @@ mod tests {
         let mut state = sample_state_with_snapshot();
         let text = render_to_text(&mut state, 130, 40).join("\n");
 
-        assert!(text.contains("rust-agents-proxy"));
+        assert!(text.contains("claude-monitor"));
         assert!(text.contains("1 개요"));
         assert!(text.contains("serve 실행 중"));
         assert!(text.contains("게이트웨이 ON"));
@@ -622,6 +643,7 @@ mod tests {
         assert!(text.contains("[i] 재색인"));
         assert!(text.contains("[w] 구간 1시간"));
         assert!(text.contains("[t] 최상단 OFF"));
+        assert!(text.contains("[L] KO"));
         assert!(text.contains("[q] 종료"));
         let actions: Vec<UiAction> = state
             .hit_areas
@@ -629,7 +651,8 @@ mod tests {
             .iter()
             .map(|(action, _)| *action)
             .collect();
-        assert_eq!(actions.len(), 7);
+        assert_eq!(actions.len(), 8);
+        assert!(actions.contains(&UiAction::ToggleLanguage));
         assert!(actions.contains(&UiAction::Reindex));
         assert!(actions.contains(&UiAction::Quit));
         assert_eq!(state.hit_areas.tab_rects.len(), 7);
@@ -693,6 +716,7 @@ mod tests {
         assert!(actions.contains(&UiAction::ShowHelp));
         assert!(actions.contains(&UiAction::Quit));
         assert!(actions.contains(&UiAction::Reindex));
+        assert!(actions.contains(&UiAction::ToggleLanguage));
         assert!(!actions.contains(&UiAction::ResetLayout));
         for (_, rect) in &state.hit_areas.button_rects {
             assert!(rect.right() < MIN_WIDTH);
@@ -953,6 +977,7 @@ mod tests {
             sample_config(),
             chrono::NaiveDate::from_ymd_opt(2026, 11, 15).unwrap(),
         );
+        state.lang = Lang::Ko;
         state.snapshot.db_state = DbState::Missing;
         let text = render_to_text(&mut state, 100, 30).join("\n");
         assert!(text.contains("DB 없음"));
@@ -964,9 +989,9 @@ mod tests {
     #[test]
     fn failed_panels_render_notice_instead_of_crashing() {
         let mut state = sample_state_with_snapshot();
-        state.snapshot.overview = Panel::Failed("내부 오류: boom".to_string());
+        state.snapshot.overview = Panel::Failed(Failure::Internal("boom".to_string()));
         state.snapshot.minutes = Panel::Pending;
-        state.snapshot.events = Panel::Failed("조회 실패".to_string());
+        state.snapshot.events = Panel::Failed(Failure::Error("조회 실패".to_string()));
         let text = render_to_text(&mut state, 120, 36).join("\n");
         assert!(text.contains("내부 오류: boom"));
         assert!(text.contains("집계 대기 중"));
@@ -987,7 +1012,7 @@ mod tests {
     fn app_bar_shows_only_the_badge_without_a_caption() {
         let mut state = sample_state_with_snapshot();
         let app_bar = render_to_text(&mut state, 130, 40)[0].clone();
-        assert!(app_bar.contains("rust-agents-proxy"));
+        assert!(app_bar.contains("claude-monitor"));
         assert!(!app_bar.contains("Claude Code 관제"));
         assert!(!app_bar.contains("관제"));
     }
@@ -1501,7 +1526,7 @@ mod tests {
                 let backdrop = format!("a{}", "한".repeat(49));
                 let lines: Vec<Line> = (0..40).map(|_| Line::from(backdrop.as_str())).collect();
                 frame.render_widget(Paragraph::new(lines), area);
-                render_help_overlay(frame, area);
+                render_help_overlay(frame, area, Lang::Ko);
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
@@ -1528,6 +1553,297 @@ mod tests {
         }
     }
 
+    fn buffer_of(state: &mut AppState, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| render_frame(frame, state)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn row_text(buffer: &ratatui::buffer::Buffer, y: u16, width: u16) -> String {
+        let mut text = String::new();
+        let mut skip = 0usize;
+        for x in 0..width {
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
+            let symbol = buffer.cell((x, y)).map_or(" ", |cell| cell.symbol());
+            skip = Span::raw(symbol).width().saturating_sub(1);
+            text.push_str(symbol);
+        }
+        text
+    }
+
+    fn settings_state() -> AppState {
+        let mut state = sample_state_with_tables();
+        state.tab = ActiveTab::Settings;
+        state
+    }
+
+    #[test]
+    fn moved_card_in_move_mode_has_a_dashed_accent_border_and_a_moving_title() {
+        use crate::tui::layout::SplitGroup;
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let mut state = settings_state();
+        let mut terminal = Terminal::new(TestBackend::new(110, 36)).unwrap();
+        terminal
+            .draw(|frame| render_frame(frame, &mut state))
+            .unwrap();
+        let mcp = card_rect_of(&state, CardId::SettingsMcp);
+        let title = state
+            .hit_areas
+            .title_hits
+            .iter()
+            .find(|hit| hit.card == CardId::SettingsMcp)
+            .map(|hit| hit.rect)
+            .unwrap();
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: title.x + 1,
+            row: title.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let base = Instant::now();
+
+        // 누르는 동안(400ms 전)에는 일반 포커스 모양, 이동 표시 없음
+        state.handle_mouse_event_at(down, base);
+        let pressed = buffer_of(&mut state, 110, 36);
+        assert_eq!(pressed.cell((mcp.x, mcp.y)).unwrap().symbol(), "┏");
+        assert!(!row_text(&pressed, mcp.y, 110).contains("이동 ·"));
+
+        // 400ms: 이동 모드, 들어 올린 카드는 점선 테두리와 강조색, 제목에 이동 표시 (이중선은 겹침 창 전용이라 쓰지 않음)
+        assert!(state.tick(base + Duration::from_millis(400)));
+        let lifted = buffer_of(&mut state, 110, 36);
+        let corner = lifted.cell((mcp.x, mcp.y)).unwrap();
+        assert_eq!(corner.symbol(), "┌");
+        assert_eq!(corner.fg, theme::FG_ACCENT);
+        assert_ne!(corner.fg, theme::BORDER_FOCUS);
+        let right = lifted.cell((mcp.right() - 1, mcp.y)).unwrap();
+        assert_eq!((right.symbol(), right.fg), ("┐", theme::FG_ACCENT));
+        let bottom_left = lifted.cell((mcp.x, mcp.bottom() - 1)).unwrap();
+        assert_eq!(bottom_left.symbol(), "└");
+        assert_eq!(lifted.cell((mcp.x, mcp.y + 1)).unwrap().symbol(), "╎");
+        for y in 0..36 {
+            assert!(!row_text(&lifted, y, 110).contains('╔'), "{y}");
+        }
+        let top = row_text(&lifted, mcp.y, 110);
+        assert!(top.contains("이동 · MCP 서버"), "{top}");
+        // 제목 글자는 강조색 바탕 반전
+        let title_cell = lifted.cell((mcp.x + 2, mcp.y)).unwrap();
+        assert_eq!(title_cell.bg, theme::FG_ACCENT);
+        assert_eq!(title_cell.fg, theme::FG_ON_ACCENT);
+
+        // 다른 카드는 이중선이 아님 (포커스 카드는 이 탭의 주 카드 대신 눌린 카드)
+        let hooks = card_rect_of(&state, CardId::SettingsHooks);
+        assert_eq!(lifted.cell((hooks.x, hooks.y)).unwrap().symbol(), "╭");
+        let doctor = card_rect_of(&state, CardId::SettingsDoctor);
+        assert_eq!(lifted.cell((doctor.x, doctor.y)).unwrap().symbol(), "╭");
+
+        // 푸터 안내 줄: 놓기·취소가 맨 앞
+        let hint_row = row_text(&lifted, 35, 110);
+        assert!(hint_row.contains("놓기 위치 확정"), "{hint_row}");
+        assert!(hint_row.contains("Esc 취소"), "{hint_row}");
+        assert!(
+            hint_row.find("놓기 위치 확정").unwrap() < hint_row.find("Tab 다음 탭").unwrap(),
+            "{hint_row}"
+        );
+        assert!(!hint_row.contains("정렬 열"), "{hint_row}");
+
+        // 이동 중 카드는 제목 영역을 길게 누르는 대상으로 다시 등록되고, 순서는 미리보기에 따라 바뀜
+        assert!(
+            state
+                .hit_areas
+                .slot_groups
+                .iter()
+                .any(|slots| slots.group == SplitGroup::SettingsRows)
+        );
+
+        // Esc 로 취소하면 다시 둥근 모서리
+        state.handle_key_event(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            KeyModifiers::NONE,
+        ));
+        let restored = buffer_of(&mut state, 110, 36);
+        assert_eq!(restored.cell((mcp.x, mcp.y)).unwrap().symbol(), "┏");
+        assert!(!row_text(&restored, mcp.y, 110).contains("이동 ·"));
+        let plain_hints = row_text(&restored, 35, 110);
+        assert!(!plain_hints.contains("놓기 위치 확정"), "{plain_hints}");
+    }
+
+    #[test]
+    fn settings_reorder_draws_mcp_in_the_first_slot_and_keeps_slot_heights() {
+        use crate::tui::layout::{IDENTITY_ORDER, SplitGroup};
+
+        for (width, height) in [(110u16, 36u16), (MIN_WIDTH, MIN_HEIGHT)] {
+            let mut state = settings_state();
+            let before = buffer_of(&mut state, width, height);
+            let slots: Vec<Rect> = state
+                .hit_areas
+                .slot_groups
+                .iter()
+                .find(|slots| slots.group == SplitGroup::SettingsRows)
+                .map(|slots| slots.slots.clone())
+                .unwrap();
+            assert_eq!(slots.len(), 4);
+            // 기본 배치: 카드는 칸 순서대로
+            assert_eq!(card_rect_of(&state, CardId::SettingsHooks), slots[0]);
+            assert_eq!(card_rect_of(&state, CardId::SettingsMcp), slots[1]);
+            let heights: Vec<u16> = slots.iter().map(|slot| slot.height).collect();
+            assert!(row_text(&before, slots[0].y, width).contains("훅 등록"));
+
+            // MCP 서버(카드 1)를 첫 칸으로
+            state
+                .card_layout
+                .move_card_to_slot(SplitGroup::SettingsRows, &IDENTITY_ORDER, 1, 0);
+            let after = buffer_of(&mut state, width, height);
+            let reordered: Vec<Rect> = state
+                .hit_areas
+                .slot_groups
+                .iter()
+                .find(|slots| slots.group == SplitGroup::SettingsRows)
+                .map(|slots| slots.slots.clone())
+                .unwrap();
+            assert_eq!(reordered, slots, "{width}x{height}");
+            assert_eq!(
+                state
+                    .hit_areas
+                    .slot_groups
+                    .iter()
+                    .find(|slots| slots.group == SplitGroup::SettingsRows)
+                    .map(|slots| slots.cards.clone()),
+                Some(vec![1, 0, 2, 3])
+            );
+            assert_eq!(card_rect_of(&state, CardId::SettingsMcp), slots[0]);
+            assert_eq!(card_rect_of(&state, CardId::SettingsHooks), slots[1]);
+            assert_eq!(card_rect_of(&state, CardId::SettingsAgents), slots[2]);
+            assert_eq!(card_rect_of(&state, CardId::SettingsDoctor), slots[3]);
+            // 칸 높이는 그대로, 첫 칸 위 테두리에 MCP 서버 제목
+            let after_heights: Vec<u16> = slots.iter().map(|slot| slot.height).collect();
+            assert_eq!(after_heights, heights);
+            let first_row = row_text(&after, slots[0].y, width);
+            assert!(
+                first_row.contains("MCP 서버"),
+                "{width}x{height}: {first_row}"
+            );
+            assert!(
+                !first_row.contains("훅 등록"),
+                "{width}x{height}: {first_row}"
+            );
+            let second_row = row_text(&after, slots[1].y, width);
+            assert!(
+                second_row.contains("훅 등록"),
+                "{width}x{height}: {second_row}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_card_group_renders_every_order_at_both_sizes_with_cards_in_their_slots() {
+        use crate::tui::layout::{IDENTITY_ORDER, MAX_SLOTS, insert_card_order};
+
+        // 순열 대신 모든 카드를 모든 칸으로 보내는 삽입 이동 (칸 수 제곱 가짓수)
+        for tab in ActiveTab::ALL {
+            for group in tab.split_groups() {
+                if !group.is_reorderable() {
+                    continue;
+                }
+                let count = group.card_count();
+                for card in 0..count {
+                    for target in 0..count {
+                        let order: [u8; MAX_SLOTS] =
+                            insert_card_order(&IDENTITY_ORDER, count, card as u8, target);
+                        for (width, height) in [(110u16, 40u16), (MIN_WIDTH, MIN_HEIGHT)] {
+                            let mut state = sample_state_with_tables();
+                            state.tab = tab;
+                            state.card_layout.set_order(*group, order);
+                            render_to_text(&mut state, width, height);
+
+                            // 그려진 카드는 모두 놓인 칸의 영역과 같음
+                            let recorded = state
+                                .hit_areas
+                                .slot_groups
+                                .iter()
+                                .find(|slots| slots.group == *group);
+                            let Some(recorded) = recorded else {
+                                continue;
+                            };
+                            assert_eq!(recorded.cards.len(), count, "{group:?}");
+                            for (slot, placed) in recorded.cards.iter().enumerate() {
+                                assert_eq!(usize::from(order[slot]), *placed, "{group:?}");
+                            }
+                            for (drawn, rect) in &state.hit_areas.card_rects {
+                                let Some((owner, index)) = drawn.reorder_slot() else {
+                                    continue;
+                                };
+                                if owner != *group {
+                                    continue;
+                                }
+                                let slot = recorded
+                                    .cards
+                                    .iter()
+                                    .position(|placed| *placed == index)
+                                    .unwrap();
+                                assert_eq!(
+                                    *rect, recorded.slots[slot],
+                                    "{group:?} {drawn:?} {width}x{height} order {order:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pending_trend_notice_survives_cards_moved_apart_or_next_to_each_other() {
+        use crate::tui::layout::{IDENTITY_ORDER, SplitGroup};
+
+        // 분당 추이가 준비되지 않은 개요: 이웃한 칸이면 하나의 안내 카드, 떨어지면 카드마다 안내
+        for (card, target, joined) in [(0usize, 0usize, true), (0, 2, true), (0, 1, false)] {
+            let mut state = sample_state_with_snapshot();
+            state.snapshot.minutes = Panel::Pending;
+            state.card_layout.move_card_to_slot(
+                SplitGroup::OverviewTrendCols,
+                &IDENTITY_ORDER,
+                card,
+                target,
+            );
+            let text = render_to_text(&mut state, 130, 40).join("\n");
+            assert_eq!(
+                text.contains("분당 추이"),
+                joined,
+                "{card}->{target}\n{text}"
+            );
+            assert_eq!(text.contains("분당 출력 토큰"), !joined, "{card}->{target}");
+            let cuts = state
+                .hit_areas
+                .split_hits
+                .iter()
+                .filter(|hit| hit.group == SplitGroup::OverviewTrendCols)
+                .count();
+            assert_eq!(cuts, if joined { 1 } else { 2 }, "{card}->{target}");
+        }
+    }
+
+    #[test]
+    fn help_overlay_lists_the_card_move_keys_and_the_order_reset() {
+        let mut state = sample_state_with_snapshot();
+        state.show_help = true;
+        let text = render_to_text(&mut state, 100, 40).join("\n");
+        assert!(text.contains("Shift+방향키"), "{text}");
+        assert!(text.contains("포커스 카드 위치 이동"), "{text}");
+        assert!(text.contains("제목 길게 누름+드래그"), "{text}");
+        assert!(text.contains("카드 위치 이동 (Esc 취소)"), "{text}");
+        assert!(text.contains("카드 크기·순서·열 폭 기본 배치"), "{text}");
+        assert!(text.contains("스크롤바"), "{text}");
+
+        // 낮은 창은 잘림 표시를 유지
+        let text = render_to_text(&mut state, MIN_WIDTH, MIN_HEIGHT).join("\n");
+        assert!(text.contains("창을 키우면 전체 표시"), "{text}");
+    }
+
     #[test]
     fn every_tab_renders_at_minimum_size_without_panic() {
         for tab in ActiveTab::ALL {
@@ -1536,5 +1852,241 @@ mod tests {
             render_to_text(&mut state, MIN_WIDTH, MIN_HEIGHT);
             render_to_text(&mut state, 200, 60);
         }
+    }
+
+    #[test]
+    fn a_fresh_state_defaults_to_english_and_renders_english_chrome() {
+        let mut state = AppState::new(
+            sample_config(),
+            chrono::NaiveDate::from_ymd_opt(2026, 11, 15).unwrap(),
+        );
+        assert_eq!(state.lang, Lang::En);
+        let text = render_to_text(&mut state, 130, 40).join("\n");
+        assert!(text.contains("Overview"), "{text}");
+        assert!(text.contains("[q] Quit"), "{text}");
+        assert!(text.contains("[?] Help"), "{text}");
+        assert!(text.contains("[L] EN"), "{text}");
+        assert!(text.contains("Waiting for first poll"), "{text}");
+        assert!(!text.contains("개요"), "{text}");
+    }
+
+    #[test]
+    fn english_overview_and_footer_use_the_english_catalog() {
+        let mut state = sample_state_with_snapshot();
+        state.lang = Lang::En;
+        let text = render_to_text(&mut state, 130, 40).join("\n");
+        for expected in [
+            "1 Overview",
+            "serve running",
+            "Gateway ON",
+            "Cache hit rate",
+            "Saved today",
+            "Live events (4)",
+            "Event detail",
+            "[i] Reindex",
+            "[w] Window 1h",
+            "[r] Refresh",
+            "[t] Pin OFF",
+            "[l] Reset layout",
+            "[L] EN",
+            "[?] Help",
+            "[q] Quit",
+            "Tab Next tab",
+            "? All keys",
+        ] {
+            assert!(text.contains(expected), "{expected}\n{text}");
+        }
+        // 데이터 값은 번역하지 않음
+        assert!(text.contains("grep -> rg"));
+        assert!(text.contains("cliguard"));
+    }
+
+    #[test]
+    fn every_tab_renders_in_both_languages_with_help_and_quit_chips() {
+        for lang in [Lang::En, Lang::Ko] {
+            let (help, quit) = match lang {
+                Lang::En => ("[?] Help", "[q] Quit"),
+                Lang::Ko => ("[?] 도움말", "[q] 종료"),
+            };
+            for tab in ActiveTab::ALL {
+                for (width, height) in [(MIN_WIDTH, MIN_HEIGHT), (100, 30), (130, 40)] {
+                    let mut state = sample_state_with_tables();
+                    state.lang = lang;
+                    state.tab = tab;
+                    let rows = render_to_text(&mut state, width, height);
+                    let footer = &rows[usize::from(height) - 2];
+                    let case = format!("{lang:?} {tab:?} {width}x{height}: {footer}");
+                    assert!(footer.contains(help), "{case}");
+                    assert!(footer.contains(quit), "{case}");
+                    assert_eq!(state.hit_areas.tab_rects.len(), 7, "{case}");
+                    let kinds: Vec<UiAction> = state
+                        .hit_areas
+                        .button_rects
+                        .iter()
+                        .map(|(action, _)| *action)
+                        .collect();
+                    assert!(kinds.contains(&UiAction::ShowHelp), "{case}");
+                    assert!(kinds.contains(&UiAction::Quit), "{case}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn language_chip_is_the_last_left_chip_to_drop_and_survives_the_minimum_size() {
+        // 최소 크기: 다른 왼쪽 칩이 뒤쪽부터 먼저 빠지고 언어 칩·도움말·종료는 남음 (두 언어 모두)
+        for (lang, language, help, quit, reindex) in [
+            (Lang::En, "[L] EN", "[?] Help", "[q] Quit", "[i] Reindex"),
+            (Lang::Ko, "[L] KO", "[?] 도움말", "[q] 종료", "[i] 재색인"),
+        ] {
+            let mut state = sample_state_with_snapshot();
+            state.lang = lang;
+            let rows = render_to_text(&mut state, MIN_WIDTH, MIN_HEIGHT);
+            let footer = &rows[usize::from(MIN_HEIGHT) - 2];
+            for expected in [language, help, quit, reindex] {
+                assert!(footer.contains(expected), "{lang:?} {expected}: {footer}");
+            }
+            assert!(!footer.contains("[l]"), "{lang:?}: {footer}");
+            let actions: Vec<UiAction> = state
+                .hit_areas
+                .button_rects
+                .iter()
+                .map(|(action, _)| *action)
+                .collect();
+            for kept in [
+                UiAction::ToggleLanguage,
+                UiAction::ShowHelp,
+                UiAction::Quit,
+                UiAction::Reindex,
+            ] {
+                assert!(actions.contains(&kept), "{lang:?} {kept:?}");
+            }
+            assert!(!actions.contains(&UiAction::ResetLayout), "{lang:?}");
+
+            // 언어 칩 클릭 영역은 줄 안에 겹침 없이 놓이고, 도움말보다 앞
+            let rect_of = |wanted: UiAction| {
+                state
+                    .hit_areas
+                    .button_rects
+                    .iter()
+                    .find(|(action, _)| *action == wanted)
+                    .map(|(_, rect)| *rect)
+                    .unwrap()
+            };
+            let chip = rect_of(UiAction::ToggleLanguage);
+            assert_eq!(chip.y, MIN_HEIGHT - 2, "{lang:?}");
+            assert!(chip.width > 0 && chip.right() < rect_of(UiAction::ShowHelp).x);
+            for (action, rect) in &state.hit_areas.button_rects {
+                if *action != UiAction::ToggleLanguage {
+                    assert!(!rect.intersects(chip), "{lang:?} {action:?}");
+                }
+            }
+        }
+
+        // 넓으면 언어 칩이 왼쪽 그룹 마지막, 도움말보다 앞 (자리는 예전과 같음)
+        let mut wide = sample_state_with_snapshot();
+        wide.lang = Lang::En;
+        render_to_text(&mut wide, 130, 40);
+        let rect_of = |action: UiAction| {
+            wide.hit_areas
+                .button_rects
+                .iter()
+                .find(|(candidate, _)| *candidate == action)
+                .map(|(_, rect)| *rect)
+                .unwrap()
+        };
+        let language = rect_of(UiAction::ToggleLanguage);
+        assert!(rect_of(UiAction::ResetLayout).right() < language.x);
+        assert!(language.right() < rect_of(UiAction::ShowHelp).x);
+    }
+
+    #[test]
+    fn switching_the_language_changes_the_rendered_text_immediately() {
+        let mut state = sample_state_with_snapshot();
+        state.lang = Lang::En;
+        let english = render_to_text(&mut state, 130, 40).join("\n");
+        assert!(english.contains("1 Overview") && english.contains("[L] EN"));
+
+        state.perform_action(UiAction::ToggleLanguage);
+        let korean = render_to_text(&mut state, 130, 40).join("\n");
+        assert!(
+            korean.contains("1 개요") && korean.contains("[L] KO"),
+            "{korean}"
+        );
+        assert!(korean.contains("언어: 한국어"), "{korean}");
+        assert!(!korean.contains("Overview"), "{korean}");
+
+        state.perform_action(UiAction::ToggleLanguage);
+        let back = render_to_text(&mut state, 130, 40).join("\n");
+        assert!(
+            back.contains("1 Overview") && back.contains("Language: English"),
+            "{back}"
+        );
+    }
+
+    #[test]
+    fn english_hint_row_keeps_the_tail_hints_at_the_minimum_size() {
+        let mut state = sample_state_with_snapshot();
+        state.lang = Lang::En;
+        let rows = render_to_text(&mut state, MIN_WIDTH, MIN_HEIGHT);
+        let hints = &rows[usize::from(MIN_HEIGHT) - 1];
+        assert!(hints.contains("Tab Next tab"), "{hints}");
+        assert!(hints.contains("? All keys"), "{hints}");
+
+        // 넓은 화면에서는 포커스 카드 종류 맥락 안내가 앞에 붙음
+        let rows = render_to_text(&mut state, 130, 40);
+        let hints = &rows[39];
+        assert!(hints.contains("↑↓ Select row"), "{hints}");
+        assert!(hints.contains("s Sort column"), "{hints}");
+        assert!(hints.contains("Tab Next tab"), "{hints}");
+    }
+
+    #[test]
+    fn english_help_overlay_lists_the_language_key_and_keeps_key_names() {
+        let mut state = sample_state_with_snapshot();
+        state.lang = Lang::En;
+        state.show_help = true;
+        let text = render_to_text(&mut state, 130, 40).join("\n");
+        for expected in [
+            "Keyboard",
+            "Mouse",
+            "1-7, Tab, Shift-Tab",
+            "Switch language (EN / KO)",
+            "Shift+Arrows",
+            "q, Esc, Ctrl+C",
+            "Any key or click: close",
+        ] {
+            assert!(text.contains(expected), "{expected}\n{text}");
+        }
+        state.lang = Lang::Ko;
+        let text = render_to_text(&mut state, 130, 40).join("\n");
+        assert!(text.contains("표시 언어 전환 (EN / KO)"), "{text}");
+        assert!(text.contains("q, Esc, Ctrl+C"), "{text}");
+    }
+
+    #[test]
+    fn english_empty_states_toasts_and_size_gate_use_the_catalog() {
+        let mut state = sample_state_with_snapshot();
+        state.lang = Lang::En;
+        state.snapshot.events = Panel::Ready(Vec::new());
+        state.snapshot.minutes = Panel::Pending;
+        state.snapshot.overview = Panel::Failed(Failure::Error("query failed".to_string()));
+        let text = render_to_text(&mut state, 120, 36).join("\n");
+        assert!(text.contains("No events"), "{text}");
+        assert!(text.contains("Waiting for first poll"), "{text}");
+        assert!(text.contains("query failed"), "{text}");
+        assert!(text.contains("Press r to retry"), "{text}");
+
+        state.snapshot.db_state = DbState::Missing;
+        let text = render_to_text(&mut state, 100, 30).join("\n");
+        assert!(text.contains("No database"), "{text}");
+        assert!(text.contains("Run serve or index first"), "{text}");
+
+        let rows = render_to_text(&mut state, 50, 10);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Terminal too small (min 60x16, now 50x10)")),
+            "{rows:?}"
+        );
     }
 }

@@ -278,7 +278,7 @@ impl Drop for ResponseTap {
         let ctx = Arc::clone(&self.ctx);
         let insert = move || {
             if let Err(err) = ctx.store.insert_batch(&batch) {
-                eprintln!("[rap] 게이트웨이 행 저장 실패: {err:#}");
+                eprintln!("[cm] 게이트웨이 행 저장 실패: {err:#}");
             }
         };
         match tokio::runtime::Handle::try_current() {

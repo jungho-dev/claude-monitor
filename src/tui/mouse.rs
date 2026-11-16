@@ -1,9 +1,10 @@
 //! tui/mouse.rs
-//! 마우스 입력 상태 전이: 호버 강조, 클릭 포커스·선택·정렬·버튼, 카드 경계·열 경계 드래그, 휠 스크롤.
+//! 마우스 입력 상태 전이: 호버 강조, 클릭 포커스·선택·정렬·버튼, 카드 경계·열 경계 드래그, 카드 제목 길게 누름, 휠 스크롤.
 
 use crate::tui::cards::{
-    ColumnDrag, MAX_TABLE_COLUMNS, ScrollDrag, scroll_for_thumb, scroll_thumb,
+    CardPress, ColumnDrag, MAX_TABLE_COLUMNS, ScrollDrag, scroll_for_thumb, scroll_thumb,
 };
+use crate::tui::i18n::{self, Msg};
 use crate::tui::layout::{SplitAxis, SplitDrag};
 use crate::tui::sort::SortChange;
 use crate::tui::state::{AppState, ToastLevel, UiCommand};
@@ -15,23 +16,61 @@ use std::time::{Duration, Instant};
 const WHEEL_STEP: isize = 3;
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
 
+// 끌어 움직인 것이 있었는지를 실행 요청으로 바꿈
+fn save_request(saved: bool) -> UiCommand {
+    if saved {
+        UiCommand::SaveState
+    } else {
+        UiCommand::None
+    }
+}
+
 impl AppState {
     // 1. 마우스 이벤트 분배 ---------------------------------------------------
     // 직전 그리기에서 등록한 영역으로 판정, 반환 = 실행 요청
     pub fn handle_mouse_event(&mut self, mouse: MouseEvent) -> UiCommand {
+        self.handle_mouse_event_at(mouse, Instant::now())
+    }
+
+    // 시각을 주입하는 입구 (카드 제목 길게 누름·더블클릭 판정이 now 를 기준으로 함)
+    pub fn handle_mouse_event_at(&mut self, mouse: MouseEvent, now: Instant) -> UiCommand {
+        // 움직임 없이 오래 누른 뒤 처음 오는 이벤트도 이동 모드 진입 뒤에 처리
+        self.tick(now);
+
         // 도움말이 열려 있으면 클릭(닫기)과 버튼 뗌만 받음
         if self.show_help && !matches!(mouse.kind, MouseEventKind::Down(_) | MouseEventKind::Up(_))
         {
             return UiCommand::None;
         }
+        // 카드 이동 중: 버튼 없는 움직임·새 누름은 놓은 것으로 보고 미리보기 순서를 확정, 휠은 무시
+        if self.card_move.is_some() {
+            match mouse.kind {
+                MouseEventKind::Moved | MouseEventKind::Down(MouseButton::Left) => {
+                    return self.commit_card_move();
+                }
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => return UiCommand::None,
+                _ => {}
+            }
+        }
         let position = Position::new(mouse.column, mouse.row);
         match mouse.kind {
             MouseEventKind::Moved => {
+                // 버튼 없는 움직임 = 이미 뗌, 대기 중 누름은 일반 클릭으로 끝 (포커스는 누를 때 반영)
+                // 경계·열·썸 끌기도 Up 과 같게 끝내고, 끌어 움직인 것이 있었으면 저장 요청
+                self.card_press = None;
+                let saved = self.end_drags(Some(now));
                 self.track_hover(position);
-                UiCommand::None
+                save_request(saved)
             }
             MouseEventKind::Drag(MouseButton::Left) => {
-                if self.scroll_drag.is_some() {
+                if self.card_move.is_some() {
+                    self.preview_card_move(position);
+                } else if let Some(press) = self.card_press {
+                    // 누른 칸을 벗어나 시간이 차기 전에 끌면 취소 (같은 칸의 흔들림은 유지)
+                    if position != press.cell {
+                        self.card_press = None;
+                    }
+                } else if self.scroll_drag.is_some() {
                     self.drag_scrollbar(position);
                 } else if self.column_drag.is_some() {
                     self.drag_column(position);
@@ -41,18 +80,12 @@ impl AppState {
                 UiCommand::None
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                self.split_drag = None;
-                self.scroll_drag = None;
-
-                // 끌지 않고 떼 경계 클릭만 더블클릭 후보로 기록
-                if let Some(drag) = self.column_drag.take() {
-                    self.last_column_click = if drag.moved {
-                        None
-                    } else {
-                        Some((drag.card, drag.column, Instant::now()))
-                    };
+                // 시간이 차기 전에 놓으면 일반 클릭 (포커스는 누를 때 이미 반영)
+                self.card_press = None;
+                if self.card_move.is_some() {
+                    return self.commit_card_move();
                 }
-                UiCommand::None
+                save_request(self.end_drags(Some(now)))
             }
             MouseEventKind::ScrollUp => {
                 self.wheel_card(position, -WHEEL_STEP);
@@ -62,7 +95,12 @@ impl AppState {
                 self.wheel_card(position, WHEEL_STEP);
                 UiCommand::None
             }
-            MouseEventKind::Down(MouseButton::Left) => self.press_left(position),
+            MouseEventKind::Down(MouseButton::Left) => {
+                // 놓기를 놓친 이전 끌기는 새 누름보다 먼저 끝내고, 움직인 것이 있으면 저장도 함께 요청
+                let saved = self.end_drags(None);
+                let command = self.press_left(position, now);
+                self.merge_save(saved, command)
+            }
             _ => UiCommand::None,
         }
     }
@@ -128,13 +166,17 @@ impl AppState {
             self.split_drag = None;
             return;
         };
-        let (coord, unit) = match hit.axis {
-            SplitAxis::Columns => (i32::from(position.x), "열"),
-            SplitAxis::Rows => (i32::from(position.y), "행"),
+        let coord = match hit.axis {
+            SplitAxis::Columns => i32::from(position.x),
+            SplitAxis::Rows => i32::from(position.y),
         };
         if let Some((before, after)) = self.card_layout.drag_cut(&hit, coord - drag.grip) {
+            self.split_drag = Some(SplitDrag {
+                moved: true,
+                ..drag
+            });
             self.show_toast(
-                &format!("카드 크기 {before}{unit} : {after}{unit} (l 기본 배치)"),
+                &i18n::card_resized(self.lang, hit.axis, before, after),
                 ToastLevel::Info,
             );
         }
@@ -177,16 +219,18 @@ impl AppState {
     }
 
     // 6. 왼쪽 버튼 누름 -------------------------------------------------------
-    // 우선순위: 도움말 닫기, 스크롤바, 카드 경계 잡기, 열 경계 잡기, 카드 포커스, 버튼, 탭, 머리글 정렬, 행 선택
-    fn press_left(&mut self, position: Position) -> UiCommand {
+    // 우선순위: 도움말 닫기, 스크롤바, 카드 제목, 카드 경계 잡기, 열 경계 잡기, 카드 포커스, 버튼, 탭, 머리글 정렬, 행 선택
+    fn press_left(&mut self, position: Position, now: Instant) -> UiCommand {
         // 1. 도움말은 클릭 한 번에 닫기
         if self.show_help {
             self.show_help = false;
             return UiCommand::None;
         }
 
+        // 놓기를 놓친 이전 누름이 남았으면 버림 (이동 중이던 순서는 입구에서 이미 확정)
+        self.cancel_card_move();
+
         // 2. 스크롤바: 썸 잡기, 트랙 클릭은 한 화면 이동 (경계 잡기보다 우선)
-        self.scroll_drag = None;
         let track_hit = self
             .hit_areas
             .scroll_hits
@@ -213,8 +257,34 @@ impl AppState {
             return UiCommand::None;
         }
 
-        // 3. 카드 경계 잡기 (행·머리글 클릭보다 우선)
-        self.split_drag = None;
+        // 3. 카드 제목 글자 누름: 카드 포커스 후 길게 누름 대기 (카드 경계 잡기보다 우선, 이동 모드는 tick 이 진입)
+        // 순서를 바꿀 수 있는 그룹이 이번 프레임에 그려진 카드만, 나머지 테두리는 계속 크기 조절
+        let title_card = self
+            .hit_areas
+            .title_hits
+            .iter()
+            .find(|hit| hit.rect.contains(position))
+            .map(|hit| hit.card);
+        if let Some(card) = title_card
+            && let Some((group, index)) = card.reorder_slot()
+            && self
+                .hit_areas
+                .slot_groups
+                .iter()
+                .any(|slots| slots.group == group)
+        {
+            self.focused_card = Some((self.tab, card));
+            self.card_press = Some(CardPress {
+                card,
+                group,
+                index,
+                started: now,
+                cell: position,
+            });
+            return UiCommand::None;
+        }
+
+        // 4. 카드 경계 잡기 (행·머리글 클릭보다 우선)
         let grabbed = self
             .hit_areas
             .split_hits
@@ -231,17 +301,14 @@ impl AppState {
                 group: hit.group,
                 index: hit.index,
                 grip: i32::from(coord) - i32::from(cut_at),
+                moved: false,
             });
             self.split_hover = Some((hit.group, hit.index));
-            self.show_toast(
-                "카드 경계 드래그: 놓으면 고정, l 기본 배치",
-                ToastLevel::Info,
-            );
+            self.show_toast(i18n::text(self.lang, Msg::ToastSplitDrag), ToastLevel::Info);
             return UiCommand::None;
         }
 
-        // 4. 열 경계 잡기: 머리글 정렬보다 우선, 끌지 않고 떼 직후 다시 누르면 자동 폭 복원
-        self.column_drag = None;
+        // 5. 열 경계 잡기: 머리글 정렬보다 우선, 끌지 않고 떼 직후 다시 누르면 자동 폭 복원
         let column_hit = self
             .hit_areas
             .column_hits
@@ -251,13 +318,18 @@ impl AppState {
         if let Some(hit) = column_hit {
             self.focused_card = Some((self.tab, hit.card));
             let double_click = self.last_column_click.is_some_and(|(card, column, at)| {
-                card == hit.card && column == hit.column && at.elapsed() < DOUBLE_CLICK_WINDOW
+                card == hit.card
+                    && column == hit.column
+                    && now.saturating_duration_since(at) < DOUBLE_CLICK_WINDOW
             });
             self.last_column_click = None;
             if double_click {
                 self.column_widths[hit.card as usize] = [None; MAX_TABLE_COLUMNS];
-                self.show_toast("열 폭 자동 복원", ToastLevel::Info);
-                return UiCommand::None;
+                self.show_toast(
+                    i18n::text(self.lang, Msg::ToastColumnsAuto),
+                    ToastLevel::Info,
+                );
+                return UiCommand::SaveState;
             }
             self.column_drag = Some(ColumnDrag {
                 card: hit.card,
@@ -268,13 +340,13 @@ impl AppState {
             });
             self.column_hover = Some((hit.card, hit.column));
             self.show_toast(
-                "열 경계 드래그: 열 폭 조절, 더블클릭 자동 폭",
+                i18n::text(self.lang, Msg::ToastColumnDrag),
                 ToastLevel::Info,
             );
             return UiCommand::None;
         }
 
-        // 5. 카드 클릭: 테두리 강조 대상 변경, 카드 안 행·머리글 처리는 아래에서 계속
+        // 6. 카드 클릭: 테두리 강조 대상 변경, 카드 안 행·머리글 처리는 아래에서 계속
         let clicked_card = self
             .hit_areas
             .card_rects
@@ -285,7 +357,7 @@ impl AppState {
             self.focused_card = Some((self.tab, card));
         }
 
-        // 6. 하단·날짜 버튼
+        // 7. 하단·날짜 버튼
         let button = self
             .hit_areas
             .button_rects
@@ -296,7 +368,7 @@ impl AppState {
             return self.perform_action(action);
         }
 
-        // 7. 탭 전환
+        // 8. 탭 전환
         let tab = self
             .hit_areas
             .tab_rects
@@ -307,7 +379,7 @@ impl AppState {
             return self.switch_tab(tab);
         }
 
-        // 8. 표 머리글 클릭 정렬 (오름 -> 내림 -> 기본 순환, 선택 행은 같은 항목을 따라감)
+        // 9. 표 머리글 클릭 정렬 (숫자·시간 내림 -> 오름, 문자 오름 -> 내림, 세 번째 기본, 선택 행은 같은 항목을 따라감)
         let header = self
             .hit_areas
             .header_cells
@@ -319,7 +391,7 @@ impl AppState {
             return UiCommand::None;
         }
 
-        // 9. 표 본문 행 클릭: 선택 행 변경, 하단 상세 카드가 따라감
+        // 10. 표 본문 행 클릭: 선택 행 변경, 하단 상세 카드가 따라감
         let row_hit = self
             .hit_areas
             .row_hits
@@ -361,10 +433,49 @@ impl AppState {
             moved: true,
             ..drag
         });
-        self.show_toast(
-            &format!("열 폭 {width}칸 (더블클릭 자동 폭)"),
-            ToastLevel::Info,
-        );
+        self.show_toast(&i18n::column_width(self.lang, width), ToastLevel::Info);
+    }
+
+    // 8. 끌기 종료 ------------------------------------------------------------
+    // 놓음과 놓침(버튼 없는 움직임, 새 누름, 탭 전환, 크기 변경)이 같은 방식으로 경계·열·썸 끌기를 끝냄
+    // click_at 이 있으면 끌지 않고 뗀 열 경계 클릭을 더블클릭 후보로 기록, 반환 = 끌어 움직인 것이 있어 저장이 필요한지
+    pub fn end_drags(&mut self, click_at: Option<Instant>) -> bool {
+        let split_moved = self.split_drag.take().is_some_and(|drag| drag.moved);
+        self.scroll_drag = None;
+        let mut column_moved = false;
+        if let Some(drag) = self.column_drag.take() {
+            column_moved = drag.moved;
+            if drag.moved {
+                self.last_column_click = None;
+            } else if let Some(at) = click_at {
+                self.last_column_click = Some((drag.card, drag.column, at));
+            }
+        }
+        split_moved || column_moved
+    }
+
+    // 끌기 확정 저장과 다른 실행 요청을 합침, 다른 요청이 있으면 저장은 save_pending 에 남겨 이벤트 루프가 따로 보냄
+    pub fn merge_save(&mut self, saved: bool, command: UiCommand) -> UiCommand {
+        match (saved, command) {
+            (false, command) => command,
+            (true, UiCommand::None | UiCommand::SaveState) => UiCommand::SaveState,
+            (true, command) => {
+                self.save_pending = true;
+                command
+            }
+        }
+    }
+
+    // 9. 크기 변경 ------------------------------------------------------------
+    // 맞추어 그린 영역이 모두 바뀜으니 카드 이동 취소와 강조·끌기 해제, 끌어 움직인 경계·열 폭이 있었으면 저장 요청
+    pub fn handle_resize(&mut self) -> UiCommand {
+        self.cancel_card_move();
+        let saved = self.end_drags(None);
+        self.split_hover = None;
+        self.column_hover = None;
+        self.hover_card = None;
+        self.scroll_hover = None;
+        save_request(saved)
     }
 }
 
@@ -372,8 +483,8 @@ impl AppState {
 mod tests {
     use super::*;
     use crate::tui::cards::{CardId, ColumnHit, HeaderHit, ScrollHit, UiAction};
-    use crate::tui::layout::SplitGroup;
-    use crate::tui::sort::SortState;
+    use crate::tui::layout::{CardLayout, SplitGroup};
+    use crate::tui::sort::{SortKind, SortState};
     use crate::tui::state::ActiveTab;
     use crate::tui::test_support::{
         sample_state_with_long_report, sample_state_with_many_events, sample_state_with_many_tools,
@@ -650,10 +761,18 @@ mod tests {
         ));
         assert!(state.scroll_drag.is_none());
 
+        // 놓기를 놓쳐도 버튼 없는 움직임이 썸 끌기를 끝내고, 트랙 위 강조는 따로 유지
         click(&mut state, hit.track.x, hit.track.y);
-        state.handle_mouse_event(mouse(MouseEventKind::Moved, hit.track.x, hit.track.y));
         assert!(state.scroll_drag.is_some());
+        assert_eq!(
+            state.handle_mouse_event(mouse(MouseEventKind::Moved, hit.track.x, hit.track.y)),
+            UiCommand::None
+        );
+        assert!(state.scroll_drag.is_none());
         assert!(state.scroll_hover.is_some());
+
+        click(&mut state, hit.track.x, hit.track.y);
+        assert!(state.scroll_drag.is_some());
         state.switch_tab(ActiveTab::Hooks);
         assert!(state.scroll_drag.is_none());
         assert!(state.scroll_hover.is_none());
@@ -805,7 +924,7 @@ mod tests {
     }
 
     #[test]
-    fn header_click_sorts_every_table_card_ascending_first_then_descending() {
+    fn header_click_sorts_numbers_descending_first_and_text_ascending_first_on_every_table_card() {
         // (탭, 카드, 기본과 다른 열)
         let cases = [
             (ActiveTab::Overview, CardId::EventFeed, 2),
@@ -825,20 +944,21 @@ mod tests {
             draw(&mut state, 170, 60);
             let hit = header_hit(&state, card, column);
             click(&mut state, hit.rect.x, hit.rect.y);
+            let spec = crate::tui::sort::sort_spec(card).unwrap();
+            let number_first = spec.kinds[column] == SortKind::Number;
             let first = card_sort(&state, card);
             assert_eq!(first.column, column, "{card:?}");
-            assert!(!first.descending, "{card:?}");
+            assert_eq!(first.descending, number_first, "{card:?}");
 
             draw(&mut state, 170, 60);
             click(&mut state, hit.rect.x, hit.rect.y);
             let second = card_sort(&state, card);
             assert_eq!(second.column, column, "{card:?}");
-            assert!(second.descending, "{card:?}");
+            assert_eq!(second.descending, !number_first, "{card:?}");
 
             // 세 번째 클릭은 카드 기본 정렬로 복원
             draw(&mut state, 170, 60);
             click(&mut state, hit.rect.x, hit.rect.y);
-            let spec = crate::tui::sort::sort_spec(card).unwrap();
             assert_eq!(card_sort(&state, card), spec.default, "{card:?}");
         }
     }
@@ -861,12 +981,8 @@ mod tests {
         click(&mut state, rows.rect.x + 2, rows.rect.y + 1);
         assert_eq!(state.card_views[table].selected, 1);
 
-        // 호출 오름차순: Edit, Bash, Read 이라 Read 는 마지막 행
+        // 호출 내림차순 (숫자 열 첫 클릭): Read, Bash, Edit 이라 Read 는 첫 행
         let calls = header_hit(&state, CardId::ToolTable, 1);
-        click(&mut state, calls.rect.x, calls.rect.y);
-        assert_eq!(state.card_views[table].selected, 2);
-
-        // 호출 내림차순: Read, Bash, Edit 이라 Read 는 첫 행
         click(&mut state, calls.rect.x, calls.rect.y);
         assert_eq!(state.card_views[table].selected, 0);
         let buffer = draw(&mut state, 100, 30);
@@ -879,7 +995,12 @@ mod tests {
             .collect();
         assert!(text.contains("Read"));
 
+        // 호출 오름차순: Edit, Bash, Read 이라 Read 는 마지막 행
+        click(&mut state, calls.rect.x, calls.rect.y);
+        assert_eq!(state.card_views[table].selected, 2);
+
         // 세 번째 클릭으로 기본 정렬(합계 내림차순)에 돌아와도 Read 선택 유지
+        draw(&mut state, 100, 30);
         click(&mut state, calls.rect.x, calls.rect.y);
         assert_eq!(card_sort(&state, CardId::ToolTable).column, 5);
         assert_eq!(state.card_views[table].selected, 1);
@@ -1190,6 +1311,49 @@ mod tests {
     }
 
     #[test]
+    fn language_chip_click_switches_language_and_requests_a_save() {
+        let mut state = sample_state_with_snapshot();
+        state.lang = crate::tui::i18n::Lang::En;
+        draw(&mut state, 130, 40);
+        let chip = state
+            .hit_areas
+            .button_rects
+            .iter()
+            .find(|(action, _)| *action == UiAction::ToggleLanguage)
+            .map(|(_, rect)| *rect)
+            .unwrap();
+        assert_eq!(click(&mut state, chip.x + 1, chip.y), UiCommand::SaveState);
+        assert_eq!(state.lang, crate::tui::i18n::Lang::Ko);
+        assert_eq!(state.toast.as_ref().unwrap().text, "언어: 한국어");
+
+        // 다시 그린 뒤 같은 칩을 누르면 영어로
+        draw(&mut state, 130, 40);
+        let chip = state
+            .hit_areas
+            .button_rects
+            .iter()
+            .find(|(action, _)| *action == UiAction::ToggleLanguage)
+            .map(|(_, rect)| *rect)
+            .unwrap();
+        click(&mut state, chip.x + 1, chip.y);
+        assert_eq!(state.lang, crate::tui::i18n::Lang::En);
+    }
+
+    #[test]
+    fn drag_toasts_follow_the_active_language() {
+        let mut state = sample_state_with_tables();
+        state.lang = crate::tui::i18n::Lang::En;
+        state.handle_key_event(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        draw(&mut state, 130, 40);
+        let hit = state.hit_areas.split_hits[0];
+        click(&mut state, hit.grab.x, hit.grab.y);
+        assert_eq!(
+            state.toast.as_ref().unwrap().text,
+            "Dragging card edge: release to keep, l resets layout"
+        );
+    }
+
+    #[test]
     fn layout_reset_button_restores_default_cards_of_current_tab() {
         // 전체 버튼이 들어가는 폭 (100열에서는 오른쪽 그룹을 지키려 [l] 칩이 빠짐)
         let mut state = sample_state_with_tables();
@@ -1478,5 +1642,970 @@ mod tests {
             assert!(!hit.grab.intersects(track), "{hit:?}");
             assert!(!hit.grab.intersects(split.grab), "{hit:?}");
         }
+    }
+
+    fn settings_state() -> AppState {
+        let mut state = sample_state_with_tables();
+        state.tab = ActiveTab::Settings;
+        draw(&mut state, 110, 36);
+        state
+    }
+
+    fn title_pos(state: &AppState, card: CardId) -> (u16, u16) {
+        let rect = state
+            .hit_areas
+            .title_hits
+            .iter()
+            .find(|hit| hit.card == card)
+            .map(|hit| hit.rect)
+            .unwrap_or_else(|| panic!("{card:?} 제목 영역 없음"));
+        (rect.x + 1, rect.y)
+    }
+
+    fn slot_rects(state: &AppState, group: SplitGroup) -> Vec<Rect> {
+        state
+            .hit_areas
+            .slot_groups
+            .iter()
+            .find(|slots| slots.group == group)
+            .map(|slots| slots.slots.clone())
+            .unwrap_or_else(|| panic!("{group:?} 칸 배치 없음"))
+    }
+
+    fn after(base: Instant, millis: u64) -> Instant {
+        base + Duration::from_millis(millis)
+    }
+
+    fn press_at(state: &mut AppState, (column, row): (u16, u16), now: Instant) -> UiCommand {
+        state.handle_mouse_event_at(
+            mouse(MouseEventKind::Down(MouseButton::Left), column, row),
+            now,
+        )
+    }
+
+    fn drag_at(state: &mut AppState, column: u16, row: u16, now: Instant) -> UiCommand {
+        state.handle_mouse_event_at(
+            mouse(MouseEventKind::Drag(MouseButton::Left), column, row),
+            now,
+        )
+    }
+
+    fn up_at(state: &mut AppState, column: u16, row: u16, now: Instant) -> UiCommand {
+        state.handle_mouse_event_at(
+            mouse(MouseEventKind::Up(MouseButton::Left), column, row),
+            now,
+        )
+    }
+
+    fn settings_order(state: &AppState) -> [u8; 4] {
+        let order = state.card_layout.order_of(SplitGroup::SettingsRows);
+        [order[0], order[1], order[2], order[3]]
+    }
+
+    #[test]
+    fn title_press_released_before_400ms_is_a_plain_click_that_only_focuses() {
+        let mut state = settings_state();
+        let base = Instant::now();
+        let title = title_pos(&state, CardId::SettingsMcp);
+
+        assert_eq!(press_at(&mut state, title, base), UiCommand::None);
+        assert_eq!(
+            state.focused_card,
+            Some((ActiveTab::Settings, CardId::SettingsMcp))
+        );
+        assert!(state.card_press.is_some());
+        assert!(state.split_drag.is_none());
+
+        // 399ms: 아직 이동 모드 아님, 놓으면 포커스만 남음
+        assert!(!state.tick(after(base, 399)));
+        assert!(state.card_move.is_none());
+        assert_eq!(
+            up_at(&mut state, title.0, title.1, after(base, 399)),
+            UiCommand::None
+        );
+        assert!(state.card_press.is_none());
+        assert!(state.card_move.is_none());
+        assert_eq!(state.card_layout, CardLayout::default());
+        assert!(state.toast.is_none());
+        assert_eq!(
+            state.focused_card,
+            Some((ActiveTab::Settings, CardId::SettingsMcp))
+        );
+    }
+
+    #[test]
+    fn title_hold_for_400ms_enters_move_mode_without_any_mouse_motion() {
+        let mut state = settings_state();
+        let base = Instant::now();
+        let title = title_pos(&state, CardId::SettingsMcp);
+        press_at(&mut state, title, base);
+
+        // 남은 시간은 줄어들다 400ms 에서 0, 시계만으로 이동 모드 진입
+        assert_eq!(
+            state.press_remaining(after(base, 100)),
+            Some(Duration::from_millis(300))
+        );
+        assert!(!state.tick(after(base, 399)));
+        assert!(state.tick(after(base, 400)));
+        let moving = state.card_move.expect("이동 모드");
+        assert_eq!(moving.card, CardId::SettingsMcp);
+        assert_eq!((moving.group, moving.index), (SplitGroup::SettingsRows, 1));
+        assert_eq!(moving.target, 1);
+        assert_eq!(moving.baseline[..4], [0, 1, 2, 3]);
+        assert!(state.card_press.is_none());
+        assert_eq!(state.press_remaining(after(base, 401)), None);
+        // 이미 진입했으면 상태 변화 없음
+        assert!(!state.tick(after(base, 900)));
+    }
+
+    #[test]
+    fn dragging_before_the_hold_time_cancels_the_press_without_move_or_resize() {
+        let mut state = settings_state();
+        let base = Instant::now();
+        let title = title_pos(&state, CardId::SettingsMcp);
+        let slots = slot_rects(&state, SplitGroup::SettingsRows);
+        press_at(&mut state, title, base);
+
+        drag_at(&mut state, title.0, slots[3].y + 1, after(base, 100));
+        assert!(state.card_press.is_none());
+        assert!(state.card_move.is_none());
+        assert!(state.split_drag.is_none());
+        assert!(state.column_drag.is_none());
+        assert_eq!(state.card_layout, CardLayout::default());
+
+        // 취소한 뒤 시간이 흘러도 이동 모드로 가지 않고, 놓아도 저장 요청 없음
+        assert!(!state.tick(after(base, 600)));
+        assert!(state.card_move.is_none());
+        assert_eq!(
+            up_at(&mut state, title.0, slots[3].y + 1, after(base, 650)),
+            UiCommand::None
+        );
+        assert_eq!(state.card_layout, CardLayout::default());
+        // 크기 조절 알림도 나오지 않음
+        assert!(state.toast.is_none());
+    }
+
+    #[test]
+    fn dragging_in_move_mode_previews_insertion_and_release_commits_and_saves() {
+        let mut state = settings_state();
+        let base = Instant::now();
+        let slots = slot_rects(&state, SplitGroup::SettingsRows);
+        let title = title_pos(&state, CardId::SettingsHooks);
+        press_at(&mut state, title, base);
+        assert!(state.tick(after(base, 400)));
+
+        // 둘째 칸 -> 셋째 칸 -> 되돌아 첫 칸: 삽입 이동이라 사이 카드가 밀림
+        drag_at(&mut state, 20, slots[2].y + 1, after(base, 450));
+        assert_eq!(settings_order(&state), [1, 2, 0, 3]);
+        assert_eq!(state.card_move.unwrap().target, 2);
+        drag_at(&mut state, 20, slots[1].y + 1, after(base, 460));
+        assert_eq!(settings_order(&state), [1, 0, 2, 3]);
+        drag_at(&mut state, 20, slots[0].y + 1, after(base, 470));
+        assert_eq!(settings_order(&state), [0, 1, 2, 3]);
+
+        // 칸 밖(앱 바)은 마지막 목표 유지
+        drag_at(&mut state, 20, slots[3].y + 1, after(base, 480));
+        assert_eq!(settings_order(&state), [1, 2, 3, 0]);
+        drag_at(&mut state, 20, 0, after(base, 490));
+        assert_eq!(settings_order(&state), [1, 2, 3, 0]);
+        assert_eq!(state.card_move.unwrap().target, 3);
+
+        // 휠은 이동 중 무시 (순서·이동 모드 그대로)
+        state.handle_mouse_event_at(
+            mouse(MouseEventKind::ScrollDown, 20, slots[1].y + 1),
+            after(base, 495),
+        );
+        assert_eq!(settings_order(&state), [1, 2, 3, 0]);
+        assert!(state.card_move.is_some());
+
+        // 놓으면 확정: 알림과 저장 요청
+        assert_eq!(
+            up_at(&mut state, 20, 0, after(base, 500)),
+            UiCommand::SaveState
+        );
+        assert!(state.card_move.is_none());
+        assert_eq!(settings_order(&state), [1, 2, 3, 0]);
+        let toast = state.toast.as_ref().unwrap();
+        assert_eq!(toast.text, "카드 위치 변경 (l 기본 배치)");
+        assert_eq!(toast.level, ToastLevel::Info);
+
+        // 다음 프레임: 위 카드가 마지막 칸 영역에 그려짐
+        draw(&mut state, 110, 36);
+        assert_eq!(card_rect(&state, CardId::SettingsHooks), slots[3]);
+        assert_eq!(card_rect(&state, CardId::SettingsMcp), slots[0]);
+    }
+
+    #[test]
+    fn releasing_on_the_original_slot_changes_nothing_and_requests_no_save() {
+        let mut state = settings_state();
+        let base = Instant::now();
+        let slots = slot_rects(&state, SplitGroup::SettingsRows);
+        let title = title_pos(&state, CardId::SettingsAgents);
+        press_at(&mut state, title, base);
+        state.tick(after(base, 400));
+        drag_at(&mut state, 20, slots[0].y + 1, after(base, 420));
+        drag_at(&mut state, 20, slots[2].y + 1, after(base, 430));
+        assert_eq!(
+            up_at(&mut state, 20, slots[2].y + 1, after(base, 440)),
+            UiCommand::None
+        );
+        assert!(state.card_move.is_none());
+        assert_eq!(state.card_layout, CardLayout::default());
+        assert!(state.toast.is_none());
+    }
+
+    #[test]
+    fn first_event_after_the_hold_time_starts_the_move_even_without_a_tick() {
+        let mut state = settings_state();
+        let base = Instant::now();
+        let slots = slot_rects(&state, SplitGroup::SettingsRows);
+        let title = title_pos(&state, CardId::SettingsHooks);
+        press_at(&mut state, title, base);
+
+        // 이벤트 루프가 tick 을 못 돌렸어도 450ms 에 온 드래그는 이동으로 처리
+        drag_at(&mut state, 20, slots[1].y + 1, after(base, 450));
+        assert!(state.card_press.is_none());
+        assert_eq!(settings_order(&state), [1, 0, 2, 3]);
+        assert_eq!(
+            up_at(&mut state, 20, slots[1].y + 1, after(base, 460)),
+            UiCommand::SaveState
+        );
+    }
+
+    #[test]
+    fn escape_restores_the_order_from_before_the_press() {
+        let mut state = settings_state();
+        let base = Instant::now();
+        let slots = slot_rects(&state, SplitGroup::SettingsRows);
+        let title = title_pos(&state, CardId::SettingsHooks);
+        press_at(&mut state, title, base);
+        state.tick(after(base, 400));
+        drag_at(&mut state, 20, slots[3].y + 1, after(base, 420));
+        assert_eq!(settings_order(&state), [1, 2, 3, 0]);
+
+        state.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(state.card_move.is_none());
+        assert_eq!(state.card_layout, CardLayout::default());
+        assert!(!state.should_quit);
+
+        // 취소 뒤 남은 끌기·놓기는 아무 일도 하지 않음
+        drag_at(&mut state, 20, slots[1].y + 1, after(base, 430));
+        assert_eq!(
+            up_at(&mut state, 20, slots[1].y + 1, after(base, 440)),
+            UiCommand::None
+        );
+        assert_eq!(state.card_layout, CardLayout::default());
+
+        // 크기 변경 등 외부 취소 경로도 같은 복원
+        press_at(&mut state, title, after(base, 500));
+        state.tick(after(base, 900));
+        drag_at(&mut state, 20, slots[2].y + 1, after(base, 910));
+        assert_ne!(state.card_layout, CardLayout::default());
+        assert!(state.cancel_card_move());
+        assert_eq!(state.card_layout, CardLayout::default());
+        assert!(!state.cancel_card_move());
+    }
+
+    fn moved_at(state: &mut AppState, column: u16, row: u16, now: Instant) -> UiCommand {
+        state.handle_mouse_event_at(mouse(MouseEventKind::Moved, column, row), now)
+    }
+
+    #[test]
+    fn a_lost_button_release_is_committed_by_the_first_moved_event_and_saved() {
+        let mut state = settings_state();
+        let base = Instant::now();
+        let slots = slot_rects(&state, SplitGroup::SettingsRows);
+        let title = title_pos(&state, CardId::SettingsHooks);
+        press_at(&mut state, title, base);
+        state.tick(after(base, 400));
+        drag_at(&mut state, 20, slots[2].y + 1, after(base, 420));
+        assert_eq!(settings_order(&state), [1, 2, 0, 3]);
+
+        // 창 밖에서 놓아 Up 이 오지 않은 경우: 버튼 없는 움직임 = 뗌, 미리보기 순서를 그대로 확정
+        assert_eq!(
+            moved_at(&mut state, 5, 5, after(base, 430)),
+            UiCommand::SaveState
+        );
+        assert!(state.card_move.is_none());
+        assert_eq!(settings_order(&state), [1, 2, 0, 3]);
+        let toast = state.toast.as_ref().unwrap();
+        assert_eq!(toast.text, "카드 위치 변경 (l 기본 배치)");
+        assert_eq!(toast.level, ToastLevel::Info);
+
+        // 확정 뒤 늦게 온 Up 은 아무 일도 하지 않음
+        assert_eq!(up_at(&mut state, 5, 5, after(base, 440)), UiCommand::None);
+        assert_eq!(settings_order(&state), [1, 2, 0, 3]);
+    }
+
+    #[test]
+    fn moved_in_move_mode_without_a_change_commits_nothing_and_requests_no_save() {
+        let mut state = settings_state();
+        let base = Instant::now();
+        let slots = slot_rects(&state, SplitGroup::SettingsRows);
+        let title = title_pos(&state, CardId::SettingsAgents);
+        press_at(&mut state, title, base);
+        state.tick(after(base, 400));
+        drag_at(&mut state, 20, slots[0].y + 1, after(base, 410));
+        drag_at(&mut state, 20, slots[2].y + 1, after(base, 420));
+
+        // 원래 칸으로 돌아온 상태에서 뗌: 알림도 저장도 없음
+        assert_eq!(
+            moved_at(&mut state, 5, 5, after(base, 430)),
+            UiCommand::None
+        );
+        assert!(state.card_move.is_none());
+        assert_eq!(state.card_layout, CardLayout::default());
+        assert!(state.toast.is_none());
+    }
+
+    #[test]
+    fn a_new_press_in_move_mode_commits_the_preview_like_a_release() {
+        let mut state = settings_state();
+        let base = Instant::now();
+        let slots = slot_rects(&state, SplitGroup::SettingsRows);
+        let title = title_pos(&state, CardId::SettingsHooks);
+        press_at(&mut state, title, base);
+        state.tick(after(base, 400));
+        drag_at(&mut state, 20, slots[3].y + 1, after(base, 420));
+        assert_eq!(settings_order(&state), [1, 2, 3, 0]);
+
+        // Up 이 오지 않고 새 누름이 오면 확정(알림·저장), 그 누름은 확정에 쓰이고 새 대기를 만들지 않음
+        assert_eq!(
+            press_at(&mut state, (3, 3), after(base, 450)),
+            UiCommand::SaveState
+        );
+        assert!(state.card_move.is_none());
+        assert!(state.card_press.is_none());
+        assert_eq!(settings_order(&state), [1, 2, 3, 0]);
+        assert_eq!(
+            state.toast.as_ref().unwrap().text,
+            "카드 위치 변경 (l 기본 배치)"
+        );
+
+        // 순서가 그대로면 새 누름도 아무것도 요청하지 않음
+        let mut unchanged = settings_state();
+        press_at(&mut unchanged, title, base);
+        unchanged.tick(after(base, 400));
+        assert_eq!(
+            press_at(&mut unchanged, (3, 3), after(base, 450)),
+            UiCommand::None
+        );
+        assert!(unchanged.card_move.is_none());
+        assert_eq!(unchanged.card_layout, CardLayout::default());
+        assert!(unchanged.toast.is_none());
+    }
+
+    #[test]
+    fn moved_during_a_pending_press_ends_it_as_a_plain_click_and_never_enters_move_mode() {
+        let mut state = settings_state();
+        let base = Instant::now();
+        let title = title_pos(&state, CardId::SettingsMcp);
+        press_at(&mut state, title, base);
+        assert!(state.card_press.is_some());
+
+        // 버튼 없는 움직임: 대기 중 누름 종료, 포커스는 누를 때 이미 반영
+        assert_eq!(
+            moved_at(&mut state, title.0 + 1, title.1, after(base, 100)),
+            UiCommand::None
+        );
+        assert!(state.card_press.is_none());
+        assert_eq!(
+            state.focused_card,
+            Some((ActiveTab::Settings, CardId::SettingsMcp))
+        );
+
+        // 400ms 가 지나도 이동 모드로 가지 않음
+        assert!(!state.tick(after(base, 400)));
+        assert!(state.card_move.is_none());
+        assert_eq!(state.card_layout, CardLayout::default());
+        assert!(state.toast.is_none());
+        assert_eq!(state.press_remaining(after(base, 400)), None);
+    }
+
+    #[test]
+    fn a_key_other_than_escape_in_a_timer_started_move_mode_does_not_leave_the_ui_stuck() {
+        let base = Instant::now();
+        let plain = |code: KeyCode| KeyEvent::new(code, KeyModifiers::NONE);
+        for code in [
+            KeyCode::Char('q'),
+            KeyCode::Char('2'),
+            KeyCode::Char('l'),
+            KeyCode::Tab,
+            KeyCode::Down,
+            KeyCode::Enter,
+        ] {
+            // 놓기를 놓치고 움직임도 없이 400ms: 시계만으로 이동 모드 진입
+            let mut state = settings_state();
+            let title = title_pos(&state, CardId::SettingsMcp);
+            press_at(&mut state, title, base);
+            assert!(state.tick(after(base, 400)));
+
+            // 키는 종료·탭 전환·배치 변경 없이 무시, 이동 모드 유지
+            assert_eq!(
+                state.handle_key_event(plain(code)),
+                UiCommand::None,
+                "{code:?}"
+            );
+            assert!(state.card_move.is_some(), "{code:?}");
+            assert!(!state.should_quit, "{code:?}");
+            assert_eq!(state.tab, ActiveTab::Settings, "{code:?}");
+            assert_eq!(state.card_layout, CardLayout::default(), "{code:?}");
+
+            // 다음 버튼 없는 움직임이 놓은 것으로 보고 끝냄 (순서 그대로라 저장 없음)
+            assert_eq!(
+                moved_at(&mut state, 5, 5, after(base, 500)),
+                UiCommand::None
+            );
+            assert!(state.card_move.is_none(), "{code:?}");
+
+            // 이동 모드가 끝난 뒤에는 일반 키가 다시 동작
+            state.handle_key_event(plain(KeyCode::Char('3')));
+            assert_eq!(state.tab, ActiveTab::Hooks, "{code:?}");
+        }
+
+        // Esc 는 놓은 뒤 오는 이벤트 없이도 즉시 취소
+        let mut state = settings_state();
+        let title = title_pos(&state, CardId::SettingsMcp);
+        press_at(&mut state, title, base);
+        assert!(state.tick(after(base, 400)));
+        state.handle_key_event(plain(KeyCode::Char('x')));
+        state.handle_key_event(plain(KeyCode::Esc));
+        assert!(state.card_move.is_none());
+        assert!(!state.should_quit);
+        assert_eq!(state.card_layout, CardLayout::default());
+
+        // 키 뒤 새 누름은 확정에 쓰이고 새 대기를 만들지 않음
+        let mut state = settings_state();
+        press_at(&mut state, title, base);
+        assert!(state.tick(after(base, 400)));
+        state.handle_key_event(plain(KeyCode::Char('x')));
+        assert_eq!(
+            press_at(&mut state, (3, 3), after(base, 450)),
+            UiCommand::None
+        );
+        assert!(state.card_move.is_none());
+        assert!(state.card_press.is_none());
+    }
+
+    #[test]
+    fn same_cell_jitter_keeps_the_press_while_another_cell_cancels_it() {
+        let mut state = settings_state();
+        let base = Instant::now();
+        let title = title_pos(&state, CardId::SettingsMcp);
+        press_at(&mut state, title, base);
+        assert_eq!(
+            state.card_press.map(|press| press.cell),
+            Some(Position::new(title.0, title.1))
+        );
+
+        // 같은 칸의 끌기(떨림)는 대기 유지, 400ms 에 이동 모드 진입
+        assert_eq!(
+            drag_at(&mut state, title.0, title.1, after(base, 100)),
+            UiCommand::None
+        );
+        assert!(state.card_press.is_some());
+        assert!(state.split_drag.is_none());
+        drag_at(&mut state, title.0, title.1, after(base, 300));
+        assert!(state.card_press.is_some());
+        assert!(state.tick(after(base, 400)));
+        let moving = state.card_move.expect("이동 모드");
+        assert_eq!(moving.card, CardId::SettingsMcp);
+
+        // 다른 칸으로 끌면 대기 취소: 가로 한 칸 옆도 취소
+        let mut other = settings_state();
+        press_at(&mut other, title, base);
+        drag_at(&mut other, title.0 + 1, title.1, after(base, 100));
+        assert!(other.card_press.is_none());
+        assert!(!other.tick(after(base, 400)));
+        assert!(other.card_move.is_none());
+        assert_eq!(other.card_layout, CardLayout::default());
+    }
+
+    #[test]
+    fn title_press_does_not_grab_the_split_on_a_lower_card_but_the_rest_of_the_border_does() {
+        let mut state = settings_state();
+        let base = Instant::now();
+        let mcp = card_rect(&state, CardId::SettingsMcp);
+        let split = state
+            .hit_areas
+            .split_hits
+            .iter()
+            .find(|hit| hit.group == SplitGroup::SettingsRows && hit.index == 0)
+            .copied()
+            .unwrap();
+        let title = title_pos(&state, CardId::SettingsMcp);
+
+        // 제목 글자는 경계 잡기 영역 안이지만 길게 누름이 이김
+        assert!(split.grab.contains(Position::new(title.0, title.1)));
+        press_at(&mut state, title, base);
+        assert!(state.split_drag.is_none());
+        assert!(state.card_press.is_some());
+        up_at(&mut state, title.0, title.1, after(base, 50));
+
+        // 같은 테두리 줄의 제목 밖은 계속 크기 조절
+        press_at(&mut state, (mcp.right() - 6, mcp.y), after(base, 100));
+        assert!(state.card_press.is_none());
+        assert_eq!(
+            state.split_drag.map(|drag| (drag.group, drag.index)),
+            Some((SplitGroup::SettingsRows, 0))
+        );
+    }
+
+    #[test]
+    fn title_without_a_drawn_slot_group_falls_back_to_a_normal_click() {
+        // 이벤트 패널이 준비되지 않으면 피드는 안내 카드(칸 분할 없음)
+        let mut state = sample_state_with_snapshot();
+        state.snapshot.events = crate::tui::state::Panel::Pending;
+        draw(&mut state, 130, 40);
+        assert!(
+            state
+                .hit_areas
+                .slot_groups
+                .iter()
+                .all(|slots| slots.group != SplitGroup::OverviewFeedCols)
+        );
+        let title = title_pos(&state, CardId::EventFeed);
+        press_at(&mut state, title, Instant::now());
+        assert!(state.card_press.is_none());
+        // 기존 동작 그대로: 아래 카드의 위 테두리는 줄 경계 크기 조절 잡기
+        assert_eq!(
+            state.split_drag.map(|drag| drag.group),
+            Some(SplitGroup::OverviewRows)
+        );
+        state.split_drag = None;
+
+        // 순서 대상이 아닌 서버 상태 카드 제목도 일반 클릭
+        let status = title_pos(&state, CardId::ServerStatus);
+        press_at(&mut state, status, Instant::now());
+        assert!(state.card_press.is_none());
+        assert_eq!(
+            state.focused_card,
+            Some((ActiveTab::Overview, CardId::ServerStatus))
+        );
+    }
+
+    fn shift_press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::SHIFT)
+    }
+
+    #[test]
+    fn shift_arrows_do_nothing_when_the_focused_cards_group_is_not_drawn_this_frame() {
+        // 데이터베이스 안내 카드만 보이는 도구 탭: 포커스는 탭의 주 카드(도구 표), 그룹은 그려지지 않음
+        let mut state = sample_state_with_tables();
+        state.tab = ActiveTab::Tools;
+        state.snapshot.db_state = crate::tui::state::DbState::Missing;
+        draw(&mut state, 100, 30);
+        assert_eq!(state.focused_card_id(), CardId::ToolTable);
+        assert!(
+            state
+                .hit_areas
+                .slot_groups
+                .iter()
+                .all(|slots| slots.group != SplitGroup::ToolsRows)
+        );
+        for code in [KeyCode::Up, KeyCode::Down, KeyCode::Left, KeyCode::Right] {
+            assert_eq!(state.handle_key_event(shift_press(code)), UiCommand::None);
+        }
+        assert_eq!(state.card_layout, CardLayout::default());
+        assert!(state.toast.is_none());
+
+        // 이벤트 패널이 준비되지 않아 피드가 안내 카드인 개요 탭도 같음
+        let mut feed = sample_state_with_snapshot();
+        feed.snapshot.events = crate::tui::state::Panel::Pending;
+        draw(&mut feed, 130, 40);
+        assert_eq!(feed.focused_card_id(), CardId::EventFeed);
+        for code in [KeyCode::Left, KeyCode::Right] {
+            assert_eq!(feed.handle_key_event(shift_press(code)), UiCommand::None);
+        }
+        assert_eq!(feed.card_layout, CardLayout::default());
+        assert!(feed.toast.is_none());
+
+        // 그려진 그룹의 카드는 그대로 이동
+        let mut drawn = sample_state_with_tables();
+        drawn.tab = ActiveTab::Tools;
+        draw(&mut drawn, 100, 30);
+        assert!(
+            drawn
+                .hit_areas
+                .slot_groups
+                .iter()
+                .any(|slots| slots.group == SplitGroup::ToolsRows)
+        );
+        assert_eq!(
+            drawn.handle_key_event(shift_press(KeyCode::Down)),
+            UiCommand::SaveState
+        );
+        assert_eq!(
+            drawn.card_layout.order_of(SplitGroup::ToolsRows)[..2],
+            [1, 0]
+        );
+    }
+
+    #[test]
+    fn resize_during_a_moved_column_drag_requests_a_save_and_keeps_the_dragged_width() {
+        let mut state = hooks_state();
+        draw(&mut state, 200, 30);
+        let route = column_hit(&state, CardId::HookTable, 0);
+        click(&mut state, route.grab.x, route.grab.y);
+        drag_to(&mut state, route.grab.x + 3, route.grab.y);
+        assert!(state.column_drag.is_some_and(|drag| drag.moved));
+        let dragged = state.column_widths[CardId::HookTable as usize][0];
+        assert!(dragged.is_some());
+        state.hover_card = Some(CardId::HookTable);
+        state.column_hover = Some((CardId::HookTable, 0));
+
+        // 끌기 상태 해제, 끌어 정한 폭은 저장 요청으로 보존
+        assert_eq!(state.handle_resize(), UiCommand::SaveState);
+        assert!(state.column_drag.is_none());
+        assert!(state.column_hover.is_none());
+        assert!(state.hover_card.is_none());
+        assert_eq!(state.column_widths[CardId::HookTable as usize][0], dragged);
+
+        // 늦게 오는 Up 은 저장 재요청 없음
+        assert_eq!(
+            state.handle_mouse_event(mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                route.grab.x + 3,
+                route.grab.y
+            )),
+            UiCommand::None
+        );
+    }
+
+    #[test]
+    fn resize_during_a_moved_split_drag_requests_a_save() {
+        let mut state = sample_state_with_tables();
+        state.tab = ActiveTab::Tools;
+        draw(&mut state, 100, 30);
+        let hit = state.hit_areas.split_hits[0];
+        click(&mut state, hit.grab.x + 4, hit.grab.y);
+        drag_to(&mut state, hit.grab.x + 4, hit.grab.y - 2);
+        assert!(state.split_drag.is_some_and(|drag| drag.moved));
+        let ratios = state.card_layout.custom_ratios(SplitGroup::ToolsRows);
+        assert!(ratios.is_some());
+        state.split_hover = Some((SplitGroup::ToolsRows, 0));
+
+        assert_eq!(state.handle_resize(), UiCommand::SaveState);
+        assert!(state.split_drag.is_none());
+        assert!(state.split_hover.is_none());
+        assert_eq!(
+            state.card_layout.custom_ratios(SplitGroup::ToolsRows),
+            ratios
+        );
+    }
+
+    #[test]
+    fn resize_without_a_moved_drag_requests_nothing_and_clears_the_gesture_state() {
+        // 끌지 않고 잡기만 한 열 경계·카드 경계
+        let mut state = hooks_state();
+        draw(&mut state, 200, 30);
+        let route = column_hit(&state, CardId::HookTable, 0);
+        click(&mut state, route.grab.x, route.grab.y);
+        assert!(state.column_drag.is_some_and(|drag| !drag.moved));
+        assert_eq!(state.handle_resize(), UiCommand::None);
+        assert!(state.column_drag.is_none());
+
+        let mut tools = sample_state_with_tables();
+        tools.tab = ActiveTab::Tools;
+        draw(&mut tools, 100, 30);
+        let hit = tools.hit_areas.split_hits[0];
+        click(&mut tools, hit.grab.x + 4, hit.grab.y);
+        assert!(tools.split_drag.is_some_and(|drag| !drag.moved));
+        assert_eq!(tools.handle_resize(), UiCommand::None);
+        assert!(tools.split_drag.is_none());
+
+        // 스크롤바 썸 끌기와 잡담만된 강조도 지움
+        tools.scroll_drag = Some(ScrollDrag {
+            card: CardId::ToolTable,
+            grip: 0,
+        });
+        tools.scroll_hover = Some(CardId::ToolTable);
+        assert_eq!(tools.handle_resize(), UiCommand::None);
+        assert!(tools.scroll_drag.is_none());
+        assert!(tools.scroll_hover.is_none());
+    }
+
+    #[test]
+    fn resize_cancels_a_card_move_and_restores_the_order_without_saving() {
+        let mut state = settings_state();
+        let base = Instant::now();
+        let slots = slot_rects(&state, SplitGroup::SettingsRows);
+        let title = title_pos(&state, CardId::SettingsHooks);
+        press_at(&mut state, title, base);
+        state.tick(after(base, 400));
+        drag_at(&mut state, 20, slots[3].y + 1, after(base, 420));
+        assert_eq!(settings_order(&state), [1, 2, 3, 0]);
+
+        assert_eq!(state.handle_resize(), UiCommand::None);
+        assert!(state.card_move.is_none());
+        assert_eq!(state.card_layout, CardLayout::default());
+    }
+
+    #[test]
+    fn split_and_column_drags_request_a_layout_save_only_when_something_moved() {
+        // 경계를 끌어 놓으면 저장 요청, 끌지 않고 놓으면 없음
+        let mut state = sample_state_with_tables();
+        state.tab = ActiveTab::Tools;
+        draw(&mut state, 100, 30);
+        let hit = state.hit_areas.split_hits[0];
+        click(&mut state, hit.grab.x + 4, hit.grab.y);
+        assert_eq!(
+            state.handle_mouse_event(mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                hit.grab.x + 4,
+                hit.grab.y
+            )),
+            UiCommand::None
+        );
+        click(&mut state, hit.grab.x + 4, hit.grab.y);
+        drag_to(&mut state, hit.grab.x + 4, hit.grab.y - 2);
+        assert_eq!(
+            state.handle_mouse_event(mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                hit.grab.x + 4,
+                hit.grab.y - 2
+            )),
+            UiCommand::SaveState
+        );
+
+        // 열 경계: 끌면 저장, 끌지 않은 클릭은 없음, 더블클릭 자동 폭은 저장
+        let mut state = hooks_state();
+        draw(&mut state, 200, 30);
+        let route = column_hit(&state, CardId::HookTable, 0);
+        click(&mut state, route.grab.x, route.grab.y);
+        drag_to(&mut state, route.grab.x + 3, route.grab.y);
+        let up = mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            route.grab.x + 3,
+            route.grab.y,
+        );
+        assert_eq!(state.handle_mouse_event(up), UiCommand::SaveState);
+
+        draw(&mut state, 200, 30);
+        let moved = column_hit(&state, CardId::HookTable, 0);
+        click(&mut state, moved.grab.x, moved.grab.y);
+        assert_eq!(
+            state.handle_mouse_event(mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                moved.grab.x,
+                moved.grab.y
+            )),
+            UiCommand::None
+        );
+        assert_eq!(
+            click(&mut state, moved.grab.x, moved.grab.y),
+            UiCommand::SaveState
+        );
+        assert!(
+            state.column_widths[CardId::HookTable as usize]
+                .iter()
+                .all(Option::is_none)
+        );
+    }
+
+    #[test]
+    fn a_lost_release_is_ended_by_the_first_moved_event_for_column_drags() {
+        let mut state = hooks_state();
+        let base = Instant::now();
+        draw(&mut state, 200, 30);
+        let route = column_hit(&state, CardId::HookTable, 0);
+        let grab = (route.grab.x, route.grab.y);
+
+        // 끌어 움직인 뒤 Up 없이 버튼 없는 움직임: 끌기 종료, 폭 유지, 저장 요청 (더블클릭 후보는 없음)
+        press_at(&mut state, grab, base);
+        drag_at(&mut state, grab.0 + 3, grab.1, after(base, 50));
+        let dragged = state.column_widths[CardId::HookTable as usize][0];
+        assert!(dragged.is_some());
+        assert_eq!(
+            moved_at(&mut state, grab.0 + 6, grab.1, after(base, 60)),
+            UiCommand::SaveState
+        );
+        assert!(state.column_drag.is_none());
+        assert!(state.last_column_click.is_none());
+        assert_eq!(state.column_widths[CardId::HookTable as usize][0], dragged);
+
+        // 이후 움직임과 늦게 온 Up 은 저장을 다시 요청하지 않음
+        assert_eq!(
+            moved_at(&mut state, grab.0 + 7, grab.1, after(base, 70)),
+            UiCommand::None
+        );
+        assert_eq!(
+            up_at(&mut state, grab.0 + 7, grab.1, after(base, 80)),
+            UiCommand::None
+        );
+
+        // 끌지 않고 잡기만 했으면 저장 없이 끝나고 더블클릭 후보만 남음
+        draw(&mut state, 200, 30);
+        let moved = column_hit(&state, CardId::HookTable, 0);
+        press_at(&mut state, (moved.grab.x, moved.grab.y), after(base, 500));
+        assert_eq!(
+            moved_at(&mut state, 0, 0, after(base, 520)),
+            UiCommand::None
+        );
+        assert!(state.column_drag.is_none());
+        assert!(state.last_column_click.is_some());
+    }
+
+    #[test]
+    fn a_lost_release_is_ended_by_the_first_moved_event_for_split_and_scroll_drags() {
+        let mut state = sample_state_with_tables();
+        state.tab = ActiveTab::Tools;
+        let base = Instant::now();
+        draw(&mut state, 100, 30);
+        let hit = state.hit_areas.split_hits[0];
+
+        press_at(&mut state, (hit.grab.x + 4, hit.grab.y), base);
+        drag_at(&mut state, hit.grab.x + 4, hit.grab.y - 2, after(base, 50));
+        assert!(state.split_drag.is_some_and(|drag| drag.moved));
+        assert_eq!(
+            moved_at(&mut state, hit.grab.x + 4, hit.grab.y - 3, after(base, 60)),
+            UiCommand::SaveState
+        );
+        assert!(state.split_drag.is_none());
+
+        // 끌지 않은 카드 경계 잡기는 저장 없이 끝남
+        draw(&mut state, 100, 30);
+        let again = state.hit_areas.split_hits[0];
+        press_at(
+            &mut state,
+            (again.grab.x + 4, again.grab.y),
+            after(base, 500),
+        );
+        assert!(state.split_drag.is_some_and(|drag| !drag.moved));
+        assert_eq!(
+            moved_at(&mut state, 0, 0, after(base, 510)),
+            UiCommand::None
+        );
+        assert!(state.split_drag.is_none());
+
+        // 스크롤바 썸 끌기는 저장할 것이 없고 끝나기만 함
+        let mut tools = sample_state_with_many_tools(40);
+        draw(&mut tools, 100, 30);
+        let thumb = scroll_hit(&tools, CardId::ToolTable);
+        press_at(&mut tools, (thumb.track.x, thumb.track.y), base);
+        assert!(tools.scroll_drag.is_some());
+        assert_eq!(
+            moved_at(
+                &mut tools,
+                thumb.track.x,
+                thumb.track.y + 2,
+                after(base, 20)
+            ),
+            UiCommand::None
+        );
+        assert!(tools.scroll_drag.is_none());
+    }
+
+    #[test]
+    fn a_new_press_resets_every_drag_state_and_commits_a_moved_one() {
+        let mut state = hooks_state();
+        let base = Instant::now();
+        draw(&mut state, 200, 30);
+        let route = column_hit(&state, CardId::HookTable, 0);
+        let grab = (route.grab.x, route.grab.y);
+        press_at(&mut state, grab, base);
+        drag_at(&mut state, grab.0 + 3, grab.1, after(base, 50));
+        let dragged = state.column_widths[CardId::HookTable as usize][0];
+        state.scroll_drag = Some(ScrollDrag {
+            card: CardId::HookTable,
+            grip: 0,
+        });
+
+        // Up 이 오지 않고 다른 곳을 누름: 이전 끌기를 모두 끝내고 움직인 폭은 저장 요청
+        assert_eq!(
+            press_at(&mut state, (0, 0), after(base, 100)),
+            UiCommand::SaveState
+        );
+        assert!(state.column_drag.is_none());
+        assert!(state.scroll_drag.is_none());
+        assert!(state.split_drag.is_none());
+        assert_eq!(state.column_widths[CardId::HookTable as usize][0], dragged);
+        assert!(!state.save_pending);
+
+        // 다른 실행 요청이 있는 누름(설정 탭)은 그 요청을 돌려주고 저장은 save_pending 으로 남김
+        draw(&mut state, 200, 30);
+        let route = column_hit(&state, CardId::HookTable, 0);
+        press_at(&mut state, (route.grab.x, route.grab.y), after(base, 200));
+        drag_at(&mut state, route.grab.x + 2, route.grab.y, after(base, 250));
+        let settings = state
+            .hit_areas
+            .tab_rects
+            .iter()
+            .find(|(tab, _)| *tab == ActiveTab::Settings)
+            .map(|(_, rect)| *rect)
+            .unwrap();
+        assert_eq!(
+            press_at(&mut state, (settings.x, settings.y), after(base, 300)),
+            UiCommand::LoadSettings
+        );
+        assert!(state.column_drag.is_none());
+        assert!(state.save_pending);
+    }
+
+    #[test]
+    fn a_tab_switch_commits_a_moved_drag_instead_of_dropping_it() {
+        let mut state = hooks_state();
+        let base = Instant::now();
+        draw(&mut state, 200, 30);
+        let route = column_hit(&state, CardId::HookTable, 0);
+        press_at(&mut state, (route.grab.x, route.grab.y), base);
+        drag_at(&mut state, route.grab.x + 3, route.grab.y, after(base, 50));
+        let dragged = state.column_widths[CardId::HookTable as usize][0];
+        assert!(dragged.is_some());
+
+        assert_eq!(state.switch_tab(ActiveTab::Overview), UiCommand::SaveState);
+        assert!(state.column_drag.is_none());
+        assert_eq!(state.column_widths[CardId::HookTable as usize][0], dragged);
+
+        // 끌지 않고 잡기만 한 열 경계는 저장 없이 해제, 적재 요청이 있는 탭은 저장을 save_pending 으로 남김
+        state.switch_tab(ActiveTab::Hooks);
+        draw(&mut state, 200, 30);
+        let route = column_hit(&state, CardId::HookTable, 0);
+        press_at(&mut state, (route.grab.x, route.grab.y), after(base, 400));
+        assert_eq!(state.switch_tab(ActiveTab::Overview), UiCommand::None);
+        assert!(state.column_drag.is_none());
+        assert!(!state.save_pending);
+
+        state.switch_tab(ActiveTab::Hooks);
+        draw(&mut state, 200, 30);
+        let route = column_hit(&state, CardId::HookTable, 0);
+        press_at(&mut state, (route.grab.x, route.grab.y), after(base, 600));
+        drag_at(&mut state, route.grab.x + 2, route.grab.y, after(base, 650));
+        assert_eq!(
+            state.switch_tab(ActiveTab::Settings),
+            UiCommand::LoadSettings
+        );
+        assert!(state.save_pending);
+    }
+
+    #[test]
+    fn a_title_press_dragged_across_cells_before_400ms_leaves_widths_and_order_unchanged() {
+        let mut state = settings_state();
+        let base = Instant::now();
+        let title = title_pos(&state, CardId::SettingsHooks);
+        press_at(&mut state, title, base);
+
+        // 시간이 차기 전에 다른 칸으로 끎: 누름 취소, 이후 끌기도 열 폭이나 카드 경계에 영향 없음
+        drag_at(&mut state, title.0 + 4, title.1, after(base, 100));
+        drag_at(&mut state, title.0 + 8, title.1 + 1, after(base, 150));
+        assert!(state.card_press.is_none());
+        assert!(state.card_move.is_none());
+        assert!(state.column_drag.is_none());
+        assert!(state.split_drag.is_none());
+        assert!(
+            state
+                .column_widths
+                .iter()
+                .all(|widths| widths.iter().all(Option::is_none))
+        );
+        assert_eq!(state.card_layout, CardLayout::default());
+
+        // 400ms 가 지나도 이동 모드로 가지 않고 놓아도 저장 요청 없음
+        assert!(!state.tick(after(base, 500)));
+        assert_eq!(
+            up_at(&mut state, title.0 + 8, title.1 + 1, after(base, 520)),
+            UiCommand::None
+        );
+        assert!(state.toast.is_none());
     }
 }

@@ -69,7 +69,7 @@ pub fn format_count(amount: i64) -> String {
         grouped.push('-');
     }
     for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
             grouped.push(',');
         }
         grouped.push(digit);
@@ -180,7 +180,7 @@ pub fn build_suggestions(input: &ReportInput) -> Vec<String> {
     // 6. 기록 없음
     if input.today.api_requests == 0 {
         suggestions.push(
-            "해당 일자 기록 0건: serve 색인 동작 또는 `rust-agents-proxy index` 실행 여부 확인"
+            "해당 일자 기록 0건: serve 색인 동작 또는 `claude-monitor index` 실행 여부 확인"
                 .to_string(),
         );
     }

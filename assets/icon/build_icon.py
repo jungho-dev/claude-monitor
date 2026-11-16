@@ -1,7 +1,8 @@
 """build_icon.py
-SVG 원본 두 개를 ImageMagick 으로 렌더링해 PNG 압축 다중 해상도 rust-agents-proxy.ico 를 만든다.
+Build the multi-size Windows icon from the two lossless WebP masters with ImageMagick.
+<name>.webp (1024 px tile) feeds 40-256 px, <name>-small.webp (256 px hexagon crop) feeds 16-32 px.
 
-실행: uv run --no-project --python "C:/JUNGHO/1.Language/3.Python/python.exe" python assets/icon/build_icon.py
+Usage: uv run --no-project python assets/icon/build_icon.py
 """
 
 import shutil
@@ -12,38 +13,34 @@ import tempfile
 from pathlib import Path
 
 ICON_DIR = Path(__file__).resolve().parent
-LARGE_SVG = ICON_DIR / "rust-agents-proxy.svg"
-SMALL_SVG = ICON_DIR / "rust-agents-proxy-small.svg"
-OUTPUT_ICO = ICON_DIR / "rust-agents-proxy.ico"
-# 32px 이하는 링·발광을 뺀 소형 원본에서 축소해야 형태가 남음
+APP_NAME = "claude-monitor"
+LARGE_MASTER = ICON_DIR / f"{APP_NAME}.webp"
+SMALL_MASTER = ICON_DIR / f"{APP_NAME}-small.webp"
+OUTPUT_ICO = ICON_DIR / f"{APP_NAME}.ico"
+# 32 px and below come from the hexagon-only master so the symbol stays legible
 SMALL_SIZES = (16, 20, 24, 32)
 LARGE_SIZES = (40, 48, 64, 128, 256)
 
 
+def render_png(magick: str, master: Path, size: int, out_png: Path) -> bytes:
+    """Render one Lanczos-scaled 32-bit PNG entry from a master image."""
+    subprocess.run(
+        [magick, str(master), "-filter", "Lanczos", "-resize", f"{size}x{size}",
+         "-depth", "8", f"PNG32:{out_png}"],
+        check=True,
+    )
+    return out_png.read_bytes()
+
+
 def build_icon(magick: str) -> Path:
-    """두 원본을 크기별 8-bit PNG 로 렌더링하고 ICONDIR + PNG 엔트리로 묶는다."""
-    with tempfile.TemporaryDirectory(prefix="rap-icon-") as work_text:
+    """Pack ICONDIR + ICONDIRENTRY records + PNG bodies (PNG entries, Vista and later)."""
+    with tempfile.TemporaryDirectory(prefix="icon-") as work_text:
         work_dir = Path(work_text)
-
-        # 1. 원본 256px 렌더링 후 크기별 Lanczos 축소
         png_by_size: dict[int, bytes] = {}
-        for svg_path, sizes in ((SMALL_SVG, SMALL_SIZES), (LARGE_SVG, LARGE_SIZES)):
-            master_png = work_dir / f"{svg_path.stem}-256.png"
-            subprocess.run(
-                [magick, "-background", "none", "-density", "192", str(svg_path),
-                 "-resize", "256x256", "-depth", "8", str(master_png)],
-                check=True,
-            )
+        for master, sizes in ((SMALL_MASTER, SMALL_SIZES), (LARGE_MASTER, LARGE_SIZES)):
             for size in sizes:
-                sized_png = work_dir / f"{svg_path.stem}-{size}.png"
-                subprocess.run(
-                    [magick, str(master_png), "-filter", "Lanczos", "-resize", f"{size}x{size}",
-                     "-depth", "8", f"PNG32:{sized_png}"],
-                    check=True,
-                )
-                png_by_size[size] = sized_png.read_bytes()
+                png_by_size[size] = render_png(magick, master, size, work_dir / f"{size}.png")
 
-        # 2. ICONDIR(6B) + ICONDIRENTRY(16B) * N + PNG 본문 (Vista 이상 PNG 엔트리 지원)
         sizes = sorted(png_by_size)
         header = struct.pack("<HHH", 0, 1, len(sizes))
         entries = b""
@@ -62,6 +59,6 @@ def build_icon(magick: str) -> Path:
 if __name__ == "__main__":
     magick_path = shutil.which("magick")
     if magick_path is None:
-        sys.exit("ImageMagick(magick) 을 PATH 에서 찾지 못함")
+        sys.exit("ImageMagick (magick) was not found on PATH")
     ico_path = build_icon(magick_path)
     print(f"{ico_path} ({ico_path.stat().st_size} bytes)")

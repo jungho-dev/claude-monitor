@@ -188,7 +188,7 @@ fn relay_hook_payload(
     };
 
     // 2. 실패 처리 (pretool 은 거부 본문, 그 외 exit 1)
-    eprintln!("[rap hook] {failure}");
+    eprintln!("[cm hook] {failure}");
     if !route.starts_with("pretool") {
         return Ok(1);
     }

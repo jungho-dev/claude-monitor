@@ -120,7 +120,7 @@ where
                 // 연속 실패는 지수 대기, 로그는 1·2·4·8회째만
                 accept_failures = accept_failures.saturating_add(1);
                 if accept_failures.is_power_of_two() {
-                    eprintln!("[rap] accept 실패 {addr} ({accept_failures}회째): {err}");
+                    eprintln!("[cm] accept 실패 {addr} ({accept_failures}회째): {err}");
                 }
                 let delay = accept_retry_delay(&err, accept_failures);
                 if !delay.is_zero() {
@@ -167,7 +167,7 @@ where
                 let text = err.to_string();
                 quiet |= text.contains("connection closed") || text.contains("shutting down");
                 if !quiet {
-                    eprintln!("[rap] 연결 오류 :{port}: {text}");
+                    eprintln!("[cm] 연결 오류 :{port}: {text}");
                 }
             }
         });

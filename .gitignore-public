@@ -52,6 +52,8 @@
 **/.gradle/
 **/.m2/
 **/.ivy2/
+**/__pycache__/
+**/.pytest_cache/
 
 # 4. VCS / misc
 **/.git/
@@ -64,6 +66,12 @@
 **/secrets/
 **/.secret/
 **/.secrets/
+**/.cmd/
+**/.docs/
+**/.claude/
+/.cargo/
+# Source module, not a private area
+!/src/net/admin/
 
 # 6. IDE / editor
 **/.vscode/
@@ -192,6 +200,14 @@
 # 8. Process managers / local runtime
 **/ecosystem.config.js
 **/ecosystem.config.*
+
+# 9. Local agent and indexer files
+/CLAUDE.md
+/.cbmignore
+
+# 10. Python build metadata
+**/*.pyc
+**/.playground
 
 # 99. case of env
 **/*[eE][nN][vV]*

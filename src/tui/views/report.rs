@@ -3,10 +3,13 @@
 
 use crate::tui::cards::{CardId, UiAction};
 use crate::tui::format::{outline_entries, prepare_report_markdown};
+use crate::tui::i18n::{self, Msg};
 use crate::tui::layout::{SplitAxis, SplitGroup};
 use crate::tui::state::{AppState, Panel};
 use crate::tui::theme;
-use crate::tui::views::common::{TextCard, panel_message, render_notice_card, render_text_card};
+use crate::tui::views::common::{
+    PanelNote, TextCard, panel_message, render_notice_card, render_text_card,
+};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -27,7 +30,7 @@ pub fn render_report_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // 1. 목차 카드와 본문 카드 분할 (경계 드래그)
     let outline_width = ((u32::from(body_area.width) * 28 / 100) as u16).clamp(16, 36);
     let panes = state.card_layout.split_cards(
-        &mut state.hit_areas.split_hits,
+        &mut state.hit_areas,
         SplitGroup::ReportCols,
         SplitAxis::Columns,
         body_area,
@@ -36,6 +39,7 @@ pub fn render_report_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
     );
 
     // 2. 본문 줄과 목차 (파이프 표는 박스 표로 바꾸고 울타리 줄은 숨긴 본문 기준)
+    let lang = state.lang;
     let markdown = match &state.report {
         Panel::Ready(Some(text)) => Some(prepare_report_markdown(text)),
         _ => None,
@@ -43,17 +47,20 @@ pub fn render_report_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let body_lines: Vec<Line<'static>> = match &state.report {
         Panel::Ready(Some(_)) => style_report_lines(markdown.as_deref().unwrap_or("")),
         Panel::Ready(None) => vec![
-            Line::from(Span::styled("저장된 리포트 없음", theme::STYLE_WARN)),
             Line::from(Span::styled(
-                "g 키 또는 [리포트 생성] 버튼 (serve 실행 필요)",
+                i18n::text(lang, Msg::NoSavedReport),
+                theme::STYLE_WARN,
+            )),
+            Line::from(Span::styled(
+                i18n::text(lang, Msg::ReportGenerateHint),
                 theme::STYLE_ACCENT,
             )),
         ],
         other => {
-            let (message, color) = panel_message(other).unwrap_or((String::new(), theme::FG_DIM));
+            let note = panel_message(lang, other).unwrap_or_default();
             vec![Line::from(Span::styled(
-                message,
-                Style::default().fg(color),
+                note.message,
+                Style::default().fg(note.color),
             ))]
         }
     };
@@ -64,14 +71,18 @@ pub fn render_report_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
         let outline_view = &mut state.card_views[CardId::ReportOutline as usize];
         outline_view.total = 0;
         outline_view.visible = 0;
+        let note = PanelNote {
+            message: i18n::text(lang, Msg::NoHeadings).to_string(),
+            color: theme::FG_DIM,
+            hint: None,
+        };
         render_notice_card(
             frame,
             state,
             CardId::ReportOutline,
             panes[0],
-            "목차",
-            "제목 없음",
-            theme::FG_DIM,
+            i18n::text(lang, Msg::TitleOutline),
+            note,
         );
     } else {
         let outline_lines: Vec<Line<'static>> = entries
@@ -91,17 +102,16 @@ pub fn render_report_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
             panes[0],
             TextCard {
                 card: CardId::ReportOutline,
-                title: "목차".to_string(),
+                title: i18n::text(lang, Msg::TitleOutline).to_string(),
                 hint: String::new(),
-                header: None,
-                header_cells: Vec::new(),
                 lines: outline_lines,
             },
         );
     }
 
     // 4. 본문 카드
-    let body_title = format!("일일 리포트 · {}", state.report_date.format("%Y-%m-%d"));
+    let body_title =
+        i18n::daily_report_title(lang, &state.report_date.format("%Y-%m-%d").to_string());
     state.report_row_starts = render_text_card(
         frame,
         state,
@@ -110,8 +120,6 @@ pub fn render_report_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
             card: CardId::ReportBody,
             title: body_title,
             hint: String::new(),
-            header: None,
-            header_cells: Vec::new(),
             lines: body_lines,
         },
     );
@@ -138,12 +146,14 @@ fn render_date_bar(frame: &mut Frame, state: &mut AppState, area: Rect) {
     } else {
         (name_style, key_style)
     };
+    let lang = state.lang;
+    let chip_name = |msg: Msg| format!(" {} ", i18n::text(lang, msg));
     let day_note = if state.report_date == state.today {
-        " (오늘)"
+        format!(" ({})", i18n::text(lang, Msg::DayToday))
     } else if Some(state.report_date) == state.today.pred_opt() {
-        " (어제)"
+        format!(" ({})", i18n::text(lang, Msg::DayYesterday))
     } else {
-        ""
+        String::new()
     };
 
     // 2. 칩 목록 (날짜는 칩 없이 굵은 큰 글자)
@@ -152,7 +162,7 @@ fn render_date_bar(frame: &mut Frame, state: &mut AppState, area: Rect) {
             Some(UiAction::ReportPrev),
             Line::from(vec![
                 Span::styled(" ←", key_style),
-                Span::styled(" 이전 ", name_style),
+                Span::styled(chip_name(Msg::ReportPrev), name_style),
             ]),
         ),
         (
@@ -168,7 +178,7 @@ fn render_date_bar(frame: &mut Frame, state: &mut AppState, area: Rect) {
         (
             Some(UiAction::ReportNext),
             Line::from(vec![
-                Span::styled(" 다음", next_name),
+                Span::styled(format!(" {}", i18n::text(lang, Msg::ReportNext)), next_name),
                 Span::styled(" → ", next_key),
             ]),
         ),
@@ -176,7 +186,7 @@ fn render_date_bar(frame: &mut Frame, state: &mut AppState, area: Rect) {
             Some(UiAction::ReportGenerate),
             Line::from(vec![
                 Span::styled(" [g]", key_style),
-                Span::styled(" 리포트 생성 ", name_style),
+                Span::styled(chip_name(Msg::ReportGenerate), name_style),
             ]),
         ),
     ];
