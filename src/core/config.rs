@@ -12,6 +12,7 @@ pub const CONFIG_FILE_NAME: &str = "rap.toml";
 pub const DB_FILE_NAME: &str = "rap.sqlite";
 pub const TOKEN_FILE_NAME: &str = "admin.token";
 const MAX_GUARD_DEADLINE_MS: u64 = 4500;
+const MIN_GAP_THRESHOLD_SECS: u64 = 15;
 
 // 1. 실행 설정 ----------------------------------------------------------------
 #[derive(Debug, Clone)]
@@ -23,6 +24,7 @@ pub struct AppConfig {
     pub hooks: HookConfig,
     pub indexer: IndexerConfig,
     pub report: ReportConfig,
+    pub power: PowerConfig,
     pub source_path: Option<PathBuf>,
 }
 
@@ -74,7 +76,18 @@ pub struct ReportConfig {
     pub run_hour: u32,
 }
 
-// 7. 설정 파일 형태 -----------------------------------------------------------
+// 7. 최신 대기 대응 설정 ------------------------------------------------------
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PowerConfig {
+    pub enabled: bool,
+    pub keep_awake: bool,
+    pub awake_grace_secs: u64,
+    pub gap_threshold_secs: u64,
+    pub hint_window_secs: u64,
+}
+
+// 8. 설정 파일 형태 -----------------------------------------------------------
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ConfigFile {
@@ -85,9 +98,10 @@ struct ConfigFile {
     hooks: HookConfig,
     indexer: IndexerConfig,
     report: ReportConfig,
+    power: PowerConfig,
 }
 
-// 8. 기본값 -------------------------------------------------------------------
+// 9. 기본값 -------------------------------------------------------------------
 impl Default for PortConfig {
     fn default() -> Self {
         Self {
@@ -141,7 +155,19 @@ impl Default for ReportConfig {
     }
 }
 
-// 9. 설정 적재 ----------------------------------------------------------------
+impl Default for PowerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            keep_awake: true,
+            awake_grace_secs: 600,
+            gap_threshold_secs: 60,
+            hint_window_secs: 1800,
+        }
+    }
+}
+
+// 10. 설정 적재 ---------------------------------------------------------------
 impl AppConfig {
     /// 명시 경로 > RAP_CONFIG > 데이터 폴더 rap.toml > 기본값 순 적재.
     pub fn load(explicit: Option<&Path>) -> anyhow::Result<Self> {
@@ -199,6 +225,7 @@ impl AppConfig {
             hooks: file.hooks,
             indexer: file.indexer,
             report: file.report,
+            power: file.power,
             source_path,
         })
     }
@@ -230,7 +257,7 @@ impl AppConfig {
     }
 }
 
-// 10. 설정 검증 ---------------------------------------------------------------
+// 11. 설정 검증 ---------------------------------------------------------------
 fn validate_config_file(file: &ConfigFile) -> anyhow::Result<()> {
     // 1. 포트 (0 과 중복 거부)
     let ports = &file.ports;
@@ -247,6 +274,12 @@ fn validate_config_file(file: &ConfigFile) -> anyhow::Result<()> {
     }
     if file.report.run_hour > 23 {
         bail!("report.run_hour 범위 오류: {}", file.report.run_hour);
+    }
+    if file.power.gap_threshold_secs < MIN_GAP_THRESHOLD_SECS {
+        bail!(
+            "power.gap_threshold_secs 는 {MIN_GAP_THRESHOLD_SECS} 이상: {}",
+            file.power.gap_threshold_secs
+        );
     }
 
     // 3. 가드 제한 시간 (0 은 전 호출 거부, 상한은 훅 제한 안 두 번 호출)
@@ -416,6 +449,7 @@ mod tests {
             hooks: HookConfig::default(),
             indexer: IndexerConfig::default(),
             report: ReportConfig::default(),
+            power: PowerConfig::default(),
             source_path: None,
         };
         let planned = config.planned_ports();
@@ -483,5 +517,30 @@ mod tests {
             let message = format!("{:#}", validate_config_file(&file).expect_err(target));
             assert!(message.contains("자기 포트"), "{target}: {message}");
         }
+    }
+
+    // 11. 대기 감지 기준 하한 -------------------------------------------------
+    #[test]
+    fn rejects_gap_threshold_below_minimum() {
+        let short = ConfigFile {
+            power: PowerConfig {
+                gap_threshold_secs: MIN_GAP_THRESHOLD_SECS - 1,
+                ..PowerConfig::default()
+            },
+            ..ConfigFile::default()
+        };
+        let message = format!(
+            "{:#}",
+            validate_config_file(&short).expect_err("하한 미만 거부")
+        );
+        assert!(message.contains("gap_threshold_secs"), "{message}");
+        let edge = ConfigFile {
+            power: PowerConfig {
+                gap_threshold_secs: MIN_GAP_THRESHOLD_SECS,
+                ..PowerConfig::default()
+            },
+            ..ConfigFile::default()
+        };
+        validate_config_file(&edge).expect("하한 통과");
     }
 }

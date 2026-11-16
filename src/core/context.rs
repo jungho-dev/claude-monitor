@@ -3,6 +3,7 @@
 
 use crate::core::config::AppConfig;
 use crate::core::model::{CounterSnapshot, LiveEvent};
+use crate::power::PowerState;
 use crate::store::Store;
 use chrono::{DateTime, Utc};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,6 +36,7 @@ pub struct AppContext {
     pub counters: LiveCounters,
     pub started_at: DateTime<Utc>,
     pub admin_token: String,
+    pub power: PowerState,
 }
 
 // 3. 카운터 스냅샷 ------------------------------------------------------------

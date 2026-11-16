@@ -1,5 +1,5 @@
 //! hooks/chain_tests.rs
-//! 체인·중계 시험: 가짜 가드 서버로 허용·거부·시한 초과·재작성 조합과 훅 서버 왕복 확인.
+//! 체인·중계·대기 안내 시험: 가짜 가드 서버 조합과 훅 서버 왕복 확인.
 
 use crate::core::config::HookConfig;
 use crate::core::context::AppContext;
@@ -10,7 +10,8 @@ use crate::hooks::chain::{
 use crate::hooks::client::{blocking_http_request, post_hook_payload};
 use crate::hooks::run_hook_server;
 use crate::hooks::upstream::UpstreamClient;
-use crate::net::admin::test_support::{build_test_config, build_test_context};
+use crate::net::admin::test_support::{build_test_config, build_test_context, pick_free_port};
+use crate::power::StandbyGap;
 use crate::transcript::test_support::remove_temp_dir;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -851,4 +852,70 @@ async fn chain_defer_then_recheck_deny_keeps_deny() {
     assert_eq!(result.outcome, HookOutcome::Deny);
     assert_eq!(result.guard, "cli-guard");
     assert_eq!(&result.body[..], CLI_GUARD_DENY.as_bytes());
+}
+
+// 27. 대기 안내 경로 왕복 -----------------------------------------------------
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standby_hint_route_answers_and_records_event() {
+    // 1. 활동 중 대기 구간을 가진 훅 서버
+    let (ctx, server) = start_hook_server("hooks-standby", pick_free_port()).await;
+    let hooks_port = ctx.config.ports.hooks;
+    let data_dir = ctx.config.data_dir.clone();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    ctx.power.record_gap(StandbyGap {
+        id: 0,
+        start_ms: now_ms - 600_000,
+        end_ms: now_ms - 60_000,
+        active: true,
+    });
+
+    // 2. 프롬프트 안내와 대상 아닌 이벤트
+    let (status, reply) = tokio::task::spawn_blocking(move || {
+        post_hook_payload(
+            hooks_port,
+            "standby-hint",
+            br#"{"session_id":"s9","hook_event_name":"UserPromptSubmit"}"#,
+        )
+    })
+    .await
+    .expect("조인")
+    .expect("안내 요청");
+    assert_eq!(status, 200);
+    let answer: Value = serde_json::from_slice(&reply).expect("JSON");
+    assert_eq!(
+        answer["hookSpecificOutput"]["hookEventName"],
+        "UserPromptSubmit"
+    );
+    let (other_status, other_reply) = tokio::task::spawn_blocking(move || {
+        post_hook_payload(
+            hooks_port,
+            "standby-hint",
+            b"{\"hook_event_name\":\"Stop\"}",
+        )
+    })
+    .await
+    .expect("조인")
+    .expect("대상 아닌 요청");
+    assert_eq!(other_status, 200);
+    assert_eq!(other_reply, b"{}");
+
+    // 3. 경로·가드 라벨 기록
+    assert_eq!(wait_for_hook_events(&ctx, 2).await, 2);
+    let hinted: i64 = ctx
+        .store
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM hook_events WHERE route = 'standby-hint' AND guard = 'standby-hint'",
+                [],
+                |row| row.get(0),
+            )
+        })
+        .expect("조회");
+    assert_eq!(hinted, 1);
+
+    // 4. 정리
+    server.abort();
+    let _ = server.await;
+    drop(ctx);
+    remove_temp_dir(&data_dir);
 }

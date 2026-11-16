@@ -6,6 +6,7 @@ pub mod core;
 pub mod hooks;
 pub mod inventory;
 pub mod net;
+pub mod power;
 pub mod report;
 pub mod serve;
 pub mod store;

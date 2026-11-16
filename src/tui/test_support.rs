@@ -2,7 +2,7 @@
 //! 테스트 전용 합성 설정·스냅샷 (환경 변수·파일 접근 없음).
 
 use crate::core::config::{
-    AppConfig, GatewayConfig, HookConfig, IndexerConfig, PortConfig, ReportConfig,
+    AppConfig, GatewayConfig, HookConfig, IndexerConfig, PortConfig, PowerConfig, ReportConfig,
 };
 use crate::core::model::{
     ApiRequestRow, CounterSnapshot, HookEventRow, HookOutcome, LiveEvent, PortStatus,
@@ -27,6 +27,7 @@ pub fn sample_config() -> AppConfig {
         hooks: HookConfig::default(),
         indexer: IndexerConfig::default(),
         report: ReportConfig::default(),
+        power: PowerConfig::default(),
         source_path: None,
     }
 }

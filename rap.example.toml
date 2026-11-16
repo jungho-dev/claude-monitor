@@ -37,3 +37,11 @@ backfill_days = 7
 enabled = true
 # dir = "C:/Users/<user>/AppData/Local/rust-agents-proxy/reports"
 run_hour = 0
+
+# 최신 대기 대응 (절전 유예, 대기 구간 감지, 복귀 안내)
+[power]
+enabled = true
+keep_awake = true
+awake_grace_secs = 600
+gap_threshold_secs = 60
+hint_window_secs = 1800

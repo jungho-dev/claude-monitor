@@ -2,7 +2,7 @@
 //! 시험 전용 임시 폴더, 합성 기록 복사, 시험용 설정 구성.
 
 use crate::core::config::{
-    AppConfig, GatewayConfig, HookConfig, IndexerConfig, PortConfig, ReportConfig,
+    AppConfig, GatewayConfig, HookConfig, IndexerConfig, PortConfig, PowerConfig, ReportConfig,
 };
 use crate::store::Store;
 use std::fs;
@@ -79,6 +79,7 @@ pub fn prepare_fixture_workspace(label: &str) -> TestWorkspace {
             ..IndexerConfig::default()
         },
         report: ReportConfig::default(),
+        power: PowerConfig::default(),
         source_path: None,
     };
     let store = Store::open_store(&root.join("data").join("rap.sqlite")).expect("DB 열기");

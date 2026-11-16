@@ -5,8 +5,9 @@ use crate::core::config::{AppConfig, DB_FILE_NAME, TOKEN_FILE_NAME};
 use crate::core::context::{AppContext, LIVE_CHANNEL_CAPACITY, LiveCounters};
 use crate::core::model::LiveEvent;
 use crate::hooks::client::blocking_http_request;
+use crate::power::PowerState;
 use crate::store::Store;
-use crate::{hooks, net, report, transcript};
+use crate::{hooks, net, power, report, transcript};
 use anyhow::{Context, bail};
 use chrono::{SecondsFormat, Utc};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -125,7 +126,13 @@ pub fn run_serve(config: AppConfig) -> anyhow::Result<()> {
         counters: LiveCounters::default(),
         started_at: Utc::now(),
         admin_token,
+        power: PowerState::default(),
     });
+    if ctx.config.power.enabled
+        && let Err(err) = power::spawn_power_monitor(Arc::clone(&ctx))
+    {
+        eprintln!("[rap] 대기 감시 스레드 생성 실패 (serve 계속): {err}");
+    }
 
     // 6. 게이트웨이 전용 런타임 (훅·색인 부하와 스트리밍 중계 분리)
     let mut gateway_exit_rx: Option<oneshot::Receiver<String>> = None;

@@ -51,7 +51,7 @@
 2. **파일 머리말**
     - 모든 `.rs` 파일은 첫 줄에 `src/` 기준 경로 `//! core/config.rs`, 둘째 줄에 용도 한 줄 `//! ...`을 둔다(`build.rs`는 `//! build.rs`).
 3. **src 루트**
-    - `src/` 루트에는 `main.rs`와 `lib.rs`만 둔다. 나머지는 모듈 디렉터리(`core`, `serve`, `store`, `net`, `hooks`, `transcript`, `report`, `inventory`, `tui`) 안에 둔다.
+    - `src/` 루트에는 `main.rs`와 `lib.rs`만 둔다. 나머지는 모듈 디렉터리(`core`, `serve`, `store`, `net`, `hooks`, `transcript`, `report`, `inventory`, `power`, `tui`) 안에 둔다.
     - 새 모듈은 `lib.rs`에 `pub mod`로 선언한다.
 4. **테스트**
     - 단위 테스트는 모듈 옆 `#[cfg(test)]`, `tests.rs`, `test_support.rs`에 두고 fixture는 `tests/fixtures`에 둔다.

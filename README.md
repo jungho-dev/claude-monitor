@@ -10,6 +10,7 @@
     - Collects usage metadata from three sources: session transcripts, OTLP http/json logs, and the API gateway.
     - Stores it in one SQLite file and serves aggregates over a local admin API, the dashboard, and a daily Markdown report.
     - Rewrites legacy CLI calls in Bash hooks (`cat`, `ls`, `git diff`) before the guard denies them, then lets the existing guard re-check the final command.
+    - Copes with forced Modern Standby: while Claude Code is active it asks Windows to postpone system sleep (the screen-off and lock policy stays untouched), records each standby gap, and tells the agent after resume that a failure overlapping a gap is environmental.
 3. **Highlights**
     - One binary with a bundled SQLite (WAL); no Node, Python, or database server.
     - Four localhost ports: admin `47330`, OTLP `47331`, gateway `47332` (on by default), hooks `47333`.
@@ -137,6 +138,15 @@ rust-agents-proxy doctor
 }
 ```
 
+6. **Standby hint hooks**
+    - Add one entry to each of the `hooks.PostToolUseFailure` and `hooks.UserPromptSubmit` arrays, beside the entries already there.
+    - Keep `onFailure` at `continue`: the route only adds context, so a stopped `serve` must not block a prompt or a tool result.
+    - Without these entries the standby gaps are still recorded and shown in `GET /api/power`, but the agent receives no hint.
+
+```json
+{"hooks":[{"type":"http","url":"http://127.0.0.1:47333/hook/standby-hint","timeout":5,"onFailure":"continue"}]}
+```
+
 ### 4. Keep It Running
 
 1. **Task Scheduler**
@@ -249,6 +259,7 @@ rust-agents-proxy status
     - `GET /api/agent-stats` returns one row per agent type (the label before `#`, `main` for the main thread): runs (distinct agent instances; sessions for `main`), requests, sessions, token sums, cache hit ratio, wait p50/p90, estimated cost, tool calls and errors, top model, and last timestamp; `?hours=` works as above.
     - `GET /api/report?date=YYYY-MM-DD` returns the stored report as Markdown, `400` without a valid date, and `404` when none is stored.
     - `GET /api/events` is a Server-Sent Events stream of live events, with a `: ping` comment every 15 seconds.
+    - `GET /api/power` returns `enabled`, `keep_awake`, `holding` (the sleep postponement is active), and `gaps`, the last 32 standby gaps since the `serve` start as `id`, `start_ms`, `end_ms` (Unix milliseconds), and `active` (Claude Code was active right before the standby).
 2. **Token-protected endpoints**
     - `POST /api/reindex` runs the transcript indexer once.
     - `POST /api/report?date=YYYY-MM-DD` generates and stores a report; the default date is yesterday.
@@ -282,12 +293,18 @@ rust-agents-proxy status
 ### 4. Hooks 47333
 
 1. **Routes**
-    - `POST /hook/pretool-chain`, `POST /hook/relay/{route}`, and `GET /health`.
-2. **Relay route**
+    - `POST /hook/pretool-chain`, `POST /hook/relay/{route}`, `POST /hook/standby-hint`, and `GET /health`.
+2. **Standby hint route**
+    - It reads only `hook_event_name`, `session_id`, and `duration_ms` from the payload.
+    - For `PostToolUseFailure` with `duration_ms`, it answers with `additionalContext` when a standby gap overlaps the tool run, on every such failure.
+    - For `UserPromptSubmit`, it answers with `additionalContext` for gaps that ended within `power.hint_window_secs` and began while Claude Code was active (a gateway request, hook call, or open stream within `power.awake_grace_secs` before the standby), once per session and gap.
+    - A failure without `duration_ms` follows the prompt rule but gets a conditional hint: treat the failure as standby-caused only when the error is a timeout or a dropped connection.
+    - Any other event, an unreadable body, `power.enabled = false`, or no matching gap returns `{}`; the call is recorded with route `standby-hint`, and the guard label `standby-hint` marks an answer that carried a hint.
+3. **Relay route**
     - `{route}` is `a-z`, `0-9`, and `-` only.
     - The request is forwarded unchanged to `{hooks.relay_target}/hook/{route}`, and the upstream status and body come back as they are.
     - The verdict, guard label, and duration are recorded; an unreachable upstream returns `502`.
-3. **Body limit**
+4. **Body limit**
     - 16 MiB per request.
 
 ### 5. Common Rules
@@ -383,6 +400,7 @@ rust-agents-proxy status
     - Unknown keys are an error; ports must be non-zero and distinct, and `report.run_hour` must be 0-23.
     - `hooks.relay_target` accepts only an `http` loopback address (`127.0.0.1`, `localhost`, or `[::1]`) on a port that is not one of rap's own ports; anything else is a configuration error, so the start fails.
     - `hooks.guard_deadline_ms` must be between 1 and 4500, so even the two guard calls of the `defer` re-check fit inside the 10-second hook timeout.
+    - `power.gap_threshold_secs` must be at least 15, so the 5-second monitor tick and its jitter never count as a standby gap.
 3. **Claude home**
     - `claude_home` in `rap.toml`, then `CLAUDE_CONFIG_DIR`, then `%USERPROFILE%\.claude`.
 
@@ -392,6 +410,8 @@ rust-agents-proxy status
     - Every key is optional; this block shows the defaults, and `rap.example.toml` is the same file.
     - `gateway.enabled` defaults to `true`; `false` leaves port `47332` untouched.
     - `gateway.upstream_timeout_secs` limits the wait for upstream response headers (504 on timeout); a streamed body has no deadline after the headers arrive. It must be at least 1.
+    - `power.enabled` starts the standby monitor thread; `power.keep_awake` asks Windows to postpone system sleep (`SetThreadExecutionState` with `ES_SYSTEM_REQUIRED`, never `ES_DISPLAY_REQUIRED`) while a gateway stream is open or a gateway request or hook call happened within `power.awake_grace_secs`.
+    - A wall-clock jump larger than `power.gap_threshold_secs` between two monitor ticks is recorded as a standby gap; `power.hint_window_secs` is how long after a gap a prompt still gets the hint.
 
 ```toml
 # data_dir = "C:/Users/<user>/AppData/Local/rust-agents-proxy"
@@ -424,6 +444,13 @@ backfill_days = 7
 enabled = true
 # dir = "C:/Users/<user>/AppData/Local/rust-agents-proxy/reports"
 run_hour = 0
+
+[power]
+enabled = true
+keep_awake = true
+awake_grace_secs = 600
+gap_threshold_secs = 60
+hint_window_secs = 1800
 ```
 
 2. **Report schedule**
@@ -506,6 +533,12 @@ cargo vendor --config net.offline=false vendor
     - It uses a built-in per-model rate table; an unknown model counts as zero.
 8. **Read endpoints**
     - `GET` endpoints on the admin port need no token; they return metadata only, behind the Host and Origin checks.
+9. **Standby**
+    - Whether Windows honors the system-required request when a policy turns the screen off on a Modern Standby (S0) machine is unverified; when a gap is recorded while the request was held, the notice and `serve.log` say `절전 유예 중`, which shows that the request did not prevent standby.
+    - The gap ledger lives in memory only and resets when `serve` restarts.
+    - A long background job that makes no gateway request or hook call for `power.awake_grace_secs` before the standby counts as idle, so prompts after that gap get no hint.
+    - A wall-clock step forward of more than `power.gap_threshold_secs` (manual or NTP correction) is recorded as a gap; a step backward ends the sleep postponement until the next activity.
+    - A gap is seen only when the whole process is paused; a network drop without standby is not detected.
 
 ---
 

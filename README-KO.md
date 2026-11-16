@@ -10,6 +10,7 @@
     - 세션 기록(transcript), OTLP http/json 로그, API 게이트웨이 세 출처에서 사용량 메타데이터를 수집
     - SQLite 파일 하나에 저장하고, 로컬 관리 API, 대시보드, 일일 Markdown 리포트로 집계를 제공
     - Bash 훅의 구형 CLI 호출(`cat`, `ls`, `git diff`)을 가드가 거부하기 전에 재작성하고, 최종 명령은 기존 가드가 다시 검사
+    - 강제 최신 대기 대응: Claude Code가 작업 중인 동안 Windows에 시스템 절전 유예를 요청하고(화면 끄기·잠금 정책은 그대로), 대기 구간을 기록하며, 복귀 뒤 대기 구간에 걸친 실패는 환경 원인이라고 에이전트에게 알림
 3. **특징**
     - 내장 SQLite(WAL)를 쓰는 단일 실행 파일이며 Node, Python, 데이터베이스 서버가 필요 없음
     - localhost 포트 4개: 관리 `47330`, OTLP `47331`, 게이트웨이 `47332`(기본 켜짐), 훅 `47333`
@@ -137,6 +138,15 @@ rust-agents-proxy doctor
 }
 ```
 
+6. **대기 안내 훅**
+    - `hooks.PostToolUseFailure`와 `hooks.UserPromptSubmit` 배열에 기존 항목과 나란히 아래 항목을 하나씩 추가함
+    - `onFailure`는 `continue`로 둠: 이 경로는 문맥만 더하므로 `serve`가 멈춰도 프롬프트나 도구 결과를 막으면 안 됨
+    - 항목이 없어도 대기 구간은 기록되고 `GET /api/power`로 보이지만, 에이전트에게 안내는 가지 않음
+
+```json
+{"hooks":[{"type":"http","url":"http://127.0.0.1:47333/hook/standby-hint","timeout":5,"onFailure":"continue"}]}
+```
+
 ### 4. 상시 실행
 
 1. **작업 스케줄러**
@@ -249,6 +259,7 @@ rust-agents-proxy status
     - `GET /api/agent-stats`는 에이전트 종류(`#` 앞 라벨, 메인 스레드는 `main`)당 한 행을 반환: 실행 수(에이전트 인스턴스 수, `main`은 세션 수), 요청, 세션, 토큰 합계, 캐시 적중률, 대기 p50/p90, 추정 비용, 도구 호출과 오류, 최다 모델, 마지막 시각이며 `?hours=`는 위와 같음
     - `GET /api/report?date=YYYY-MM-DD`는 보관된 리포트를 Markdown으로 반환하고, 날짜가 없거나 잘못되면 `400`, 보관본이 없으면 `404`
     - `GET /api/events`는 실시간 이벤트 Server-Sent Events 스트림이며 15초마다 `: ping` 주석을 보냄
+    - `GET /api/power`는 `enabled`, `keep_awake`, `holding`(절전 유예 요청 중 여부), `gaps`(이번 `serve` 기동 이후 최근 대기 구간 32개, `id`·`start_ms`·`end_ms` Unix 밀리초, `active`는 대기 직전 Claude Code 활동 여부)를 반환
 2. **토큰 보호 엔드포인트**
     - `POST /api/reindex`는 기록 색인기를 한 번 실행
     - `POST /api/report?date=YYYY-MM-DD`는 리포트를 생성·보관하며 기본 날짜는 어제
@@ -282,12 +293,18 @@ rust-agents-proxy status
 ### 4. 훅 47333
 
 1. **경로**
-    - `POST /hook/pretool-chain`, `POST /hook/relay/{route}`, `GET /health`
-2. **relay 경로**
+    - `POST /hook/pretool-chain`, `POST /hook/relay/{route}`, `POST /hook/standby-hint`, `GET /health`
+2. **대기 안내 경로**
+    - 페이로드에서 `hook_event_name`, `session_id`, `duration_ms`만 읽음
+    - `duration_ms`가 있는 `PostToolUseFailure`는 도구 실행 구간과 겹친 대기 구간이 있으면 `additionalContext`로 답하며, 그런 실패마다 매번 답함
+    - `UserPromptSubmit`는 `power.hint_window_secs` 안에 끝나고 Claude Code가 활동 중일 때(대기 직전 `power.awake_grace_secs` 안에 게이트웨이 요청, 훅 호출, 열린 스트림이 있었을 때) 시작된 대기 구간을 세션·구간마다 한 번 `additionalContext`로 답함
+    - `duration_ms` 없는 실패는 프롬프트 규칙을 따르되, 오류가 시간 초과나 연결 끊김일 때만 대기 원인으로 보라는 조건부 안내를 받음
+    - 그 밖의 이벤트, 읽을 수 없는 본문, `power.enabled = false`, 맞는 구간 없음은 `{}`를 반환하며, 호출은 경로 `standby-hint`로 기록되고 안내를 담은 응답은 가드 라벨 `standby-hint`로 표시됨
+3. **relay 경로**
     - `{route}`는 `a-z`, `0-9`, `-`만 허용
     - 요청을 `{hooks.relay_target}/hook/{route}`로 그대로 전달하고, 상류의 상태와 본문을 그대로 돌려줌
     - 판정, 가드 라벨, 소요 시간을 기록하며 상류에 닿지 못하면 `502`를 반환
-3. **본문 상한**
+4. **본문 상한**
     - 요청당 16 MiB
 
 ### 5. 공통 규칙
@@ -383,6 +400,7 @@ rust-agents-proxy status
     - 알 수 없는 키는 오류이고, 포트는 0이 아니며 서로 달라야 하고, `report.run_hour`는 0-23이어야 함
     - `hooks.relay_target`은 `http` 루프백 주소(`127.0.0.1`, `localhost`, `[::1]`)만 허용하고 rap 자신의 포트는 쓸 수 없으며, 그 밖은 설정 오류라 기동이 실패함
     - `hooks.guard_deadline_ms`는 1~4500 범위여야 함. `defer` 재검사의 가드 2회 호출도 훅 timeout 10초 안에 들어가게 하기 위함
+    - `power.gap_threshold_secs`는 15 이상이어야 함. 5초 감시 주기와 그 지연이 대기 구간으로 잡히지 않게 하기 위함
 3. **Claude 홈**
     - `rap.toml`의 `claude_home`, `CLAUDE_CONFIG_DIR`, `%USERPROFILE%\.claude` 순
 
@@ -392,6 +410,8 @@ rust-agents-proxy status
     - 모든 키는 생략할 수 있으며, 아래 블록이 기본값이고 `rap.example.toml`과 같은 내용
     - `gateway.enabled`의 기본값은 `true`이며, `false`면 포트 `47332`를 건드리지 않음
     - `gateway.upstream_timeout_secs`는 상류 응답 헤더를 기다리는 시한이며 초과 시 504 를 반환함. 헤더가 온 뒤 스트리밍 본문에는 시한이 없고, 값은 1 이상이어야 함
+    - `power.enabled`는 대기 감시 스레드를 띄우고, `power.keep_awake`는 게이트웨이 스트림이 열려 있거나 `power.awake_grace_secs` 안에 게이트웨이 요청이나 훅 호출이 있으면 Windows에 시스템 절전 유예를 요청함(`SetThreadExecutionState`의 `ES_SYSTEM_REQUIRED`, `ES_DISPLAY_REQUIRED`는 쓰지 않음)
+    - 감시 주기 두 번 사이에 벽시계가 `power.gap_threshold_secs`보다 크게 건너뛰면 대기 구간으로 기록하며, `power.hint_window_secs`는 대기 뒤 프롬프트에 안내를 붙이는 기간
 
 ```toml
 # data_dir = "C:/Users/<user>/AppData/Local/rust-agents-proxy"
@@ -424,6 +444,13 @@ backfill_days = 7
 enabled = true
 # dir = "C:/Users/<user>/AppData/Local/rust-agents-proxy/reports"
 run_hour = 0
+
+[power]
+enabled = true
+keep_awake = true
+awake_grace_secs = 600
+gap_threshold_secs = 60
+hint_window_secs = 1800
 ```
 
 2. **리포트 예약**
@@ -506,6 +533,12 @@ cargo vendor --config net.offline=false vendor
     - 내장 모델별 단가표를 쓰며 알 수 없는 모델은 0으로 셈
 8. **조회 엔드포인트**
     - 관리 포트의 `GET` 엔드포인트는 토큰이 필요 없으며, Host·Origin 검사 뒤에서 메타데이터만 반환
+9. **대기 모드**
+    - 최신 대기(S0) PC에서 정책이 화면을 끌 때 Windows가 시스템 유지 요청을 지키는지는 미확인이며, 요청을 유지한 채 대기 구간이 기록되면 알림과 `serve.log`에 `절전 유예 중`이 남아 요청이 대기를 막지 못했음을 보여 줌
+    - 대기 구간 기록은 메모리에만 있고 `serve`를 다시 띄우면 비워짐
+    - 대기 직전 `power.awake_grace_secs` 동안 게이트웨이 요청이나 훅 호출이 없던 긴 백그라운드 작업은 활동 없음으로 보므로, 그 대기 뒤 프롬프트에는 안내가 붙지 않음
+    - 벽시계가 수동이나 NTP 보정으로 `power.gap_threshold_secs`보다 크게 앞으로 뛰면 대기 구간으로 기록되고, 뒤로 가면 다음 활동까지 절전 유예가 끝남
+    - 프로세스 전체가 멈춘 구간만 잡히며, 대기 없는 네트워크 끊김은 감지하지 않음
 
 ---
 

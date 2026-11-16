@@ -6,6 +6,7 @@ use super::test_support::prepare_fixture_workspace;
 use super::{index_transcripts_once, run_indexer_loop};
 use crate::core::context::{AppContext, LIVE_CHANNEL_CAPACITY, LiveCounters};
 use crate::core::model::LiveEvent;
+use crate::power::PowerState;
 use chrono::Utc;
 use std::fs;
 use std::io::Write;
@@ -218,6 +219,7 @@ async fn indexer_loop_counts_first_run_and_publishes_later_rows() {
         counters: LiveCounters::default(),
         started_at: Utc::now(),
         admin_token: "test".to_string(),
+        power: PowerState::default(),
     });
     let loop_task = tokio::spawn(run_indexer_loop(Arc::clone(&ctx)));
 

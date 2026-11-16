@@ -39,6 +39,7 @@ rust-agents-proxy/
 │   │   ├── chain.rs : pretool-chain 판정, 가드 응답 합성, fail-closed
 │   │   ├── rewrite.rs : 보수적 Bash 재작성(cat, ls, eza, git diff)
 │   │   ├── relay.rs : 다른 훅 경로의 계측 중계
+│   │   ├── standby.rs : 대기 안내 경로, 도구 실패·프롬프트에 additionalContext 응답
 │   │   ├── upstream.rs : 가드로 가는 keep-alive HTTP 클라이언트와 마감 시한
 │   │   ├── record.rs : 카운터, 실시간 이벤트, 응답 경로 밖 저장소 기록
 │   │   ├── client.rs : 블로킹 HTTP 클라이언트와 hook 명령
@@ -60,6 +61,9 @@ rust-agents-proxy/
 │   │   ├── load.rs : settings.json, .claude.json, 에이전트·스킬 머리글 읽기, 값 제외
 │   │   ├── doctor.rs : 데이터 폴더, 포트, 중계 대상, 훅 등록, 허용 URL, 텔레메트리, 게이트웨이, projects 폴더 점검
 │   │   └── tests.rs : fixture Claude 홈을 쓴 목록·진단 테스트
+│   ├── power/
+│   │   ├── mod.rs : 대기 감시 스레드, 절전 유예 요청(Win32 직접 선언), 대기 구간 기록, 안내 문구
+│   │   └── tests.rs : 대기 감지, 유예 유지·해제, 안내 대상 선택, 훅 응답 테스트
 │   └── tui/
 │       ├── mod.rs : 터미널 진입·복원, 변화 시에만 다시 그리는 이벤트 루프, 명령 전달
 │       ├── state.rs : 탭, 카드 포커스·배치·스크롤, 구간, 패널 데이터, 키 처리, 스냅샷 교체 시 선택 유지
@@ -118,11 +122,13 @@ rust-agents-proxy/
     - 관리, OTLP, 훅(`hooks.enabled`일 때), 기록 색인기(`indexer.enabled`일 때), 리포트 스케줄러(`report.enabled`일 때)가 작업 하나씩으로 돌아감
     - 게이트웨이는 전용 OS 스레드 `rap-gateway`에서 worker 2개짜리 자체 multi-thread 런타임으로 실행하며, 기본 켜짐이고 `gateway.enabled = false`일 때만 생략
     - 이렇게 나누면 긴 스트리밍 중계가 훅·색인 부하와 섞이지 않음
+    - `power.enabled`(기본값)이면 일반 OS 스레드 `rap-power`가 5초마다 돌며, `SetThreadExecutionState`는 절전 유예를 호출한 스레드에 묶으므로 이 스레드 하나가 설정과 해제를 모두 맡음
 3. **장애 격리**
     - release 프로필의 `panic = "unwind"`로 panic이 작업 하나 안에 머묾
     - 수락한 연결마다 별도 tokio 작업이므로 핸들러 panic은 그 연결만 끝냄
     - 기동 순서: 게이트웨이 상류를 검증하고, 관리, OTLP, 훅, 게이트웨이 순으로 포트를 바인딩해 서버가 인수할 때까지 유지하며, 그 뒤에야 저장소를 열고 `admin.token`을 기록하므로 관리 바인딩에 진 두 번째 `serve`는 토큰을 덮어쓰지 않음
     - 필수: 관리, 그리고 `hooks.enabled`일 때의 훅. 바인딩 실패나 둘 중 하나의 종료·panic이 있으면 `serve`가 0 이 아닌 종료 코드로 멈춤
+    - `rap-power` 스레드 생성 실패는 출력만 하고 `serve`는 대기 감시 없이 계속 실행
     - 선택: OTLP와 게이트웨이. 바인딩 실패는 경고와 함께 그 서버를 건너뛰고, OTLP·색인기·리포트 스케줄러·게이트웨이 스레드의 종료는 로그와 warn `Notice` 실시간 이벤트로 알리고 `serve`는 계속 실행
     - `hooks.enabled = false`이면 훅 포트를 점유하지 않음
     - `Ctrl+C`가 대기 루프를 빠져나와 모든 작업을 중단
@@ -131,7 +137,7 @@ rust-agents-proxy/
     - SQLite 접근, 색인, 리포트 생성, 포트 점검은 `spawn_blocking`으로 실행
     - 훅 이벤트는 응답 경로 밖에서 저장소에 기록하고, 게이트웨이 tap은 응답 본문이 drop될 때 행을 기록
 5. **공유 상태**
-    - `AppContext`가 설정, 저장소, 실시간 이벤트 broadcast sender(용량 1024), 원자적 실시간 카운터, 시작 시각, 관리 토큰을 가짐
+    - `AppContext`가 설정, 저장소, 실시간 이벤트 broadcast sender(용량 1024), 원자적 실시간 카운터, 시작 시각, 관리 토큰, `PowerState`(유예 여부, 마지막 주기 시각, 대기 구간 최대 32개와 안내한 세션·구간 쌍 최대 512개의 메모리 기록)를 가짐
 6. **색인 주기**
     - 색인기는 `indexer.interval_secs`(30초)마다 블로킹 스레드에서 폴링하며 첫 실행은 실시간 이벤트를 내보내지 않음
     - 리포트 스케줄러는 첫 색인기 실행을 기다린 뒤(2초마다 확인, 최대 10분, 초과하면 warn 알림) 어제 리포트를 다시 만들며 보관된 것을 교체함
@@ -192,12 +198,21 @@ flowchart LR
     - Claude Code가 `/v1/logs`로 로그를 보내며, 세 이벤트만 행이 되고 나머지는 무시
 4. **훅 경로**
     - Claude Code가 PreToolUse 페이로드를 `/hook/pretool-chain`으로 보내며, 판정은 다음 다이어그램에 나옴
-5. **게이트웨이 경로**
+    - 사용자가 등록하면 Claude Code가 PostToolUseFailure와 UserPromptSubmit 페이로드를 `/hook/standby-hint`로 보내며, 이 경로는 메모리의 대기 구간 기록을 읽고 훅 이벤트 행 하나를 기록
+5. **대기 경로**
+    - 주기마다 벽시계를 이전 주기와 비교하며, `power.gap_threshold_secs`를 넘는 도약은 최신 대기나 절전으로 프로세스 전체가 멈췄던 구간이므로 대기 구간으로 봄
+    - 활동 표식은 게이트웨이 요청 카운터와 훅 호출 카운터의 합이며, 표식이 바뀌거나 게이트웨이 스트림이 열려 있으면 `power.awake_grace_secs` 동안 절전 유예를 유지
+    - 각 대기 구간은 직전 주기가 활동에서 `power.awake_grace_secs` 안이었는지를 `active`로 가지며, 벽시계 역행은 활동 없음으로 봄
+    - 실패 안내는 `active`와 관계없이 도구 실행 구간(`duration_ms`에 주기 한 번을 더한 구간)과 겹친 대기 구간을 담고, 프롬프트 안내와 `duration_ms` 없는 실패의 조건부 안내는 `power.hint_window_secs` 안에 끝난 `active` 구간을 세션·구간 시작 시각마다 한 번 담음
+    - 감시 스레드가 기준보다 오래 주기를 돌지 않았으면 안내 경로는 마지막 주기 이후를 마지막 주기의 `active`를 가진 진행 중 대기 구간으로 보며, 나중에 기록되는 구간과 시작 시각이 같으므로 대기 한 번에 프롬프트 안내가 두 번 붙지 않음
+    - 감시 스레드는 새 주기 시각을 저장하기 전에 대기 구간을 기록하므로, 그 사이에 도착한 훅도 진행 중 구간이나 기록된 구간 중 하나를 봄
+    - `rap-power` 스레드의 drop guard는 스레드가 끝나면 마지막 주기 시각을 0으로 두고 warn 알림을 보내므로, 멈춘 감시 스레드가 영구적인 진행 중 구간이 되지 않음
+6. **게이트웨이 경로**
     - 응답 본문을 감싼 tap이 본문이 끝나거나 drop될 때, 중단된 경우도 포함해 시간과 토큰 사용량을 기록
     - `POST /v1/messages`만 계측하며, 첫 `content_block_delta` 이벤트가 첫 토큰 시각
     - 상류 연결 오류는 `502`, 응답 헤더가 `gateway.upstream_timeout_secs` 안에 오지 않으면 `504`를 반환하며, 스트리밍 본문에는 시한이 없음
     - 작성자의 환경은 `ANTHROPIC_BASE_URL=http://127.0.0.1:47332`와 `ANTHROPIC_DEFAULT_HAIKU_MODEL`로 Claude Code를 게이트웨이로 경유시키므로 Claude Code 자신의 API 트래픽이 이 경로를 지남
-6. **화면**
+7. **화면**
     - 관리 API, 대시보드, 일일 리포트는 모두 `store/query.rs`의 같은 집계 쿼리를 읽음
     - 대시보드는 키 `1`-`7`의 일곱 탭(개요, 도구, 훅, 모델, 에이전트, 설정, 리포트)이며 게이트웨이 탭은 없음: 게이트웨이 지연은 `GET /api/gateway`와 리포트로 계속 볼 수 있고, 개요의 서버 상태 카드는 게이트웨이 포트를 상태 점으로 표시
     - 실시간 이벤트는 관리 SSE 스트림이 읽는 broadcast 채널로 흐르며, 실시간 카운터는 별도의 원자적 값
@@ -321,3 +336,6 @@ sequenceDiagram
 8. **자식 프로세스**
     - `serve::ensure_background_serve`만 자식 프로세스를 띄움: `serve`와 같은 exe를 분리 실행하며, 명령 없이 실행했을 때 관리 포트가 응답하지 않을 경우 한 번만 실행하고, `build.rs`는 빌드 시점에 빌드 도구를 띄움
     - 훅 체인, 수집, 색인, 대시보드 경로는 아무것도 띄우지 않음
+9. **OS 전원 요청**
+    - 추가된 OS import는 `kernel32!SetThreadExecutionState` 하나이며 `ES_CONTINUOUS | ES_SYSTEM_REQUIRED` 또는 `ES_CONTINUOUS`로만 호출하고, `ES_DISPLAY_REQUIRED`는 설정하지 않으므로 화면 끄기·잠금 정책은 그대로 동작
+    - 대기 안내 경로는 `hook_event_name`, `session_id`, `duration_ms`만 읽으며 오류 본문, 도구 입력, 프롬프트 본문은 저장값이나 로그로 읽어 들이지 않음

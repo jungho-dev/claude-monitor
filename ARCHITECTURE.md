@@ -39,6 +39,7 @@ rust-agents-proxy/
 │   │   ├── chain.rs : pretool-chain decision, guard answer synthesis, fail-closed
 │   │   ├── rewrite.rs : conservative Bash rewrite (cat, ls, eza, git diff)
 │   │   ├── relay.rs : instrumented relay of other hook routes
+│   │   ├── standby.rs : standby hint route, additionalContext answer for tool failures and prompts
 │   │   ├── upstream.rs : keep-alive HTTP client to the guard with a deadline
 │   │   ├── record.rs : counters, live event, off-path store write
 │   │   ├── client.rs : blocking HTTP client and the hook command
@@ -60,6 +61,9 @@ rust-agents-proxy/
 │   │   ├── load.rs : read settings.json, .claude.json, agent and skill headers, no values
 │   │   ├── doctor.rs : data directory, ports, relay target, hook registration, allowed URL, telemetry, gateway, projects folder checks
 │   │   └── tests.rs : inventory and doctor tests on fixture Claude homes
+│   ├── power/
+│   │   ├── mod.rs : standby monitor thread, sleep postponement (direct Win32 declaration), gap ledger, hint text
+│   │   └── tests.rs : gap detection, hold and release, hint selection, hook answer tests
 │   └── tui/
 │       ├── mod.rs : terminal setup and restore, redraw-on-change event loop, command dispatch
 │       ├── state.rs : tabs, card focus, layout and scroll, window, panel data, key handling, selection kept across snapshots
@@ -118,11 +122,13 @@ rust-agents-proxy/
     - It runs one task each for admin, OTLP, hooks (when `hooks.enabled`), the transcript indexer (when `indexer.enabled`), and the report scheduler (when `report.enabled`).
     - The gateway runs on a dedicated OS thread, `rap-gateway`, with its own multi-thread runtime of 2 workers; the gateway is on by default and is skipped only when `gateway.enabled = false`.
     - The split keeps long streaming relays apart from hook and indexing load.
+    - With `power.enabled` (the default), a plain OS thread `rap-power` ticks every 5 seconds; `SetThreadExecutionState` binds the sleep postponement to the calling thread, so this one thread both sets and clears it.
 3. **Failure isolation**
     - The release profile sets `panic = "unwind"` so a panic stays inside one task.
     - Every accepted connection is its own tokio task, so a handler panic ends that connection only.
     - Start order: the gateway upstream is validated, the ports are bound in the order admin, OTLP, hooks, gateway and kept until the servers take them over, and only then the store is opened and `admin.token` is written, so a second `serve` that loses the admin bind never overwrites the token.
     - Required: admin, and hooks when `hooks.enabled`; a bind failure or an end or panic of either stops `serve` with a non-zero exit code.
+    - A failure to create the `rap-power` thread is printed and `serve` continues without the standby monitor.
     - Optional: OTLP and gateway; a bind failure skips that server with a warning, and an end of OTLP, the indexer, the report scheduler, or the gateway thread is logged and sent as a warn `Notice` live event while `serve` keeps running.
     - With `hooks.enabled = false` the hooks port is not taken.
     - `Ctrl+C` leaves the wait loop and aborts every task.
@@ -131,7 +137,7 @@ rust-agents-proxy/
     - SQLite access, indexing, report generation, and port probes run through `spawn_blocking`.
     - A hook event is written to the store off the response path, and the gateway tap writes its row when the response body is dropped.
 5. **Shared state**
-    - `AppContext` holds the configuration, the store, the live-event broadcast sender (capacity 1024), atomic live counters, the start time, and the admin token.
+    - `AppContext` holds the configuration, the store, the live-event broadcast sender (capacity 1024), atomic live counters, the start time, the admin token, and the `PowerState` (hold flag, last tick time, and the in-memory gap ledger of up to 32 gaps and 512 notified session and gap pairs).
 6. **Indexer cadence**
     - The indexer polls every `indexer.interval_secs` (30 s) on a blocking thread; its first run emits no live events.
     - The report scheduler waits for the first indexer run (polling every 2 s, up to 10 minutes, a warn notice on timeout) and then regenerates yesterday's report, replacing a stored one.
@@ -192,12 +198,21 @@ flowchart LR
     - Claude Code posts logs to `/v1/logs`; three event kinds become rows and the rest are ignored.
 4. **Hook path**
     - Claude Code posts the PreToolUse payload to `/hook/pretool-chain`; the next diagram shows the decision.
-5. **Gateway path**
+    - Claude Code posts PostToolUseFailure and UserPromptSubmit payloads to `/hook/standby-hint` when the user registers it; the route reads the in-memory gap ledger and writes one hook event row.
+5. **Standby path**
+    - Each tick compares the wall clock with the previous tick; a jump over `power.gap_threshold_secs` is a gap, because the whole process was paused by Modern Standby or sleep.
+    - The activity mark is the sum of the gateway request and hook call counters; a changed mark or an open gateway stream keeps the postponement for `power.awake_grace_secs`.
+    - Each gap stores `active`, whether the previous tick was within `power.awake_grace_secs` of activity; a step backward of the wall clock counts as no activity.
+    - A failure hint covers gaps overlapping the tool run (`duration_ms` plus one tick) whatever `active` says; a prompt hint, and the conditional hint for a failure without `duration_ms`, cover `active` gaps ended within `power.hint_window_secs`, once per session and gap start time.
+    - When the monitor has not ticked for longer than the threshold, the hint route treats the time since the last tick as a pending gap with the last tick's `active`; it shares the start time of the gap recorded later, so one standby never produces two prompt hints.
+    - The monitor records a gap before it stores the new tick time, so a hook arriving in between still sees either the pending or the recorded gap.
+    - A drop guard on the `rap-power` thread sets the last tick time to 0 and sends a warn notice when the thread ends, so a dead monitor never turns into a permanent pending gap.
+6. **Gateway path**
     - A tap around the response body records timing and token usage when the body ends or is dropped, including on abort.
     - Only `POST /v1/messages` is tapped; the first `content_block_delta` event marks the first token.
     - An upstream connection error returns `502`; response headers that miss `gateway.upstream_timeout_secs` return `504`, and the streamed body has no deadline.
     - The author's setup routes Claude Code through it with `ANTHROPIC_BASE_URL=http://127.0.0.1:47332` and `ANTHROPIC_DEFAULT_HAIKU_MODEL`, so Claude Code's own API traffic passes this path.
-6. **Views**
+7. **Views**
     - The admin API, the dashboard, and the daily report all read the same aggregate queries in `store/query.rs`.
     - The dashboard has seven tabs on keys `1`-`7` (overview, tools, hooks, models, agents, settings, report) and no gateway tab; gateway timing stays available through `GET /api/gateway` and the report, and the overview server-status card shows the gateway port as a status dot.
     - Live events travel through a broadcast channel that the admin SSE stream reads; the live counters are separate atomics.
@@ -321,3 +336,6 @@ sequenceDiagram
 8. **Child processes**
     - Only `serve::ensure_background_serve` spawns a child: the same exe as `serve`, detached, once per no-command launch when the admin port does not answer; `build.rs` spawns build tools at build time.
     - The hook chain, intake, indexing, and dashboard paths spawn nothing.
+9. **OS power request**
+    - The only added OS import is `kernel32!SetThreadExecutionState`, called with `ES_CONTINUOUS | ES_SYSTEM_REQUIRED` or `ES_CONTINUOUS`; `ES_DISPLAY_REQUIRED` is never set, so the screen-off and lock policy keeps working.
+    - The standby hint route reads `hook_event_name`, `session_id`, and `duration_ms` only; the error text, tool input, and prompt text are never read into a stored value or a log.

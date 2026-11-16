@@ -6,6 +6,7 @@ pub mod client;
 pub mod record;
 pub mod relay;
 pub mod rewrite;
+pub mod standby;
 pub mod upstream;
 
 #[cfg(test)]
@@ -14,7 +15,7 @@ mod chain_tests;
 pub use client::run_hook_client;
 
 use crate::core::context::AppContext;
-use crate::core::model::HookEventRow;
+use crate::core::model::{HookEventRow, HookOutcome};
 use crate::net::common::{
     ResponseBody, full_body, serve_local_http, serve_local_listener, text_response,
 };
@@ -96,6 +97,7 @@ async fn route_hook_request(state: &HookState, req: Request<Incoming>) -> Respon
 
     // 3. 경로 판별
     let is_chain = path == "/hook/pretool-chain";
+    let is_standby = path == "/hook/standby-hint";
     let relay_route: Option<String> = path.strip_prefix("/hook/relay/").map(str::to_string);
     if let Some(route) = &relay_route {
         let valid = !route.is_empty()
@@ -105,11 +107,37 @@ async fn route_hook_request(state: &HookState, req: Request<Incoming>) -> Respon
         if !valid {
             return text_response(StatusCode::BAD_REQUEST, "invalid relay route");
         }
-    } else if !is_chain {
+    } else if !is_chain && !is_standby {
         return text_response(StatusCode::NOT_FOUND, "not found");
     }
 
-    // 4. 체인 판정
+    // 4. 대기 복귀 안내
+    if is_standby {
+        let result = standby::evaluate_standby_hint(&state.ctx, &body);
+        record::record_hook_event(
+            &state.ctx,
+            HookEventRow {
+                session_id: result.session_id,
+                route: "standby-hint".to_string(),
+                guard: if result.hinted {
+                    "standby-hint".to_string()
+                } else {
+                    String::new()
+                },
+                outcome: HookOutcome::Allow,
+                duration_ms: Some(i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)),
+                ..Default::default()
+            },
+        );
+        let mut response = Response::new(full_body(result.body));
+        response.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/json; charset=utf-8"),
+        );
+        return response;
+    }
+
+    // 5. 체인 판정
     let hooks = &state.ctx.config.hooks;
     if is_chain {
         let result = chain::evaluate_pretool_chain(&state.upstream, hooks, &body).await;
@@ -134,7 +162,7 @@ async fn route_hook_request(state: &HookState, req: Request<Incoming>) -> Respon
         return response;
     }
 
-    // 5. 계측 중계
+    // 6. 계측 중계
     let route = relay_route.unwrap_or_default();
     let result = relay::relay_hook_request(&state.upstream, hooks, &route, body).await;
     record::record_hook_event(
