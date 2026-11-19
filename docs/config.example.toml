@@ -33,11 +33,13 @@ enabled = true
 interval_secs = 30
 backfill_days = 7
 
-# Daily report
+# Daily and weekly reports (weekly = ISO week, Mon-Sun, written on Monday's run as YYYY-Www)
 [report]
 enabled = true
 # dir = "C:/Users/<user>/.config/claude-monitor/reports"
 run_hour = 0
+# Report text language: "ko" or "en"
+language = "ko"
 
 # Modern Standby handling (sleep postponement, standby gap detection, resume hints)
 [power]
@@ -46,3 +48,14 @@ keep_awake = true
 awake_grace_secs = 600
 gap_threshold_secs = 60
 hint_window_secs = 1800
+
+# Cost estimate rate overrides (USD per million tokens); built-in rates stay for every model not listed
+# The key is the model name without the claude- prefix and matches by prefix, so "opus-5-5" also covers claude-opus-5-5-20260101; the longest matching key wins and replaces the built-in rate of that model
+# input and output are required; an omitted cache_write_5m, cache_write_1h, or cache_read becomes 1.25x, 2x, or 0.1x of input
+# A listed model uses one flat rate (the built-in over-100k-token prompt tier of haiku-5-5 no longer applies)
+# [pricing.models."opus-5-5"]
+# input = 4.0
+# output = 20.0
+# cache_write_5m = 5.0
+# cache_write_1h = 8.0
+# cache_read = 0.2

@@ -10,19 +10,20 @@ use super::{MIN_HEIGHT, MIN_WIDTH, render_frame};
 use crate::core::model::LiveEvent;
 use crate::inventory::{AgentEntry, DoctorFinding, HookEntry, Inventory, McpEntry};
 use crate::store::query::{
-    AgentStatsRow, CacheBreakRow, HookStatRow, ModelStatsRow, ToolLatencyRow,
+    AgentStatsRow, CacheBreakRow, HookStatRow, ModelStatsRow, OverviewStats, ToolLatencyRow,
 };
 use crate::tui::cards::{CardId, CardKind, CardMove, ColumnHit, HeaderHit, UiAction};
 use crate::tui::i18n::{self, Lang};
 use crate::tui::layout::{IDENTITY_ORDER, SplitGroup};
 use crate::tui::poller::POLL_INTERVAL;
 use crate::tui::sort::{SortKind, SortState, sort_spec};
-use crate::tui::state::{ActiveTab, AppState, Panel, Toast, ToastLevel, UiCommand};
+use crate::tui::state::{ActiveTab, AppState, LimitsData, Panel, Toast, ToastLevel, UiCommand};
 use crate::tui::test_support::{
-    sample_config, sample_state_with_snapshot, sample_state_with_tables,
+    fixed_limits_now, sample_config, sample_state_with_limits, sample_state_with_snapshot,
+    sample_state_with_tables,
 };
 use crate::tui::theme;
-use chrono::{Duration as ChronoDuration, NaiveDate, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveDate, SecondsFormat, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -203,7 +204,7 @@ fn every_tab_renders_in_both_languages_at_the_size_matrix_with_consistent_chrome
 
                 // 1. 앱 바 배지와 탭 바 (탭마다 적중 영역이 그 탭 글자를 덮음)
                 assert!(row_text(&buffer, 0).contains("claude-monitor"), "{case}");
-                assert_eq!(state.hit_areas.tab_rects.len(), 7, "{case}");
+                assert_eq!(state.hit_areas.tab_rects.len(), 8, "{case}");
                 for (hit_tab, rect) in &state.hit_areas.tab_rects {
                     let text = rect_text(&buffer, rect.y, rect.x, rect.right());
                     assert_eq!(rect.y, 1, "{case}");
@@ -849,7 +850,7 @@ fn registered_header_row_and_title_hit_areas_respond_to_a_click_at_the_size_matr
                 // 머리글: 누른 열이 그 카드의 정렬 열이 됨
                 for hit in probe.hit_areas.header_cells.clone() {
                     let mut state = fresh();
-                    click(&mut state, hit.rect.x, hit.rect.y);
+                    click(&mut state, hit.rect.x + hit.rect.width / 2, hit.rect.y);
                     assert_eq!(
                         state.card_sorts[hit.card as usize].column, hit.column,
                         "{case} {hit:?}"
@@ -1300,20 +1301,32 @@ fn new_table_cards_register_header_and_boundary_hit_areas_that_match_the_drawn_c
                     let left = &headers[index];
                     assert_eq!(bound.column, left.column, "{case}");
                     assert_eq!(bound.width, left.rect.width, "{case}");
-                    assert_eq!(bound.grab.x, left.rect.right(), "{case}");
-                    assert_eq!(bound.grab.y, left.rect.y, "{case}");
-                    assert_eq!((bound.grab.width, bound.grab.height), (1, 1), "{case}");
+                    assert_eq!(bound.line.x, left.rect.right(), "{case}");
+                    assert_eq!(bound.line.y, left.rect.y, "{case}");
                     assert!(
                         bound.min <= bound.width && bound.width <= bound.max,
                         "{case}"
                     );
-                    assert_eq!(bound.line.x, bound.grab.x, "{case}");
                     assert!(bound.line.height >= 2, "{case}");
 
-                    // 오른쪽 이웃 머리글이 그 바로 다음 칸에서 시작하고, 경계 칸 자체는 평소 빈 칸
-                    assert_eq!(headers[index + 1].rect.x, bound.grab.x + 1, "{case}");
-                    let cell = buffer.cell((bound.grab.x, bound.grab.y)).unwrap();
-                    assert_eq!(cell.symbol(), " ", "{case}");
+                    // 잡는 칸: 머리글 한 행, 경계 칸을 포함해 양옆 열로 최대 한 칸씩, 양옆 머리글 밖으로 나가지 않음
+                    let right = &headers[index + 1];
+                    assert_eq!(
+                        (bound.grab.y, bound.grab.height),
+                        (bound.line.y, 1),
+                        "{case}"
+                    );
+                    assert!(bound.grab.x <= bound.line.x, "{case}");
+                    assert!(bound.line.x < bound.grab.right(), "{case}");
+                    assert!((1..=3).contains(&bound.grab.width), "{case}");
+                    assert!(bound.grab.x > left.rect.x, "{case}");
+                    assert!(bound.grab.right() < right.rect.right(), "{case}");
+
+                    // 오른쪽 이웃 머리글이 그 바로 다음 칸에서 시작하고, 경계 칸은 평소 흐린 │
+                    assert_eq!(right.rect.x, bound.line.x + 1, "{case}");
+                    let cell = buffer.cell((bound.line.x, bound.line.y)).unwrap();
+                    assert_eq!(cell.symbol(), "│", "{case}");
+                    assert_eq!(cell.fg, theme::FG_FAINT, "{case}");
                 }
             }
         }
@@ -1336,11 +1349,11 @@ fn dragging_a_new_card_boundary_resizes_the_column_and_a_quick_second_click_rese
         let down = |x: u16| mouse_event(MouseEventKind::Down(MouseButton::Left), x, bound.grab.y);
 
         // 끌기: 폭 +3, 놓으면 저장 요청
-        state.handle_mouse_event_at(down(bound.grab.x), after(0));
+        state.handle_mouse_event_at(down(bound.line.x), after(0));
         state.handle_mouse_event_at(
             mouse_event(
                 MouseEventKind::Drag(MouseButton::Left),
-                bound.grab.x + 3,
+                bound.line.x + 3,
                 bound.grab.y,
             ),
             after(10),
@@ -1348,7 +1361,7 @@ fn dragging_a_new_card_boundary_resizes_the_column_and_a_quick_second_click_rese
         let released = state.handle_mouse_event_at(
             mouse_event(
                 MouseEventKind::Up(MouseButton::Left),
-                bound.grab.x + 3,
+                bound.line.x + 3,
                 bound.grab.y,
             ),
             after(20),
@@ -1368,16 +1381,16 @@ fn dragging_a_new_card_boundary_resizes_the_column_and_a_quick_second_click_rese
 
         // 끌지 않은 클릭 뒤 곧바로 다시 누르면 자동 폭 복원
         let again = column_hits_of(&state, card)[0];
-        state.handle_mouse_event_at(down(again.grab.x), after(100));
+        state.handle_mouse_event_at(down(again.line.x), after(100));
         state.handle_mouse_event_at(
             mouse_event(
                 MouseEventKind::Up(MouseButton::Left),
-                again.grab.x,
+                again.line.x,
                 again.grab.y,
             ),
             after(110),
         );
-        let reset = state.handle_mouse_event_at(down(again.grab.x), after(200));
+        let reset = state.handle_mouse_event_at(down(again.line.x), after(200));
         assert_eq!(reset, UiCommand::SaveState, "{case}");
         assert!(
             state.column_widths[card as usize]
@@ -1422,7 +1435,7 @@ fn new_table_card_headers_sort_numbers_descending_first_and_text_ascending_first
                 spec.default,
             ];
             for expected in steps {
-                click(&mut state, hit.rect.x, hit.rect.y);
+                click(&mut state, hit.rect.x + hit.rect.width / 2, hit.rect.y);
                 assert_eq!(
                     state.card_sorts[card as usize], expected,
                     "{card:?} {kind:?} column {}",
@@ -1669,6 +1682,614 @@ fn pinned_badge_and_chip_use_their_own_fill_with_the_word_and_never_the_warn_col
                 assert!(text.contains(off_word), "{case}: {text}");
                 assert_eq!(buffer.cell((chip.x, chip.y)).unwrap().bg, theme::BG_TONAL);
             }
+        }
+    }
+}
+
+// 10. 한도 카드·캐시 타이머 카드 ----------------------------------------------
+// 카드 영역(테두리 포함) 안 모든 줄의 글자
+fn card_text(buffer: &Buffer, state: &AppState, card: CardId) -> String {
+    let rect = card_rect_of(state, card);
+    (rect.y..rect.bottom())
+        .map(|y| rect_text(buffer, y, rect.x, rect.right()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// 한도 카드에 스냅샷 나이(초)를 지정
+fn limits_state_aged(lang: Lang, age_secs: i64) -> AppState {
+    let mut state = sample_state_with_limits(lang);
+    if let Panel::Ready(data) = &mut state.snapshot.limits
+        && let Some(latest) = data.latest.as_mut()
+    {
+        latest.ts = (fixed_limits_now() - ChronoDuration::seconds(age_secs))
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
+    }
+    state
+}
+
+// 카드 안쪽 한 줄(테두리 안 첫 줄이 0)의 첫 막대 채움 칸 글자 색
+fn first_bar_color(
+    buffer: &Buffer,
+    state: &AppState,
+    card: CardId,
+    row: u16,
+) -> Option<ratatui::style::Color> {
+    let rect = card_rect_of(state, card);
+    let y = rect.y + 1 + row;
+    (rect.x + 1..rect.right() - 1)
+        .find(|x| {
+            buffer
+                .cell((*x, y))
+                .is_some_and(|cell| cell.symbol() == "█")
+        })
+        .and_then(|x| buffer.cell((x, y)).and_then(|cell| cell.style().fg))
+}
+
+#[test]
+fn limits_card_shows_bars_countdowns_pace_projection_context_and_api_key_at_the_size_matrix() {
+    // 5시간 줄 소진 예상: 마지막 스냅샷(12초 전, 70%) + 남은 30%를 한 시간 20%p 속도로 = 5370초 뒤
+    let exhaust_clock = DateTime::from_timestamp(fixed_limits_now().timestamp() + 5_370, 0)
+        .unwrap()
+        .with_timezone(&Local)
+        .format("%H:%M")
+        .to_string();
+    for lang in [Lang::En, Lang::Ko] {
+        for (width, height) in [(100u16, 30u16), (130, 40)] {
+            let case = format!("{} {width}x{height}", lang_name(lang));
+            let mut state = sample_state_with_limits(lang);
+            let buffer = draw(&mut state, width, height);
+            let text = card_text(&buffer, &state, CardId::LimitsCard);
+            let rect = card_rect_of(&state, CardId::LimitsCard);
+            assert_eq!(rect.right(), width, "{case}");
+            assert_eq!(rect.height, 6, "{case}");
+            assert!(
+                state
+                    .hit_areas
+                    .title_hits
+                    .iter()
+                    .any(|hit| hit.card == CardId::LimitsCard),
+                "{case}"
+            );
+
+            // 이름·퍼센트 숫자·막대·리셋 카운트다운·페이스 글자와 단어·컨텍스트·API 키 남은 양
+            let (reset, pace, compact, hint) = match lang {
+                Lang::En => ("in 3h 00m", "▲ ahead", "compact 2", "official · 12s ago"),
+                Lang::Ko => ("3h 00m 후", "▲ 빠름", "압축 2회", "공식 · 12s 전"),
+            };
+            for needle in [
+                "5h",
+                "7d",
+                "ctx",
+                "API",
+                "70%",
+                "35%",
+                "62%",
+                "█",
+                "░",
+                reset,
+                pace,
+                compact,
+                hint,
+                "480/500",
+                "80.0K/100.0K",
+            ] {
+                assert!(text.contains(needle), "{case} {needle}\n{text}");
+            }
+
+            // API 키 리셋 카운트다운도 넓은 카드에만
+            let api_reset = match lang {
+                Lang::En => "in 12m 00s",
+                Lang::Ko => "12m 00s 후",
+            };
+            assert_eq!(text.contains(api_reset), width == 130, "{case}\n{text}");
+
+            // 소진 예상 시각은 넓은 카드에만 (좋으면 페이스보다 뒤에서 덜어냄)
+            let projection = format!("→ {exhaust_clock}");
+            assert_eq!(text.contains(&projection), width == 130, "{case}\n{text}");
+        }
+    }
+}
+
+#[test]
+fn limits_bar_and_number_turn_warn_at_80_and_critical_at_95_and_stay_paired() {
+    for (pct, color) in [
+        (0.0, None),
+        (79.0, Some(theme::COLOR_OK)),
+        (80.0, Some(theme::COLOR_WARN)),
+        (94.0, Some(theme::COLOR_WARN)),
+        (95.0, Some(theme::COLOR_CRIT)),
+        (100.0, Some(theme::COLOR_CRIT)),
+    ] {
+        for lang in [Lang::En, Lang::Ko] {
+            let case = format!("{pct} {}", lang_name(lang));
+            let mut state = sample_state_with_limits(lang);
+            if let Panel::Ready(data) = &mut state.snapshot.limits
+                && let Some(latest) = data.latest.as_mut()
+            {
+                latest.five_hour_pct = Some(pct);
+            }
+            let buffer = draw(&mut state, 130, 40);
+            let text = card_text(&buffer, &state, CardId::LimitsCard);
+            assert!(text.contains(&format!("{pct:.0}%")), "{case}\n{text}");
+            assert_eq!(
+                first_bar_color(&buffer, &state, CardId::LimitsCard, 0),
+                color,
+                "{case}"
+            );
+
+            // 숫자 칸도 같은 색 (색만으로 알리지 않고 숫자가 함께 있음)
+            if let Some(expected) = color {
+                let rect = card_rect_of(&state, CardId::LimitsCard);
+                let y = rect.y + 1;
+                let number_x = (rect.x + 1..rect.right() - 1)
+                    .find(|x| {
+                        buffer
+                            .cell((*x, y))
+                            .is_some_and(|cell| cell.symbol() == "%")
+                    })
+                    .unwrap();
+                let digit = buffer.cell((number_x - 1, y)).unwrap();
+                assert_eq!(digit.style().fg, Some(expected), "{case}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_stale_limits_snapshot_dims_every_value_names_the_age_and_hides_the_projection() {
+    for lang in [Lang::En, Lang::Ko] {
+        for (width, height) in [(100u16, 30u16), (130, 40)] {
+            let case = format!("{} {width}x{height}", lang_name(lang));
+            let mut state = limits_state_aged(lang, 45 * 60);
+            let buffer = draw(&mut state, width, height);
+            let text = card_text(&buffer, &state, CardId::LimitsCard);
+            let word = match lang {
+                Lang::En => "stale 45m",
+                Lang::Ko => "지연 45m",
+            };
+            assert!(text.contains(word), "{case}\n{text}");
+            assert!(
+                text.contains("70%") && text.contains("62%"),
+                "{case}\n{text}"
+            );
+            assert!(!text.contains('→'), "{case}\n{text}");
+            let rect = card_rect_of(&state, CardId::LimitsCard);
+            for y in rect.y + 1..rect.bottom() - 1 {
+                for x in rect.x + 1..rect.right() - 1 {
+                    let fg = buffer.cell((x, y)).unwrap().style().fg;
+                    assert!(
+                        ![
+                            Some(theme::COLOR_OK),
+                            Some(theme::COLOR_WARN),
+                            Some(theme::COLOR_CRIT)
+                        ]
+                        .contains(&fg),
+                        "{case} ({x},{y})"
+                    );
+                }
+            }
+
+            // 30분 이하는 흐리지 않음: 색 한도 표시가 있고 단어 stale 없음
+            let mut fresh = limits_state_aged(lang, 29 * 60);
+            let buffer = draw(&mut fresh, width, height);
+            let text = card_text(&buffer, &fresh, CardId::LimitsCard);
+            assert!(!text.contains(word), "{case}\n{text}");
+            assert_eq!(
+                first_bar_color(&buffer, &fresh, CardId::LimitsCard, 0),
+                Some(theme::COLOR_OK),
+                "{case}"
+            );
+        }
+    }
+}
+
+#[test]
+fn limits_card_without_a_snapshot_guides_to_the_statusline_or_falls_back_to_labeled_estimates() {
+    for lang in [Lang::En, Lang::Ko] {
+        for (width, height) in [(100u16, 30u16), (130, 40)] {
+            let case = format!("{} {width}x{height}", lang_name(lang));
+
+            // 빈 상태: 제목 한 줄과 설정 안내
+            let mut state = sample_state_with_limits(lang);
+            state.snapshot.limits = Panel::Ready(LimitsData::default());
+            let buffer = draw(&mut state, width, height);
+            let text = card_text(&buffer, &state, CardId::LimitsCard);
+            let headline = match lang {
+                Lang::En => "No official limit data",
+                Lang::Ko => "공식 한도 값 없음",
+            };
+            assert!(text.contains(headline), "{case}\n{text}");
+            assert!(text.contains("statusLine"), "{case}\n{text}");
+            assert!(text.contains("statusline"), "{case}\n{text}");
+
+            // 추정만 있을 때: 추정 단어와 토큰 수, 공식 퍼센트 없음
+            let estimate = |tokens: i64| {
+                Some(OverviewStats {
+                    input_tokens: tokens,
+                    output_tokens: tokens / 5,
+                    ..OverviewStats::default()
+                })
+            };
+            state.snapshot.limits = Panel::Ready(LimitsData {
+                estimate_5h: estimate(1_000_000),
+                estimate_7d: estimate(4_500_000),
+                ..LimitsData::default()
+            });
+            let buffer = draw(&mut state, width, height);
+            let text = card_text(&buffer, &state, CardId::LimitsCard);
+            let word = match lang {
+                Lang::En => "estimate",
+                Lang::Ko => "추정",
+            };
+            for needle in [word, "1.2M", "5.4M", "5h", "7d"] {
+                assert!(text.contains(needle), "{case} {needle}\n{text}");
+            }
+            assert!(!text.contains('%'), "{case}\n{text}");
+
+            // 아직 수집 전
+            state.snapshot.limits = Panel::Pending;
+            let buffer = draw(&mut state, width, height);
+            let text = card_text(&buffer, &state, CardId::LimitsCard);
+            let pending = i18n::text(lang, i18n::Msg::PanelPending);
+            assert!(text.contains(pending), "{case}\n{text}");
+        }
+    }
+}
+
+#[test]
+fn limits_and_cache_cards_follow_the_size_rules_at_minimum_and_narrow_sizes() {
+    for lang in [Lang::En, Lang::Ko] {
+        let case = lang_name(lang);
+
+        // 최소 크기의 낮은 개요: 추이 줄과 함께 한도 카드는 빠지고 올바른 본문은 그대로
+        let mut state = sample_state_with_limits(lang);
+        draw(&mut state, MIN_WIDTH, MIN_HEIGHT);
+        assert!(
+            !state
+                .hit_areas
+                .card_rects
+                .iter()
+                .any(|(card, _)| *card == CardId::LimitsCard),
+            "{case}"
+        );
+
+        // 모델 탭의 최소 크기: 캐시 타이머 카드는 숨김, 표·상세·붕괴 표는 그대로
+        let mut state = sample_state_with_limits(lang);
+        state.tab = ActiveTab::Models;
+        draw(&mut state, MIN_WIDTH, MIN_HEIGHT);
+        let drawn: Vec<CardId> = state
+            .hit_areas
+            .card_rects
+            .iter()
+            .map(|(card, _)| *card)
+            .collect();
+        assert!(!drawn.contains(&CardId::CacheTimer), "{case}");
+        for card in [CardId::ModelTable, CardId::ModelDetail, CardId::CacheBreaks] {
+            assert!(drawn.contains(&card), "{case} {card:?}");
+        }
+
+        // 폭이 좁은 큰 화면(60x30): 한도 카드는 오른쪽 끝, 이름·퍼센트·카운트다운을 유지
+        let mut state = sample_state_with_limits(lang);
+        let buffer = draw(&mut state, 60, 30);
+        let rect = card_rect_of(&state, CardId::LimitsCard);
+        assert_eq!(rect.right(), 60, "{case}");
+        let text = card_text(&buffer, &state, CardId::LimitsCard);
+        for needle in ["5h", "7d", "70%"] {
+            assert!(text.contains(needle), "{case} {needle}\n{text}");
+        }
+
+        // 카드 영역끼리 곹치지 않고 내용이 현재 카드 안에 있음 (모델 탭 카드 높이 최소 22행에서도 네 카드)
+        let mut state = sample_state_with_limits(lang);
+        state.tab = ActiveTab::Models;
+        draw(&mut state, 100, 26);
+        let mut rects: Vec<Rect> = [
+            CardId::ModelTable,
+            CardId::ModelDetail,
+            CardId::CacheBreaks,
+            CardId::CacheTimer,
+        ]
+        .iter()
+        .map(|card| card_rect_of(&state, *card))
+        .collect();
+        rects.sort_by_key(|rect| rect.y);
+        for pair in rects.windows(2) {
+            assert_eq!(pair[0].bottom(), pair[1].y, "{case}");
+        }
+        assert!(
+            rects.iter().all(|rect| rect.height >= 3),
+            "{case} {rects:?}"
+        );
+        assert_eq!(rects[3].bottom(), 24, "{case}");
+    }
+}
+
+// 낮은 모델 탭에서 사라지는 카드는 항상 캐시 타이머 (그 카드를 어느 칸으로 옮겨도 표·상세·붕괴 표는 남음)
+#[test]
+fn the_cache_timer_is_the_card_that_disappears_on_a_short_models_tab_wherever_it_sits() {
+    for lang in [Lang::En, Lang::Ko] {
+        for slot in 0..4 {
+            let case = format!("{} slot {slot}", lang_name(lang));
+            let mut state = sample_state_with_limits(lang);
+            state.tab = ActiveTab::Models;
+            state
+                .card_layout
+                .move_card_to_slot(SplitGroup::ModelsRows, &IDENTITY_ORDER, 3, slot);
+            let buffer = draw(&mut state, 100, 24);
+            let drawn: Vec<CardId> = state
+                .hit_areas
+                .card_rects
+                .iter()
+                .map(|(card, _)| *card)
+                .collect();
+            assert!(!drawn.contains(&CardId::CacheTimer), "{case} {drawn:?}");
+            for (card, min_height) in [
+                (CardId::ModelTable, 5),
+                (CardId::ModelDetail, 4),
+                (CardId::CacheBreaks, 3),
+            ] {
+                assert!(drawn.contains(&card), "{case} {card:?}");
+                let rect = card_rect_of(&state, card);
+                assert!(rect.height >= min_height, "{case} {card:?} {rect:?}");
+            }
+            let detail = card_text(&buffer, &state, CardId::ModelDetail);
+            assert!(detail.contains("claude-"), "{case}\n{detail}");
+
+            // 높은 화면에서는 캐시 타이머가 옮겨 놓은 칸에서 그려짐
+            draw(&mut state, 100, 30);
+            let rect = card_rect_of(&state, CardId::CacheTimer);
+            assert!(rect.height >= 3, "{case} {rect:?}");
+        }
+    }
+}
+
+// 폭 60 개요 추이 줄: 읽을 수 있는 폭(12열) 밑의 추이 카드 둘은 숨기고 절약·한도 카드가 폭을 나눠 갖음
+#[test]
+fn the_overview_trend_row_hides_the_trend_cards_below_a_readable_width() {
+    for lang in [Lang::En, Lang::Ko] {
+        let case = lang_name(lang);
+        let mut state = sample_state_with_limits(lang);
+        let buffer = draw(&mut state, 60, 24);
+        let drawn: Vec<CardId> = state
+            .hit_areas
+            .card_rects
+            .iter()
+            .map(|(card, _)| *card)
+            .collect();
+        assert!(
+            !drawn.contains(&CardId::TrendRequests) && !drawn.contains(&CardId::TrendTokens),
+            "{case} {drawn:?}"
+        );
+        let savings = card_rect_of(&state, CardId::SavingsEffect);
+        let limits = card_rect_of(&state, CardId::LimitsCard);
+        assert!(savings.width >= 24 && limits.width >= 28, "{case}");
+        assert_eq!(savings.right() + 1, limits.x, "{case}");
+        assert_eq!(limits.right(), 60, "{case}");
+        let text = card_text(&buffer, &state, CardId::LimitsCard);
+        for needle in ["5h", "7d", "70%"] {
+            assert!(text.contains(needle), "{case} {needle}\n{text}");
+        }
+        assert!(
+            state
+                .hit_areas
+                .split_hits
+                .iter()
+                .all(|hit| hit.group != SplitGroup::OverviewTrendCols),
+            "{case}"
+        );
+
+        // 저장한 비율이 있거나 카드 순서를 바꿔도 같은 폭에서는 추이 카드가 숨김 (폭을 남기지 않음)
+        assert!(
+            state
+                .card_layout
+                .restore_ratios(SplitGroup::OverviewTrendCols, &[2_000, 5_000, 7_000])
+        );
+        state
+            .card_layout
+            .move_card_to_slot(SplitGroup::OverviewTrendCols, &IDENTITY_ORDER, 3, 0);
+        draw(&mut state, 60, 24);
+        let limits = card_rect_of(&state, CardId::LimitsCard);
+        let savings = card_rect_of(&state, CardId::SavingsEffect);
+        assert!(
+            !state
+                .hit_areas
+                .card_rects
+                .iter()
+                .any(|(card, _)| *card == CardId::TrendTokens),
+            "{case}"
+        );
+        assert!(limits.x < savings.x, "{case}");
+        assert_eq!(savings.right(), 60, "{case}");
+
+        // 중간·큰 폭에서는 추이 카드가 그대로 보이고 읽을 수 있는 폭을 갖음
+        for (width, height) in [(100u16, 30u16), (130, 40)] {
+            let mut state = sample_state_with_limits(lang);
+            draw(&mut state, width, height);
+            for card in [CardId::TrendRequests, CardId::TrendTokens] {
+                let rect = card_rect_of(&state, card);
+                assert!(
+                    rect.width >= 12,
+                    "{case} {width}x{height} {card:?} {rect:?}"
+                );
+            }
+        }
+    }
+}
+
+// 한도 퍼센트·캐시 적중 단계는 색과 함께 표식(경고 !, 위험 !!)이 붙고 정상은 표식이 없음
+#[test]
+fn limit_and_cache_hit_levels_carry_a_mark_besides_the_color_at_the_size_matrix() {
+    for lang in [Lang::En, Lang::Ko] {
+        let hit_word = match lang {
+            Lang::En => "hit",
+            Lang::Ko => "적중",
+        };
+        for (width, height) in [(100u16, 30u16), (130, 40)] {
+            let case = format!("{} {width}x{height}", lang_name(lang));
+
+            // 정상 단계: 표식 없음
+            let mut state = sample_state_with_limits(lang);
+            let buffer = draw(&mut state, width, height);
+            let limits = card_text(&buffer, &state, CardId::LimitsCard);
+            assert!(!limits.contains('!'), "{case}\n{limits}");
+            state.tab = ActiveTab::Models;
+            let buffer = draw(&mut state, width, height);
+            let cache = card_text(&buffer, &state, CardId::CacheTimer);
+            assert!(!cache.contains('!'), "{case}\n{cache}");
+
+            // 경고·위험 단계: 퍼센트 뒤에 표식
+            for (ratio, mark) in [(0.6, "!"), (0.3, "!!")] {
+                let mut state = sample_state_with_limits(lang);
+                if let Panel::Ready(data) = &mut state.snapshot.limits
+                    && let Some(latest) = data.latest.as_mut()
+                {
+                    latest.five_hour_pct = Some(85.0);
+                    latest.seven_day_pct = Some(97.0);
+                    latest.cache_hit_ratio = Some(ratio);
+                }
+                let buffer = draw(&mut state, width, height);
+                let limits = card_text(&buffer, &state, CardId::LimitsCard);
+                assert!(limits.contains("85% !"), "{case}\n{limits}");
+                assert!(limits.contains("97% !!"), "{case}\n{limits}");
+                state.tab = ActiveTab::Models;
+                let buffer = draw(&mut state, width, height);
+                let cache = card_text(&buffer, &state, CardId::CacheTimer);
+                let needle = format!("{hit_word} {:.0}% {mark}", ratio * 100.0);
+                assert!(cache.contains(&needle), "{case} {needle}\n{cache}");
+            }
+        }
+    }
+}
+
+#[test]
+fn the_limits_card_joins_the_overview_card_group_reorder_and_the_l_reset() {
+    let mut state = sample_state_with_limits(Lang::En);
+    assert_eq!(
+        CardId::LimitsCard.reorder_slot(),
+        Some((SplitGroup::OverviewTrendCols, 3))
+    );
+    let buffer = draw(&mut state, 130, 40);
+    let default_rect = card_rect_of(&state, CardId::LimitsCard);
+    assert!(default_rect.x > card_rect_of(&state, CardId::SavingsEffect).x);
+    assert!(buffer.area.width == 130);
+
+    // 맨 앞 칸으로 옮기면 칸 크기는 칸에 남고 한도 카드가 왼쪽 끝에 옴
+    state
+        .card_layout
+        .move_card_to_slot(SplitGroup::OverviewTrendCols, &IDENTITY_ORDER, 3, 0);
+    let buffer = draw(&mut state, 130, 40);
+    let moved_rect = card_rect_of(&state, CardId::LimitsCard);
+    assert!(moved_rect.x < card_rect_of(&state, CardId::SavingsEffect).x);
+    assert_eq!(moved_rect.width, 28);
+    let text = card_text(&buffer, &state, CardId::LimitsCard);
+    assert!(text.contains("5h") && text.contains("70%"), "{text}");
+
+    // l 키로 순서 초기화
+    let command = state.handle_key_event(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+    assert_eq!(command, UiCommand::SaveState);
+    assert_eq!(
+        state.card_layout.order_of(SplitGroup::OverviewTrendCols),
+        IDENTITY_ORDER
+    );
+    draw(&mut state, 130, 40);
+    assert_eq!(card_rect_of(&state, CardId::LimitsCard), default_rect);
+}
+
+#[test]
+fn cache_timer_card_counts_down_on_every_redraw_and_reports_hit_misses_and_the_last_miss() {
+    for lang in [Lang::En, Lang::Ko] {
+        for (width, height) in [(100u16, 30u16), (130, 40)] {
+            let case = format!("{} {width}x{height}", lang_name(lang));
+            let mut state = sample_state_with_limits(lang);
+            state.tab = ActiveTab::Models;
+            let words: [&str; 9] = match lang {
+                Lang::En => [
+                    "warm",
+                    "4m 12s left",
+                    "TTL 5m",
+                    "hit 82%",
+                    "misses 9/50",
+                    "last miss",
+                    "3m 00s ago",
+                    "cause ttl_expired",
+                    "official · 12s ago",
+                ],
+                Lang::Ko => [
+                    "유지",
+                    "4m 12s 남음",
+                    "TTL 5m",
+                    "적중 82%",
+                    "미스 9/50",
+                    "최근 미스",
+                    "3m 00s 전",
+                    "원인 ttl_expired",
+                    "공식 · 12s 전",
+                ],
+            };
+            let buffer = draw(&mut state, width, height);
+            let text = card_text(&buffer, &state, CardId::CacheTimer);
+            for needle in words {
+                assert!(text.contains(needle), "{case} {needle}\n{text}");
+            }
+            let rect = card_rect_of(&state, CardId::CacheTimer);
+            assert_eq!(rect.height, 5, "{case}");
+            assert_eq!(rect.bottom(), height - 2, "{case}");
+            let dot = buffer.cell((rect.x + 2, rect.y + 1)).unwrap();
+            assert_eq!(
+                (dot.symbol(), dot.style().fg),
+                ("●", Some(theme::COLOR_OK)),
+                "{case}"
+            );
+
+            // 30초 뒤 다시 그리면 남은 시간이 줄고 최근 미스 경과는 늘어남 (스냅샷은 그대로)
+            state.clock_override = Some(fixed_limits_now() + ChronoDuration::seconds(30));
+            let buffer = draw(&mut state, width, height);
+            let text = card_text(&buffer, &state, CardId::CacheTimer);
+            let (left, ago) = match lang {
+                Lang::En => ("3m 42s left", "3m 30s ago"),
+                Lang::Ko => ("3m 42s 남음", "3m 30s 전"),
+            };
+            assert!(text.contains(left) && text.contains(ago), "{case}\n{text}");
+
+            // 1분 미만 남으면 경고색 점과 남은 시간 단어
+            state.clock_override = Some(fixed_limits_now() + ChronoDuration::seconds(200));
+            let buffer = draw(&mut state, width, height);
+            let text = card_text(&buffer, &state, CardId::CacheTimer);
+            let dot = buffer.cell((rect.x + 2, rect.y + 1)).unwrap();
+            assert_eq!(dot.style().fg, Some(theme::COLOR_WARN), "{case}");
+            assert!(
+                text.contains("0m 52s") || text.contains("52s"),
+                "{case}\n{text}"
+            );
+
+            // 만료 뒤: 빈 점과 단어 cold 또는 만료, 만료 후 경과
+            state.clock_override = Some(fixed_limits_now() + ChronoDuration::seconds(300));
+            let buffer = draw(&mut state, width, height);
+            let text = card_text(&buffer, &state, CardId::CacheTimer);
+            let (cold, expired) = match lang {
+                Lang::En => ("cold", "expired 48s ago"),
+                Lang::Ko => ("만료", "48s 전 만료"),
+            };
+            assert!(
+                text.contains(cold) && text.contains(expired),
+                "{case}\n{text}"
+            );
+            let dot = buffer.cell((rect.x + 2, rect.y + 1)).unwrap();
+            assert_eq!(
+                (dot.symbol(), dot.style().fg),
+                ("○", Some(theme::FG_DIM)),
+                "{case}"
+            );
+
+            // 스냅샷 없음
+            state.snapshot.limits = Panel::Ready(LimitsData::default());
+            let buffer = draw(&mut state, width, height);
+            let text = card_text(&buffer, &state, CardId::CacheTimer);
+            let empty = match lang {
+                Lang::En => "No cache data",
+                Lang::Ko => "캐시 값 없음",
+            };
+            assert!(text.contains(empty), "{case}\n{text}");
         }
     }
 }

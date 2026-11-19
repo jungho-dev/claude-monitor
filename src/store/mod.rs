@@ -1,11 +1,16 @@
 //! store/mod.rs
 //! SQLite 저장소: 스키마, 적재 묶음 기록, 색인 커서, 일일 리포트 보관.
 
+pub mod limits;
+pub mod metrics;
+pub mod otel_events;
+pub mod power;
 pub mod query;
+pub mod ratelimit;
 
 use crate::core::model::{IngestBatch, IngestCounts};
 use anyhow::Context;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use std::fs;
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
@@ -26,7 +31,11 @@ CREATE TABLE IF NOT EXISTS api_requests (
     duration_ms INTEGER,
     first_byte_ms INTEGER,
     first_token_ms INTEGER,
-    status INTEGER
+    status INTEGER,
+    cache_creation_5m_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_creation_1h_tokens INTEGER NOT NULL DEFAULT 0,
+    git_branch TEXT NOT NULL DEFAULT '',
+    project TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_api_requests_ts ON api_requests(ts);
 DROP INDEX IF EXISTS idx_api_requests_session;
@@ -73,12 +82,23 @@ CREATE TABLE IF NOT EXISTS index_cursors (
     read_offset INTEGER NOT NULL,
     state_json TEXT NOT NULL DEFAULT '{}'
 );
+CREATE TABLE IF NOT EXISTS index_backfill_pending (
+    marker INTEGER PRIMARY KEY CHECK (marker = 1)
+);
 CREATE TABLE IF NOT EXISTS daily_reports (
     report_date TEXT PRIMARY KEY,
     generated_at TEXT NOT NULL,
     markdown TEXT NOT NULL
 );
 ";
+
+// 기존 DB 에 덧붙이는 api_requests 열 (이름, 정의)
+const API_REQUEST_ADDED_COLUMNS: [(&str, &str); 4] = [
+    ("cache_creation_5m_tokens", "INTEGER NOT NULL DEFAULT 0"),
+    ("cache_creation_1h_tokens", "INTEGER NOT NULL DEFAULT 0"),
+    ("git_branch", "TEXT NOT NULL DEFAULT ''"),
+    ("project", "TEXT NOT NULL DEFAULT ''"),
+];
 
 // 1. 색인 커서 ----------------------------------------------------------------
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -104,12 +124,50 @@ impl Store {
             fs::create_dir_all(parent)
                 .with_context(|| format!("데이터 폴더 생성 실패: {}", parent.display()))?;
         }
-        let conn =
+        let mut conn =
             Connection::open(path).with_context(|| format!("DB 열기 실패: {}", path.display()))?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;",
         )?;
         conn.execute_batch(SCHEMA_SQL).context("스키마 생성 실패")?;
+        conn.execute_batch(otel_events::SCHEMA_SQL)
+            .context("otel_events 스키마 생성 실패")?;
+        conn.execute_batch(metrics::METRICS_SCHEMA_SQL)
+            .context("지표 스키마 생성 실패")?;
+        conn.execute_batch(power::STANDBY_GAPS_SCHEMA_SQL)
+            .context("대기 구간 스키마 생성 실패")?;
+        conn.execute_batch(limits::LIMITS_SCHEMA_SQL)
+            .context("한도 스냅샷 스키마 생성 실패")?;
+        conn.execute_batch(ratelimit::RATELIMIT_SCHEMA_SQL)
+            .context("레이트리밋 스키마 생성 실패")?;
+
+        // 기존 DB 열 추가 (있으면 건너뜀, 새로 붙으면 커서를 비워 백필 구간 재읽기)
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Vec<String> = tx
+            .prepare("PRAGMA table_info(api_requests)")?
+            .query_map([], |row| row.get(1))?
+            .collect::<Result<_, _>>()?;
+        let mut added = false;
+        for (name, definition) in API_REQUEST_ADDED_COLUMNS {
+            if existing.iter().any(|column| column == name) {
+                continue;
+            }
+            tx.execute_batch(&format!(
+                "ALTER TABLE api_requests ADD COLUMN {name} {definition}"
+            ))
+            .with_context(|| format!("열 추가 실패: {name}"))?;
+            added = true;
+        }
+        if added {
+            // 동시에 도는 이전 바이너리가 빈 커서를 소비해 새 열 없이 다시 색인할 수 있으므로
+            // 대기 표식을 남겨 새 색인기의 다음 실행이 커서를 다시 비움 (consume_index_backfill)
+            tx.execute("DELETE FROM index_cursors", [])?;
+            tx.execute(
+                "INSERT OR IGNORE INTO index_backfill_pending (marker) VALUES (1)",
+                [],
+            )?;
+        }
+        tx.commit()?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -149,8 +207,9 @@ impl Store {
             let mut insert_stmt = tx.prepare_cached(
                 "INSERT INTO api_requests (source, request_key, ts, session_id, agent, model, \
                  input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, duration_ms, \
-                 first_byte_ms, first_token_ms, status) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+                 first_byte_ms, first_token_ms, status, cache_creation_5m_tokens, \
+                 cache_creation_1h_tokens, git_branch, project) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18) \
                  ON CONFLICT(request_key) DO NOTHING",
             )?;
             let mut refresh_stmt = tx.prepare_cached(
@@ -159,10 +218,16 @@ impl Store {
                  output_tokens = MAX(output_tokens, ?2), \
                  cache_read_tokens = MAX(cache_read_tokens, ?3), \
                  cache_creation_tokens = MAX(cache_creation_tokens, ?4), \
-                 duration_ms = COALESCE(MAX(duration_ms, ?5), duration_ms, ?5) \
+                 duration_ms = COALESCE(MAX(duration_ms, ?5), duration_ms, ?5), \
+                 cache_creation_5m_tokens = MAX(cache_creation_5m_tokens, ?7), \
+                 cache_creation_1h_tokens = MAX(cache_creation_1h_tokens, ?8), \
+                 git_branch = CASE WHEN git_branch = '' THEN ?9 ELSE git_branch END, \
+                 project = CASE WHEN project = '' THEN ?10 ELSE project END \
                  WHERE request_key = ?6 \
                  AND (?2 > output_tokens OR ?1 > input_tokens OR ?3 > cache_read_tokens \
-                 OR ?4 > cache_creation_tokens OR COALESCE(?5, 0) > COALESCE(duration_ms, 0))",
+                 OR ?4 > cache_creation_tokens OR COALESCE(?5, 0) > COALESCE(duration_ms, 0) \
+                 OR ?7 > cache_creation_5m_tokens OR ?8 > cache_creation_1h_tokens \
+                 OR (git_branch = '' AND ?9 <> '') OR (project = '' AND ?10 <> ''))",
             )?;
             for row in &batch.api_requests {
                 let inserted = insert_stmt.execute(params![
@@ -180,6 +245,10 @@ impl Store {
                     row.first_byte_ms,
                     row.first_token_ms,
                     row.status,
+                    row.cache_creation_5m_tokens,
+                    row.cache_creation_1h_tokens,
+                    row.git_branch,
+                    row.project,
                 ])?;
                 if inserted > 0 {
                     counts.api_requests += 1;
@@ -194,6 +263,10 @@ impl Store {
                     row.cache_creation_tokens,
                     row.duration_ms,
                     row.request_key,
+                    row.cache_creation_5m_tokens,
+                    row.cache_creation_1h_tokens,
+                    row.git_branch,
+                    row.project,
                 ])?;
             }
         }
@@ -260,6 +333,9 @@ impl Store {
             }
         }
 
+        // 4-1. OTLP 신규 이벤트
+        counts.otel_events = otel_events::insert_otel_events(&tx, &batch.otel_events)?;
+
         // 5. 세션 구간 확장
         {
             let mut stmt = tx.prepare_cached(
@@ -300,6 +376,19 @@ impl Store {
                 },
             )
             .optional()
+        })
+    }
+
+    // 2-5-1. 백필 대기 표식 소비 (표식이 있었으면 커서를 비우고 true, 한 번만)
+    pub fn consume_index_backfill(&self) -> anyhow::Result<bool> {
+        self.with_conn(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let pending = tx.execute("DELETE FROM index_backfill_pending", [])? > 0;
+            if pending {
+                tx.execute("DELETE FROM index_cursors", [])?;
+            }
+            tx.commit()?;
+            Ok(pending)
         })
     }
 
@@ -352,15 +441,27 @@ impl Store {
             .optional()
         })
     }
+
+    // 2-9. 일일 리포트 생성 시각 조회 (RFC 3339, 보관본이 없으면 None)
+    pub fn daily_report_generated_at(&self, report_date: &str) -> anyhow::Result<Option<String>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT generated_at FROM daily_reports WHERE report_date = ?1",
+                params![report_date],
+                |row| row.get(0),
+            )
+            .optional()
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Store;
     use super::query::{CACHE_BREAK_PREVIOUS_SQL, DENY_SOURCE_SQL};
+    use super::{IndexCursor, Store};
     use crate::core::model::{ApiRequestRow, DataSource, HookEventRow, HookOutcome, IngestBatch};
     use crate::transcript::test_support::unique_temp_dir;
-    use rusqlite::params;
+    use rusqlite::{Connection, params};
     use std::sync::Arc;
 
     // 1. 오염 잠금 복구 -------------------------------------------------------
@@ -691,6 +792,219 @@ mod tests {
         };
         let next_counts = store.insert_batch(&next_batch).expect("신규 적재");
         assert_eq!(next_counts.api_requests, 1);
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // 10. 기존 DB 열 추가 (멱등) ----------------------------------------------
+    #[test]
+    fn old_schema_db_gains_columns_once_and_clears_cursors_once() {
+        // 1. 이전 스키마 DB (신규 열 없음) 준비: 요청 1건, 색인 커서 1건
+        let dir = unique_temp_dir("store-migrate");
+        let db_path = dir.join("old.db");
+        let old = Connection::open(&db_path).expect("이전 DB 열기");
+        old.execute_batch(
+            "CREATE TABLE api_requests (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, \
+                request_key TEXT NOT NULL UNIQUE, ts TEXT NOT NULL, \
+                session_id TEXT NOT NULL DEFAULT '', agent TEXT NOT NULL DEFAULT '', \
+                model TEXT NOT NULL DEFAULT '', input_tokens INTEGER NOT NULL DEFAULT 0, \
+                output_tokens INTEGER NOT NULL DEFAULT 0, \
+                cache_read_tokens INTEGER NOT NULL DEFAULT 0, \
+                cache_creation_tokens INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER, \
+                first_byte_ms INTEGER, first_token_ms INTEGER, status INTEGER); \
+             CREATE TABLE index_cursors (path TEXT PRIMARY KEY, file_size INTEGER NOT NULL, \
+                modified_ms INTEGER NOT NULL, read_offset INTEGER NOT NULL, \
+                state_json TEXT NOT NULL DEFAULT '{}'); \
+             INSERT INTO api_requests (source, request_key, ts, cache_creation_tokens) \
+                VALUES ('transcript', 'msg_old', '2026-11-10T12:00:00.000Z', 900); \
+             INSERT INTO index_cursors (path, file_size, modified_ms, read_offset) \
+                VALUES ('a.jsonl', 10, 20, 10);",
+        )
+        .expect("이전 스키마 시드");
+        drop(old);
+        let column_names = |store: &Store| -> Vec<String> {
+            store
+                .with_conn(|conn| {
+                    let mut stmt = conn.prepare("PRAGMA table_info(api_requests)")?;
+                    stmt.query_map([], |row| row.get(1))?.collect()
+                })
+                .expect("열 조회")
+        };
+        let cursor_count = |store: &Store| -> i64 {
+            store
+                .with_conn(|conn| {
+                    conn.query_row("SELECT COUNT(*) FROM index_cursors", [], |row| row.get(0))
+                })
+                .expect("커서 조회")
+        };
+
+        // 2. 첫 열기: 열 4개 추가, 색인 커서 비움, 기존 행과 합계 유지
+        let store = Store::open_store(&db_path).expect("업그레이드 열기");
+        let columns = column_names(&store);
+        for name in [
+            "cache_creation_5m_tokens",
+            "cache_creation_1h_tokens",
+            "git_branch",
+            "project",
+        ] {
+            assert_eq!(
+                columns.iter().filter(|found| *found == name).count(),
+                1,
+                "{name}"
+            );
+        }
+        assert_eq!(cursor_count(&store), 0);
+        let (total, split_5m, project): (i64, i64, String) = store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT cache_creation_tokens, cache_creation_5m_tokens, project \
+                     FROM api_requests WHERE request_key = 'msg_old'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+            })
+            .expect("기존 행 조회");
+        assert_eq!((total, split_5m, project.as_str()), (900, 0, ""));
+
+        // 3. 두 번째 열기: 열 불변, 다시 저장한 커서는 유지 (커서를 또 비우지 않음)
+        store
+            .save_index_cursor(&IndexCursor {
+                path: "b.jsonl".to_string(),
+                file_size: 1,
+                modified_ms: 2,
+                read_offset: 1,
+                state_json: "{}".to_string(),
+            })
+            .expect("커서 저장");
+        drop(store);
+        let reopened = Store::open_store(&db_path).expect("재열기");
+        assert_eq!(column_names(&reopened), columns);
+        assert_eq!(cursor_count(&reopened), 1);
+        drop(reopened);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // 10-1. 백필 대기 표식 (열 추가 때만 심고 한 번만 소비) -------------------
+    #[test]
+    fn column_migration_leaves_backfill_marker_consumed_once() {
+        // 1. 이전 스키마 DB 열기: 표식이 심기고 커서는 비워짐
+        let dir = unique_temp_dir("store-backfill-marker");
+        let db_path = dir.join("old.db");
+        let old = Connection::open(&db_path).expect("이전 DB 열기");
+        old.execute_batch(
+            "CREATE TABLE api_requests (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, \
+                request_key TEXT NOT NULL UNIQUE, ts TEXT NOT NULL, \
+                session_id TEXT NOT NULL DEFAULT '', agent TEXT NOT NULL DEFAULT '', \
+                model TEXT NOT NULL DEFAULT '', input_tokens INTEGER NOT NULL DEFAULT 0, \
+                output_tokens INTEGER NOT NULL DEFAULT 0, \
+                cache_read_tokens INTEGER NOT NULL DEFAULT 0, \
+                cache_creation_tokens INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER, \
+                first_byte_ms INTEGER, first_token_ms INTEGER, status INTEGER);",
+        )
+        .expect("이전 스키마 시드");
+        drop(old);
+        let cursor = |path: &str| IndexCursor {
+            path: path.to_string(),
+            file_size: 1,
+            modified_ms: 2,
+            read_offset: 1,
+            state_json: "{}".to_string(),
+        };
+        let cursor_count = |store: &Store| -> i64 {
+            store
+                .with_conn(|conn| {
+                    conn.query_row("SELECT COUNT(*) FROM index_cursors", [], |row| row.get(0))
+                })
+                .expect("커서 조회")
+        };
+        let store = Store::open_store(&db_path).expect("업그레이드 열기");
+        assert_eq!(cursor_count(&store), 0);
+
+        // 2. 이전 바이너리가 빈 커서를 소비해 다시 채웠다고 하면 소비가 비움
+        store
+            .save_index_cursor(&cursor("stale.jsonl"))
+            .expect("커서 저장");
+        assert!(store.consume_index_backfill().expect("첫 소비"));
+        assert_eq!(cursor_count(&store), 0);
+
+        // 3. 한 번만: 이후 커서는 유지
+        store
+            .save_index_cursor(&cursor("kept.jsonl"))
+            .expect("커서 저장");
+        assert!(!store.consume_index_backfill().expect("두 번째 소비"));
+        assert_eq!(cursor_count(&store), 1);
+
+        // 4. 재열기는 표식을 다시 심지 않음 (새 DB 도 마찬가지)
+        drop(store);
+        let reopened = Store::open_store(&db_path).expect("재열기");
+        assert!(!reopened.consume_index_backfill().expect("재열기 소비"));
+        assert_eq!(cursor_count(&reopened), 1);
+        drop(reopened);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // 11. 새 열 보존·빈 값 채움 갱신 ------------------------------------------
+    #[test]
+    fn api_request_upsert_keeps_split_columns_and_fills_empty_ones() {
+        // 1. 처음 적재 (분리·브랜치 없음)
+        let dir = unique_temp_dir("store-split-upsert");
+        let store = Store::open_store(&dir.join("split.db")).expect("저장소 열기");
+        let first_row = ApiRequestRow {
+            source: DataSource::Transcript,
+            request_key: "msg_A".to_string(),
+            ts: "2026-11-10T12:00:00.000Z".to_string(),
+            cache_creation_tokens: 1000,
+            ..ApiRequestRow::default()
+        };
+        store
+            .insert_batch(&IngestBatch {
+                api_requests: vec![first_row.clone()],
+                ..IngestBatch::default()
+            })
+            .expect("첫 적재");
+
+        // 2. 같은 키로 분리·브랜치·프로젝트 도착 (신규 건수 0, 값 채움)
+        let filled_row = ApiRequestRow {
+            cache_creation_5m_tokens: 700,
+            cache_creation_1h_tokens: 300,
+            git_branch: "main".to_string(),
+            project: "demo".to_string(),
+            ..first_row.clone()
+        };
+        let counts = store
+            .insert_batch(&IngestBatch {
+                api_requests: vec![filled_row],
+                ..IngestBatch::default()
+            })
+            .expect("갱신 적재");
+        assert_eq!(counts.api_requests, 0);
+
+        // 3. 다른 브랜치로 다시 도착해도 첫 값 유지, 분리 값은 더 큰 값 유지
+        let other_row = ApiRequestRow {
+            cache_creation_5m_tokens: 100,
+            git_branch: "other".to_string(),
+            project: "other".to_string(),
+            ..first_row
+        };
+        store
+            .insert_batch(&IngestBatch {
+                api_requests: vec![other_row],
+                ..IngestBatch::default()
+            })
+            .expect("후속 적재");
+        let stored: (i64, i64, String, String) = store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT cache_creation_5m_tokens, cache_creation_1h_tokens, git_branch, project \
+                     FROM api_requests WHERE request_key = 'msg_A'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+            })
+            .expect("저장값 조회");
+        assert_eq!(stored, (700, 300, "main".to_string(), "demo".to_string()));
         drop(store);
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -1,6 +1,7 @@
 //! tui/views/report.rs
-//! 리포트 탭: 날짜 이동 버튼 줄, 목차 카드, 일일 리포트 Markdown 본문 카드.
+//! 리포트 탭: 날짜·주 이동 버튼 줄, 목차 카드, 일일·주간 리포트 Markdown 본문 카드.
 
+use crate::report::{format_week_key, week_start_of};
 use crate::tui::cards::{CardId, UiAction};
 use crate::tui::format::{outline_entries, prepare_report_markdown};
 use crate::tui::i18n::{self, Msg};
@@ -10,6 +11,7 @@ use crate::tui::theme;
 use crate::tui::views::common::{
     PanelNote, TextCard, panel_message, render_notice_card, render_text_card,
 };
+use chrono::Duration as ChronoDuration;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -110,8 +112,11 @@ pub fn render_report_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
     }
 
     // 4. 본문 카드
-    let body_title =
-        i18n::daily_report_title(lang, &state.report_date.format("%Y-%m-%d").to_string());
+    let body_title = if state.report_weekly {
+        i18n::weekly_report_title(lang, &format_week_key(state.report_week))
+    } else {
+        i18n::daily_report_title(lang, &state.report_date.format("%Y-%m-%d").to_string())
+    };
     state.report_row_starts = render_text_card(
         frame,
         state,
@@ -140,56 +145,111 @@ fn render_date_bar(frame: &mut Frame, state: &mut AppState, area: Rect) {
     let chip = Style::default().bg(theme::BG_TONAL);
     let key_style = chip.fg(theme::FG_ACCENT).add_modifier(Modifier::BOLD);
     let name_style = chip.fg(theme::FG_TEXT);
-    let next_disabled = state.report_date >= state.today;
+    let lang = state.lang;
+    let weekly = state.report_weekly;
+    let this_week = week_start_of(state.today);
+
+    // 2. 보기별 날짜 문구와 다음 이동 가능 여부 (주간은 주 키와 월~일 범위, 일간은 날짜)
+    let (next_disabled, date_text, range_text, day_note) = if weekly {
+        let week_end = state.report_week + ChronoDuration::days(6);
+        let note = if state.report_week == this_week {
+            Some(Msg::WeekThis)
+        } else if state.report_week == this_week - ChronoDuration::days(7) {
+            Some(Msg::WeekLast)
+        } else {
+            None
+        };
+        (
+            state.report_week >= this_week,
+            format_week_key(state.report_week),
+            format!(
+                " {} ~ {}",
+                state.report_week.format("%m-%d"),
+                week_end.format("%m-%d")
+            ),
+            note,
+        )
+    } else {
+        let note = if state.report_date == state.today {
+            Some(Msg::DayToday)
+        } else if Some(state.report_date) == state.today.pred_opt() {
+            Some(Msg::DayYesterday)
+        } else {
+            None
+        };
+        (
+            state.report_date >= state.today,
+            state.report_date.format("%Y-%m-%d").to_string(),
+            String::new(),
+            note,
+        )
+    };
     let (next_name, next_key) = if next_disabled {
         (chip.fg(theme::FG_DIM), chip.fg(theme::FG_DIM))
     } else {
         (name_style, key_style)
     };
-    let lang = state.lang;
     let chip_name = |msg: Msg| format!(" {} ", i18n::text(lang, msg));
-    let day_note = if state.report_date == state.today {
-        format!(" ({})", i18n::text(lang, Msg::DayToday))
-    } else if Some(state.report_date) == state.today.pred_opt() {
-        format!(" ({})", i18n::text(lang, Msg::DayYesterday))
-    } else {
-        String::new()
-    };
 
-    // 2. 칩 목록 (날짜는 칩 없이 굵은 큰 글자)
-    let items: Vec<(Option<UiAction>, Line<'static>)> = vec![
-        (
-            Some(UiAction::ReportPrev),
-            Line::from(vec![
-                Span::styled(" ←", key_style),
-                Span::styled(chip_name(Msg::ReportPrev), name_style),
-            ]),
-        ),
-        (
-            None,
-            Line::from(vec![
-                Span::styled(
-                    format!(" {}", state.report_date.format("%Y-%m-%d")),
-                    theme::STYLE_STRONG,
-                ),
-                Span::styled(format!("{day_note} "), theme::STYLE_DIM),
-            ]),
-        ),
-        (
-            Some(UiAction::ReportNext),
-            Line::from(vec![
-                Span::styled(format!(" {}", i18n::text(lang, Msg::ReportNext)), next_name),
-                Span::styled(" → ", next_key),
-            ]),
-        ),
-        (
-            Some(UiAction::ReportGenerate),
-            Line::from(vec![
-                Span::styled(" [g]", key_style),
-                Span::styled(chip_name(Msg::ReportGenerate), name_style),
-            ]),
-        ),
-    ];
+    // 3. 칩 목록 (날짜는 칩 없이 굵은 큰 글자, 보기 전환 칩은 뒤에 두어 좌폭에서 먼저 생략)
+    // 날짜·이전·다음·생성 칩이 폭에 안 들어가면 오늘·어제·이번 주 같은 주석을 먼저 덮
+    let build_items = |with_note: bool| -> Vec<(Option<UiAction>, Line<'static>)> {
+        let note = match day_note {
+            Some(msg) if with_note => format!(" ({})", i18n::text(lang, msg)),
+            _ => String::new(),
+        };
+        vec![
+            (
+                Some(UiAction::ReportPrev),
+                Line::from(vec![
+                    Span::styled(" ←", key_style),
+                    Span::styled(chip_name(Msg::ReportPrev), name_style),
+                ]),
+            ),
+            (
+                None,
+                Line::from(vec![
+                    Span::styled(format!(" {date_text}"), theme::STYLE_STRONG),
+                    Span::styled(format!("{range_text}{note} "), theme::STYLE_DIM),
+                ]),
+            ),
+            (
+                Some(UiAction::ReportNext),
+                Line::from(vec![
+                    Span::styled(format!(" {}", i18n::text(lang, Msg::ReportNext)), next_name),
+                    Span::styled(" → ", next_key),
+                ]),
+            ),
+            (
+                Some(UiAction::ReportGenerate),
+                Line::from(vec![
+                    Span::styled(" [g]", key_style),
+                    Span::styled(chip_name(Msg::ReportGenerate), name_style),
+                ]),
+            ),
+        ]
+    };
+    let mut items = build_items(true);
+    let core_width: usize = items
+        .iter()
+        .map(|(_, line)| line.width() + 1)
+        .sum::<usize>()
+        + 1;
+    if core_width > area.width as usize {
+        items = build_items(false);
+    }
+    let toggle_name = if weekly {
+        Msg::ReportViewDaily
+    } else {
+        Msg::ReportViewWeekly
+    };
+    items.push((
+        Some(UiAction::ReportToggleView),
+        Line::from(vec![
+            Span::styled(" [v]", key_style),
+            Span::styled(chip_name(toggle_name), name_style),
+        ]),
+    ));
 
     // 3. 왼쪽부터 배치 (남은 폭 초과 항목 생략)
     let row_end = area.x.saturating_add(area.width);
@@ -342,6 +402,190 @@ pub fn style_report_lines(markdown: &str) -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::i18n::Lang;
+    use crate::tui::state::{ActiveTab, Panel, UiCommand};
+    use crate::tui::test_support::sample_state_with_tables;
+    use crate::tui::views::render_frame;
+    use chrono::NaiveDate;
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use std::time::Instant;
+
+    // 화면 전체 줄 문자열 (넓은 글자 뒤 칸 건너뜀)
+    fn draw_rows(state: &mut AppState, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| render_frame(frame, state)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                let mut text = String::new();
+                let mut skip = 0usize;
+                for x in 0..width {
+                    if skip > 0 {
+                        skip -= 1;
+                        continue;
+                    }
+                    let symbol = buffer[(x, y)].symbol();
+                    skip = Span::raw(symbol).width().saturating_sub(1);
+                    text.push_str(symbol);
+                }
+                text
+            })
+            .collect()
+    }
+
+    fn report_state(lang: Lang) -> AppState {
+        let mut state = sample_state_with_tables();
+        state.lang = lang;
+        state.tab = ActiveTab::Report;
+        state.report = Panel::Ready(Some("# Daily\n\n## 1. Summary\n- ok".to_string()));
+        state
+    }
+
+    fn click_at(state: &mut AppState, column: u16, row: u16) -> UiCommand {
+        let event = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        state.handle_mouse_event_at(event, Instant::now())
+    }
+
+    fn button_center(state: &AppState, wanted: UiAction) -> Option<(u16, u16)> {
+        state
+            .hit_areas
+            .button_rects
+            .iter()
+            .find(|(action, _)| *action == wanted)
+            .map(|(_, rect)| (rect.x + rect.width / 2, rect.y))
+    }
+
+    #[test]
+    fn daily_view_opens_on_today_at_every_size_in_both_languages() {
+        for lang in [Lang::En, Lang::Ko] {
+            for (width, height) in [(60u16, 16u16), (100, 30), (130, 40)] {
+                let mut state = report_state(lang);
+                let case = format!("{lang:?} {width}x{height}");
+                assert!(!state.report_weekly, "{case}");
+                assert_eq!(state.report_date, state.today, "{case}");
+                let rows = draw_rows(&mut state, width, height);
+                let today_note = match lang {
+                    Lang::En => "(today)",
+                    Lang::Ko => "(오늘)",
+                };
+                assert!(
+                    rows.iter()
+                        .any(|row| row.contains("2026-11-15") && row.contains(today_note)),
+                    "{case}"
+                );
+                assert!(!rows.iter().any(|row| row.contains("W46")), "{case}");
+                assert!(
+                    button_center(&state, UiAction::ReportGenerate).is_some(),
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn weekly_view_shows_the_current_week_title_range_and_chips_at_every_size() {
+        for lang in [Lang::En, Lang::Ko] {
+            for (width, height) in [(60u16, 16u16), (100, 30), (130, 40)] {
+                let mut state = report_state(lang);
+                let case = format!("{lang:?} {width}x{height}");
+                assert_eq!(
+                    state.perform_action(UiAction::ReportToggleView),
+                    UiCommand::LoadWeeklyReport(NaiveDate::from_ymd_opt(2026, 11, 9).unwrap())
+                );
+                state.report = Panel::Ready(Some("# Weekly\n\n## 1. Summary\n- ok".to_string()));
+                let rows = draw_rows(&mut state, width, height);
+
+                // 날짜 줄: 주 키와 월~일 범위, 본문 카드 제목
+                assert!(
+                    rows.iter()
+                        .any(|row| row.contains("2026-W46") && row.contains("11-09 ~ 11-15")),
+                    "{case}"
+                );
+                let title = match lang {
+                    Lang::En => "Weekly report · 2026-W46",
+                    Lang::Ko => "주간 리포트 · 2026-W46",
+                };
+                assert!(rows.iter().any(|row| row.contains(title)), "{case}");
+                assert!(rows.iter().any(|row| row.contains("Summary")), "{case}");
+                assert!(
+                    button_center(&state, UiAction::ReportPrev).is_some(),
+                    "{case}"
+                );
+                assert!(
+                    button_center(&state, UiAction::ReportNext).is_some(),
+                    "{case}"
+                );
+
+                // 보기 전환 칩은 폭이 될 때 보이고 (이번 주 주석은 넓을 때만), 최소 폭에서는 v 키가 대신함
+                if width >= 100 {
+                    assert!(
+                        button_center(&state, UiAction::ReportToggleView).is_some(),
+                        "{case}"
+                    );
+                    let (week_note, view_name) = match lang {
+                        Lang::En => ("(this week)", "[v] Daily"),
+                        Lang::Ko => ("(이번 주)", "[v] 일간"),
+                    };
+                    assert!(rows.iter().any(|row| row.contains(week_note)), "{case}");
+                    assert!(rows.iter().any(|row| row.contains(view_name)), "{case}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn weekly_chips_move_by_week_generate_the_selected_week_and_switch_back() {
+        for lang in [Lang::En, Lang::Ko] {
+            let mut state = report_state(lang);
+            let this_week = NaiveDate::from_ymd_opt(2026, 11, 9).unwrap();
+            let last_week = NaiveDate::from_ymd_opt(2026, 11, 2).unwrap();
+            let today = NaiveDate::from_ymd_opt(2026, 11, 15).unwrap();
+            draw_rows(&mut state, 130, 40);
+            let (x, y) = button_center(&state, UiAction::ReportToggleView).unwrap();
+            assert_eq!(
+                click_at(&mut state, x, y),
+                UiCommand::LoadWeeklyReport(this_week)
+            );
+
+            // 이번 주에서 다음은 비활성, 이전은 지난 주 적재 요청 후 지난주 주석
+            let rows = draw_rows(&mut state, 130, 40);
+            let (x, y) = button_center(&state, UiAction::ReportNext).unwrap();
+            assert_eq!(click_at(&mut state, x, y), UiCommand::None);
+            assert!(rows.iter().any(|row| row.contains("2026-W46")));
+            let (x, y) = button_center(&state, UiAction::ReportPrev).unwrap();
+            assert_eq!(
+                click_at(&mut state, x, y),
+                UiCommand::LoadWeeklyReport(last_week)
+            );
+            let rows = draw_rows(&mut state, 130, 40);
+            let last_note = match lang {
+                Lang::En => "(last week)",
+                Lang::Ko => "(지난주)",
+            };
+            assert!(
+                rows.iter()
+                    .any(|row| row.contains("2026-W45") && row.contains(last_note)),
+                "{lang:?}"
+            );
+
+            // 생성 칩은 선택한 주, 보기 칩은 일간 복귀 (오늘 리포트)
+            let (x, y) = button_center(&state, UiAction::ReportGenerate).unwrap();
+            assert_eq!(
+                click_at(&mut state, x, y),
+                UiCommand::GenerateWeeklyReport(last_week)
+            );
+            let (x, y) = button_center(&state, UiAction::ReportToggleView).unwrap();
+            assert_eq!(click_at(&mut state, x, y), UiCommand::LoadReport(today));
+            assert!(!state.report_weekly);
+        }
+    }
 
     fn line_text(line: &Line<'_>) -> String {
         line.spans

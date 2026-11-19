@@ -194,6 +194,26 @@ fn apply_line(state: &mut ScanState, context: &LineContext, line: TranscriptLine
         (false, _) if line.is_sidechain == Some(true) => "sidechain".to_string(),
         _ => context.agent_label.clone(),
     };
+    // 프로젝트 = cwd 마지막 폴더명, 에이전트 워크트리(<프로젝트>/.claude/worktrees/<이름>)는 원래 프로젝트로 묶음
+    let project = line
+        .cwd
+        .as_deref()
+        .map(|cwd| {
+            let parts: Vec<&str> = cwd
+                .split(['/', '\\'])
+                .filter(|part| !part.is_empty())
+                .collect();
+            let worktree = parts
+                .windows(2)
+                .position(|pair| pair == [".claude", "worktrees"]);
+            match worktree {
+                Some(index) if index > 0 => parts[index - 1],
+                _ => parts.last().copied().unwrap_or_default(),
+            }
+            .to_string()
+        })
+        .unwrap_or_default();
+    let git_branch = line.git_branch.unwrap_or_default();
 
     // 2. 세션 구간
     let span = state
@@ -319,6 +339,15 @@ fn apply_line(state: &mut ScanState, context: &LineContext, line: TranscriptLine
     pending.row.output_tokens = usage.output_tokens.unwrap_or(0);
     pending.row.cache_read_tokens = usage.cache_read_input_tokens.unwrap_or(0);
     pending.row.cache_creation_tokens = usage.cache_creation_input_tokens.unwrap_or(0);
+    let split = usage.cache_creation.unwrap_or_default();
+    pending.row.cache_creation_5m_tokens = split.ephemeral_5m_input_tokens.unwrap_or(0);
+    pending.row.cache_creation_1h_tokens = split.ephemeral_1h_input_tokens.unwrap_or(0);
+    if !project.is_empty() {
+        pending.row.project = project;
+    }
+    if !git_branch.is_empty() {
+        pending.row.git_branch = git_branch;
+    }
     pending.row.duration_ms = match (pending.trigger_ms, ts_ms) {
         (Some(trigger), Some(last)) => Some((last - trigger).max(0)),
         _ => None,

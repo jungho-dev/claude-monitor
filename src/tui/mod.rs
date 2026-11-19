@@ -97,6 +97,8 @@ pub fn run_tui(config: &AppConfig) -> anyhow::Result<()> {
         env::var_os("USERPROFILE"),
     );
     app.load_tui_state();
+
+    // 스키마 갱신(쓰기 연결)은 수집 스레드가 최초 수집 전에 하고 실패는 알림으로 돌려보냄 (UI 스레드는 기다리지 않음)
     let (ui_tx, ui_rx) = mpsc::channel::<UiMessage>();
     let poll_tx =
         poller::spawn_poller(config.clone(), ui_tx.clone()).context("수집 스레드 시작 실패")?;
@@ -162,6 +164,11 @@ fn run_event_loop(
             dirty = true;
         }
         if app.tick(Instant::now()) {
+            dirty = true;
+        }
+        // 자정을 넘기면 오늘을 새 날로 옮기고 (오늘 리포트를 보던 중이면 새 날 본문 다시 적재)
+        if let Some(command) = app.refresh_today() {
+            dispatch_ui_command(app, command, ui_tx, poll_tx, writer);
             dirty = true;
         }
         if app
@@ -278,7 +285,9 @@ fn dispatch_ui_command(
             poller::spawn_settings_load(app.config.clone(), ui_tx.clone());
         }
         UiCommand::LoadReport(date) => {
-            poller::spawn_report_load(app.config.clone(), ui_tx.clone(), date);
+            // 실시간 여부는 UI 가 지금 오늘로 보는 날 기준 (수집 스레드가 시계를 다시 읽지 않음)
+            let live = date == app.today;
+            poller::spawn_report_load(app.config.clone(), ui_tx.clone(), date, live);
         }
         UiCommand::GenerateReport(date) => {
             app.show_toast(
@@ -289,6 +298,23 @@ fn dispatch_ui_command(
                 app.config.clone(),
                 ui_tx.clone(),
                 AdminAction::GenerateReport(date),
+                app.today,
+            );
+        }
+        UiCommand::LoadWeeklyReport(week_start) => {
+            let live = week_start == crate::report::week_start_of(app.today);
+            poller::spawn_weekly_report_load(app.config.clone(), ui_tx.clone(), week_start, live);
+        }
+        UiCommand::GenerateWeeklyReport(week_start) => {
+            app.show_toast(
+                &i18n::report_requested(app.lang, &crate::report::format_week_key(week_start)),
+                ToastLevel::Info,
+            );
+            poller::spawn_admin_action(
+                app.config.clone(),
+                ui_tx.clone(),
+                AdminAction::GenerateWeeklyReport(week_start),
+                app.today,
             );
         }
         UiCommand::Reindex => {
@@ -296,7 +322,12 @@ fn dispatch_ui_command(
                 i18n::text(app.lang, Msg::ToastReindexRequested),
                 ToastLevel::Info,
             );
-            poller::spawn_admin_action(app.config.clone(), ui_tx.clone(), AdminAction::Reindex);
+            poller::spawn_admin_action(
+                app.config.clone(),
+                ui_tx.clone(),
+                AdminAction::Reindex,
+                app.today,
+            );
         }
         UiCommand::SetTopmost(enabled) => {
             TOPMOST_ACTIVE.store(enabled, Ordering::SeqCst);
@@ -445,7 +476,7 @@ mod tests {
             .column_hits
             .iter()
             .find(|hit| hit.card == CardId::HookTable && hit.column == 0)
-            .map(|hit| hit.grab)
+            .map(|hit| hit.line)
             .unwrap();
         let at = |kind: MouseEventKind, column: u16| MouseEvent {
             kind,
@@ -511,6 +542,82 @@ mod tests {
         let kpi = card_rect(&app, CardId::KpiCache);
         app.handle_mouse_event(moved(kpi.x + 2, kpi.y + 1));
         assert_ne!(hover_signature(&app), before);
+    }
+
+    // 실시간 빌드 여부는 UI 가 지금 오늘로 보는 날 기준: 시스템 시각과 다른 오늘(자정 뒤 새 날)도 바로 만들고 이전 날은 저장본만 읽음
+    #[test]
+    fn report_loads_are_live_for_the_day_and_week_the_ui_calls_today() {
+        use crate::core::config::DB_FILE_NAME;
+        use crate::store::Store;
+
+        let dir = std::env::temp_dir().join(format!("cm-tui-live-today-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        drop(Store::open_store(&dir.join(DB_FILE_NAME)).unwrap());
+        let config = AppConfig {
+            data_dir: dir.clone(),
+            ..sample_config()
+        };
+        // UI 의 오늘 = 2026-11-16(월), 시스템 시각과 무관
+        let today = NaiveDate::from_ymd_opt(2026, 11, 16).unwrap();
+        let yesterday = NaiveDate::from_ymd_opt(2026, 11, 15).unwrap();
+        let mut app = AppState::new(config, today);
+        let (ui_tx, ui_rx) = mpsc::channel::<UiMessage>();
+        let (poll_tx, _poll_rx) = mpsc::channel::<PollCommand>();
+        let writer = spawn_state_writer(ui_tx.clone()).unwrap();
+        let next = || ui_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        dispatch_ui_command(
+            &mut app,
+            UiCommand::LoadReport(today),
+            &ui_tx,
+            &poll_tx,
+            &writer,
+        );
+        let UiMessage::Report { date, body } = next() else {
+            panic!("report message");
+        };
+        assert_eq!(date, today);
+        assert!(matches!(&body, state::Panel::Ready(Some(text)) if text.contains("2026-11-16")));
+
+        dispatch_ui_command(
+            &mut app,
+            UiCommand::LoadReport(yesterday),
+            &ui_tx,
+            &poll_tx,
+            &writer,
+        );
+        let UiMessage::Report { body, .. } = next() else {
+            panic!("report message");
+        };
+        assert!(matches!(body, state::Panel::Ready(None)));
+
+        // 주간: UI 의 이번 주(11-16 시작)는 바로 만들고 지난 주(11-09)는 저장본만
+        let this_week = NaiveDate::from_ymd_opt(2026, 11, 16).unwrap();
+        let last_week = NaiveDate::from_ymd_opt(2026, 11, 9).unwrap();
+        dispatch_ui_command(
+            &mut app,
+            UiCommand::LoadWeeklyReport(this_week),
+            &ui_tx,
+            &poll_tx,
+            &writer,
+        );
+        let UiMessage::WeeklyReport { body, .. } = next() else {
+            panic!("weekly message");
+        };
+        assert!(matches!(body, state::Panel::Ready(Some(_))));
+        dispatch_ui_command(
+            &mut app,
+            UiCommand::LoadWeeklyReport(last_week),
+            &ui_tx,
+            &poll_tx,
+            &writer,
+        );
+        let UiMessage::WeeklyReport { body, .. } = next() else {
+            panic!("weekly message");
+        };
+        assert!(matches!(body, state::Panel::Ready(None)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

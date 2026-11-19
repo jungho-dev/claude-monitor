@@ -5,13 +5,19 @@ use crate::core::config::{AppConfig, DB_FILE_NAME, TOKEN_FILE_NAME};
 use crate::core::model::LiveEvent;
 use crate::inventory;
 use crate::net::admin;
+use crate::report;
 use crate::store::Store;
+use crate::store::metrics::{AttributionDimension, MetricAttributionRow};
+use crate::store::otel_events::CompactionStat;
 use crate::store::query::{
-    AgentStatsRow, CacheBreakRow, HookStatRow, ModelStatsRow, ToolLatencyRow,
+    AgentStatsRow, CacheBreakRow, HookStatRow, ModelStatsRow, OverviewStats, ProjectStatsRow,
+    ToolLatencyRow,
 };
 use crate::tui::format::fit_display;
 use crate::tui::i18n::Failure;
-use crate::tui::state::{DashboardSnapshot, DbState, Panel, UiMessage, WindowKind};
+use crate::tui::state::{
+    ATTRIBUTION_DIMENSIONS, DashboardSnapshot, DbState, LimitsData, Panel, UiMessage, WindowKind,
+};
 use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveDate, SecondsFormat, Utc};
 use std::cell::Cell;
 use std::fs;
@@ -28,6 +34,11 @@ const TOOL_ROW_LIMIT: usize = 200;
 const CACHE_BREAK_LIMIT: usize = 20;
 const MINUTE_SPAN_MINUTES: i64 = 60;
 const RESPONSE_PREVIEW_WIDTH: usize = 60;
+// 한도 카드: 소진 속도 계산용 스냅샷 기간(시간), 컴팩션 조회 기간(일), 로컬 추정 창(시간)
+const LIMIT_HISTORY_HOURS: i64 = 12;
+const COMPACTION_LOOKBACK_DAYS: i64 = 7;
+const ESTIMATE_FIVE_HOUR_HOURS: i64 = 5;
+const ESTIMATE_SEVEN_DAY_HOURS: i64 = 7 * 24;
 
 thread_local! {
     // 켜진 스레드의 panic 은 패널로 변환되므로 화면에 출력하지 않음
@@ -46,6 +57,8 @@ pub enum PollCommand {
 pub enum AdminAction {
     Reindex,
     GenerateReport(NaiveDate),
+    // 해당 주의 월요일
+    GenerateWeeklyReport(NaiveDate),
 }
 
 // 관리 요청 결과 (문구는 UI 스레드가 화면 언어로 만듦, 본문은 데이터라 번역하지 않음)
@@ -84,6 +97,7 @@ pub fn live_event_timestamp(event: &LiveEvent) -> &str {
         LiveEvent::Api(row) => &row.ts,
         LiveEvent::Tool(row) => &row.ts,
         LiveEvent::Hook(row) => &row.ts,
+        LiveEvent::Otel(row) => &row.ts,
         LiveEvent::Notice { ts, .. } => ts,
     }
 }
@@ -94,6 +108,7 @@ pub fn live_event_key(event: &LiveEvent) -> String {
         LiveEvent::Api(row) => ("api", row.model.clone()),
         LiveEvent::Tool(row) => ("tool", row.tool_name.clone()),
         LiveEvent::Hook(row) => ("hook", format!("{}/{}", row.route, row.guard)),
+        LiveEvent::Otel(row) => ("otel", format!("{}/{}", row.category, row.name)),
         LiveEvent::Notice { text, .. } => ("notice", text.clone()),
     };
     format!("{}\u{1}{tag}\u{1}{target}", live_event_timestamp(event))
@@ -120,6 +135,17 @@ struct HeavyPanels {
     model_stats: Panel<Vec<ModelStatsRow>>,
     agent_stats: Panel<Vec<AgentStatsRow>>,
     cache_breaks: Panel<Vec<CacheBreakRow>>,
+    projects: Panel<Vec<ProjectStatsRow>>,
+    attribution: Panel<Vec<(AttributionDimension, Vec<MetricAttributionRow>)>>,
+    limit_extras: LimitExtras,
+}
+
+// 한도 카드의 무거운 부분: 최신 세션 컴팩션과 5시간·7일 로컬 토큰 집계 (추정용)
+#[derive(Default)]
+struct LimitExtras {
+    compaction: Option<CompactionStat>,
+    estimate_5h: Option<OverviewStats>,
+    estimate_7d: Option<OverviewStats>,
 }
 
 // 무거운 패널 재조회 여부: 강제 요청, 첫 수집, 주기 경과
@@ -127,8 +153,28 @@ fn heavy_due(last: Option<Instant>, now: Instant, forced: bool) -> bool {
     forced || last.is_none_or(|stamp| now.duration_since(stamp) >= HEAVY_INTERVAL)
 }
 
-// 2초마다 또는 명령 도착 즉시 수집, UI 가 닫히면 종료
+// 이전 버전 serve 가 만든 DB 는 열 추가가 안 됐을 수 있어 읽기 전용 수집 전에 쓰기 연결로 스키마를 맞춤
+// (DB 가 없으면 만들지 않음, 바쁜 serve 와 경합해 오래 걸릴 수 있어 UI 스레드가 아니라 수집 스레드에서 하고, 실패하면 오류 원문을 돌려줌)
+fn upgrade_store_schema(config: &AppConfig) -> Option<String> {
+    let db_path = config.data_dir.join(DB_FILE_NAME);
+    if !db_path.is_file() {
+        return None;
+    }
+    match guard_panel(|| Store::open_store(&db_path)) {
+        Panel::Failed(Failure::Error(detail) | Failure::Internal(detail)) => Some(detail),
+        _ => None,
+    }
+}
+
+// 2초마다 또는 명령 도착 즉시 수집, UI 가 닫히면 종료 (최초 수집 전에 스키마 갱신 한 번)
 fn run_poll_loop(config: AppConfig, ui_tx: Sender<UiMessage>, command_rx: Receiver<PollCommand>) {
+    if let Some(detail) = upgrade_store_schema(&config)
+        && ui_tx
+            .send(UiMessage::SchemaUpgradeFailed { detail })
+            .is_err()
+    {
+        return;
+    }
     let mut window = WindowKind::default();
     let mut store: Option<Store> = None;
     let mut heavy = HeavyPanels::default();
@@ -232,12 +278,64 @@ fn collect_snapshot(
         heavy.agent_stats = guard_panel(|| open_store.query_agent_stats(&since, &until));
         heavy.cache_breaks =
             guard_panel(|| open_store.query_cache_breaks(&since, &until, CACHE_BREAK_LIMIT));
+        heavy.projects = guard_panel(|| open_store.query_project_stats(&since, &until));
+        // 지표 테이블이 없는 이전 DB 는 지표 없음(빈 목록)으로 취급
+        heavy.attribution = guard_panel(|| {
+            let mut by_dimension = Vec::with_capacity(ATTRIBUTION_DIMENSIONS.len());
+            for dimension in ATTRIBUTION_DIMENSIONS {
+                let rows = match open_store.query_metric_attribution(&since, &until, dimension) {
+                    Ok(rows) => rows,
+                    Err(err) if format!("{err:#}").contains("no such table") => Vec::new(),
+                    Err(err) => return Err(err),
+                };
+                by_dimension.push((dimension, rows));
+            }
+            Ok(by_dimension)
+        });
     }
     snapshot.tools = heavy.tools.clone();
     snapshot.hooks = heavy.hooks.clone();
     snapshot.model_stats = heavy.model_stats.clone();
     snapshot.agent_stats = heavy.agent_stats.clone();
     snapshot.cache_breaks = heavy.cache_breaks.clone();
+    snapshot.projects = heavy.projects.clone();
+    snapshot.attribution = heavy.attribution.clone();
+
+    // 5-1. 한도 카드 입력 (공식 스냅샷·소진 예상용 기록·API 키 헤더는 매번, 컴팩션·로컬 추정은 무거운 주기만)
+    let latest_limit = guard_panel(|| open_store.latest_limit_snapshot());
+    if refresh_heavy {
+        let session_id = match &latest_limit {
+            Panel::Ready(Some(latest)) => Some(latest.session_id.clone()),
+            _ => None,
+        };
+        heavy.limit_extras =
+            match guard_panel(|| load_limit_extras(open_store, now, &until, session_id.as_deref()))
+            {
+                Panel::Ready(extras) => extras,
+                _ => LimitExtras::default(),
+            };
+    }
+    snapshot.limits = match latest_limit {
+        Panel::Ready(latest) => guard_panel(|| {
+            let history_since = (now - ChronoDuration::hours(LIMIT_HISTORY_HOURS))
+                .to_rfc3339_opts(SecondsFormat::Millis, true);
+            Ok(LimitsData {
+                latest,
+                history: open_store.limit_snapshots_since(
+                    &history_since,
+                    crate::store::limits::LIMIT_HISTORY_MAX_ROWS,
+                )?,
+                api_key: open_store
+                    .latest_ratelimit_snapshot()?
+                    .filter(|row| row.ts >= since),
+                compaction: heavy.limit_extras.compaction.clone(),
+                estimate_5h: heavy.limit_extras.estimate_5h.clone(),
+                estimate_7d: heavy.limit_extras.estimate_7d.clone(),
+            })
+        }),
+        Panel::Failed(failure) => Panel::Failed(failure),
+        Panel::Pending => Panel::Pending,
+    };
 
     // 6. 최근 이벤트 최신순 정렬 (조회 순서 가정 제거)
     if let Panel::Ready(events) = &mut snapshot.events {
@@ -245,6 +343,34 @@ fn collect_snapshot(
     }
 
     snapshot
+}
+
+// 7-0. 한도 카드의 무거운 입력 ------------------------------------------------
+// 컴팩션은 최신 공식 스냅샷 세션의 것만 취함, 로컬 토큰 집계는 공식 퍼센트가 없을 때의 추정용
+fn load_limit_extras(
+    store: &Store,
+    now: DateTime<Utc>,
+    until: &str,
+    session_id: Option<&str>,
+) -> anyhow::Result<LimitExtras> {
+    let stamp = |span: ChronoDuration| (now - span).to_rfc3339_opts(SecondsFormat::Millis, true);
+    let compaction = match session_id {
+        Some(id) => store
+            .compaction_stats(
+                &stamp(ChronoDuration::days(COMPACTION_LOOKBACK_DAYS)),
+                until,
+            )?
+            .into_iter()
+            .find(|stat| stat.session_id == id),
+        None => None,
+    };
+    let five_hours = stamp(ChronoDuration::hours(ESTIMATE_FIVE_HOUR_HOURS));
+    let seven_days = stamp(ChronoDuration::hours(ESTIMATE_SEVEN_DAY_HOURS));
+    Ok(LimitExtras {
+        compaction,
+        estimate_5h: Some(store.query_overview(&five_hours, until)?),
+        estimate_7d: Some(store.query_overview(&seven_days, until)?),
+    })
 }
 
 // 7-1. 구간 경계 --------------------------------------------------------------
@@ -288,30 +414,76 @@ pub fn spawn_settings_load(config: AppConfig, ui_tx: Sender<UiMessage>) {
 
 // 9. 리포트 본문 적재 ---------------------------------------------------------
 // DB 없음은 안내 문구, 리포트 없음은 Ready(None)
-pub fn load_report_body(config: &AppConfig, date: NaiveDate) -> Panel<Option<String>> {
+// live = 화면이 지금 "오늘"로 보는 날 (시계를 다시 읽지 않고 UI 의 판단을 그대로 따름)
+pub fn load_report_body(config: &AppConfig, date: NaiveDate, live: bool) -> Panel<Option<String>> {
+    let db_path = config.data_dir.join(DB_FILE_NAME);
+    if !db_path.is_file() {
+        return Panel::Failed(Failure::DbMissing);
+    }
+    // 오늘은 아직 끝나지 않은 날이라 저장본 대신 읽기 전용 DB 로 지금까지의 리포트를 바로 만듦 (저장하지 않음)
+    guard_panel(|| {
+        let store = Store::open_read_only(&db_path)?;
+        if live {
+            return report::build_daily_report(&store, date, config.report.language).map(Some);
+        }
+        store.load_daily_report(&date.format("%Y-%m-%d").to_string())
+    })
+}
+
+// 9-1. 주간 리포트 본문 적재 --------------------------------------------------
+// live = 화면이 지금 "이번 주"로 보는 주: 읽기 전용 DB 로 지금까지의 주간 본문을 바로 만들고, 아니면 저장본을 읽음 (저장 키 YYYY-Www)
+pub fn load_weekly_report_body(
+    config: &AppConfig,
+    week_start: NaiveDate,
+    live: bool,
+) -> Panel<Option<String>> {
     let db_path = config.data_dir.join(DB_FILE_NAME);
     if !db_path.is_file() {
         return Panel::Failed(Failure::DbMissing);
     }
     guard_panel(|| {
         let store = Store::open_read_only(&db_path)?;
-        store.load_daily_report(&date.format("%Y-%m-%d").to_string())
+        if live {
+            return report::build_weekly_report(&store, week_start, config.report.language)
+                .map(Some);
+        }
+        store.load_daily_report(&report::format_week_key(week_start))
     })
 }
 
+pub fn spawn_weekly_report_load(
+    config: AppConfig,
+    ui_tx: Sender<UiMessage>,
+    week_start: NaiveDate,
+    live: bool,
+) {
+    let _ = thread::Builder::new()
+        .name("cm-tui-report-week".to_string())
+        .spawn(move || {
+            let body = load_weekly_report_body(&config, week_start, live);
+            let _ = ui_tx.send(UiMessage::WeeklyReport { week_start, body });
+        });
+}
+
 // 10. 리포트 적재 스레드 ------------------------------------------------------
-pub fn spawn_report_load(config: AppConfig, ui_tx: Sender<UiMessage>, date: NaiveDate) {
+pub fn spawn_report_load(config: AppConfig, ui_tx: Sender<UiMessage>, date: NaiveDate, live: bool) {
     let _ = thread::Builder::new()
         .name("cm-tui-report".to_string())
         .spawn(move || {
-            let body = load_report_body(&config, date);
+            let body = load_report_body(&config, date, live);
             let _ = ui_tx.send(UiMessage::Report { date, body });
         });
 }
 
 // 11. 관리 포트 요청 스레드 ---------------------------------------------------
 // 토큰 파일 없음 또는 빈 값은 serve 미실행으로 안내, 리포트 생성 성공 시 본문 재적재
-pub fn spawn_admin_action(config: AppConfig, ui_tx: Sender<UiMessage>, action: AdminAction) {
+// today = UI 가 지금 오늘로 보는 날 (재적재의 실시간 여부는 이 날 기준, 시계를 다시 읽지 않음)
+pub fn spawn_admin_action(
+    config: AppConfig,
+    ui_tx: Sender<UiMessage>,
+    action: AdminAction,
+    today: NaiveDate,
+) {
     let _ = thread::Builder::new()
         .name("cm-tui-admin".to_string())
         .spawn(move || {
@@ -320,6 +492,9 @@ pub fn spawn_admin_action(config: AppConfig, ui_tx: Sender<UiMessage>, action: A
                 AdminAction::Reindex => "/api/reindex".to_string(),
                 AdminAction::GenerateReport(date) => {
                     format!("/api/report?date={}", date.format("%Y-%m-%d"))
+                }
+                AdminAction::GenerateWeeklyReport(week_start) => {
+                    format!("/api/report?week={}", report::format_week_key(week_start))
                 }
             };
 
@@ -356,8 +531,13 @@ pub fn spawn_admin_action(config: AppConfig, ui_tx: Sender<UiMessage>, action: A
 
             // 4. 리포트 생성 후 본문 갱신
             if let (true, AdminAction::GenerateReport(date)) = (succeeded, action) {
-                let body = load_report_body(&config, date);
+                let body = load_report_body(&config, date, date == today);
                 let _ = ui_tx.send(UiMessage::Report { date, body });
+            }
+            if let (true, AdminAction::GenerateWeeklyReport(week_start)) = (succeeded, action) {
+                let live = week_start == report::week_start_of(today);
+                let body = load_weekly_report_body(&config, week_start, live);
+                let _ = ui_tx.send(UiMessage::WeeklyReport { week_start, body });
             }
         });
 }
@@ -388,6 +568,160 @@ mod tests {
 
         // panic 뒤 격리 표시는 해제
         assert!(!QUIET_PANIC.with(Cell::get));
+    }
+
+    #[test]
+    fn todays_report_is_built_live_and_other_days_read_the_stored_copy() {
+        let dir = std::env::temp_dir().join(format!("cm-report-live-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        Store::open_store(&dir.join(DB_FILE_NAME)).unwrap();
+        let config = AppConfig {
+            data_dir: dir.clone(),
+            ..crate::tui::test_support::sample_config()
+        };
+        let today = Local::now().date_naive();
+
+        // 오늘: 저장본이 없어도 지금까지의 본문을 만듦
+        let live = load_report_body(&config, today, true);
+        let label = today.format("%Y-%m-%d").to_string();
+        assert!(
+            matches!(&live, Panel::Ready(Some(body)) if body.contains(&label)),
+            "{label}"
+        );
+
+        // 어제: 저장본만 읽으므로 없으면 빈 값
+        let yesterday = today.pred_opt().unwrap();
+        assert!(matches!(
+            load_report_body(&config, yesterday, false),
+            Panel::Ready(None)
+        ));
+
+        // 실시간 여부는 호출한 UI 의 판단을 따름 (시계를 다시 읽지 않음): 자정이 지나 지난 날이 된 날은 live=false 로 저장본만, 새 오늘은 live=true 로 바로 만듦
+        assert!(matches!(
+            load_report_body(&config, today, false),
+            Panel::Ready(None)
+        ));
+        let next_day = today.succ_opt().unwrap();
+        let next_label = next_day.format("%Y-%m-%d").to_string();
+        assert!(
+            matches!(
+                &load_report_body(&config, next_day, true),
+                Panel::Ready(Some(body)) if body.contains(&next_label)
+            ),
+            "{next_label}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn this_week_is_built_live_and_past_weeks_read_the_stored_copy() {
+        let dir = std::env::temp_dir().join(format!("cm-report-week-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let store = Store::open_store(&dir.join(DB_FILE_NAME)).unwrap();
+        let config = AppConfig {
+            data_dir: dir.clone(),
+            ..crate::tui::test_support::sample_config()
+        };
+        let this_week = report::week_start_of(Local::now().date_naive());
+        let last_week = this_week - ChronoDuration::days(7);
+
+        // 이번 주: 저장본이 없어도 지금까지의 주간 본문을 만들고 저장하지 않음
+        let key = report::format_week_key(this_week);
+        let live = load_weekly_report_body(&config, this_week, true);
+        assert!(
+            matches!(&live, Panel::Ready(Some(body)) if body.contains(&key)),
+            "{key}"
+        );
+        assert_eq!(store.load_daily_report(&key).unwrap(), None);
+
+        // 지난 주: 저장본만 읽으므로 없으면 빈 값, 저장하면 그 본문
+        assert!(matches!(
+            load_weekly_report_body(&config, last_week, false),
+            Panel::Ready(None)
+        ));
+
+        // 실시간 여부는 UI 의 판단: 자정을 넘긴 이전 주는 live=false 로 저장본만, 새 이번 주는 live=true 로 바로 만듦
+        assert!(matches!(
+            load_weekly_report_body(&config, this_week, false),
+            Panel::Ready(None)
+        ));
+        let next_week = this_week + ChronoDuration::days(7);
+        let next_key = report::format_week_key(next_week);
+        assert!(matches!(
+            &load_weekly_report_body(&config, next_week, true),
+            Panel::Ready(Some(body)) if body.contains(&next_key)
+        ));
+        store
+            .save_daily_report(
+                &report::format_week_key(last_week),
+                "2026-11-15T00:00:00.000Z",
+                "stored weekly body",
+            )
+            .unwrap();
+        assert!(matches!(
+            &load_weekly_report_body(&config, last_week, false),
+            Panel::Ready(Some(body)) if body == "stored weekly body"
+        ));
+
+        // DB 없음은 일간과 같은 안내
+        let missing = AppConfig {
+            data_dir: dir.join("missing"),
+            ..config
+        };
+        assert!(matches!(
+            load_weekly_report_body(&missing, this_week, true),
+            Panel::Failed(Failure::DbMissing)
+        ));
+        drop(store);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn limits_panel_carries_the_latest_snapshot_recent_history_and_cached_local_estimates() {
+        use crate::store::limits::LimitSnapshot;
+
+        let dir = std::env::temp_dir().join(format!("cm-limits-poll-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let writer = Store::open_store(&dir.join(DB_FILE_NAME)).unwrap();
+        writer
+            .insert_limit_snapshot(&LimitSnapshot {
+                ts: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                session_id: "sess-1".to_string(),
+                five_hour_pct: Some(42.0),
+                ..LimitSnapshot::default()
+            })
+            .unwrap();
+        drop(writer);
+        let config = AppConfig {
+            data_dir: dir.clone(),
+            ..crate::tui::test_support::sample_config()
+        };
+        let mut store = None;
+        let mut heavy = HeavyPanels::default();
+
+        // 처음(무거운 주기): 공식 스냅샷·최근 기록·로컬 추정, API 키 기록 없음
+        let first = collect_snapshot(&config, WindowKind::Hour, &mut store, &mut heavy, true);
+        let Panel::Ready(data) = &first.limits else {
+            panic!("{:?}", first.limits);
+        };
+        assert_eq!(
+            data.latest.as_ref().and_then(|latest| latest.five_hour_pct),
+            Some(42.0)
+        );
+        assert_eq!(data.history.len(), 1);
+        assert!(data.api_key.is_none());
+        assert!(data.estimate_5h.is_some() && data.estimate_7d.is_some());
+
+        // 무거운 주기가 아니면 추정은 캐시를 그대로 쓰고 스냅샷은 다시 읽음
+        let second = collect_snapshot(&config, WindowKind::Hour, &mut store, &mut heavy, false);
+        let Panel::Ready(cached) = &second.limits else {
+            panic!("{:?}", second.limits);
+        };
+        assert!(cached.estimate_5h.is_some() && cached.latest.is_some());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -482,7 +816,33 @@ mod tests {
         let mut config = crate::tui::test_support::sample_config();
         config.data_dir = std::env::temp_dir().join("cm-tui-test-no-such-dir");
         let date = NaiveDate::from_ymd_opt(2026, 11, 14).unwrap();
-        let body = load_report_body(&config, date);
+        let body = load_report_body(&config, date, false);
         assert!(matches!(&body, Panel::Failed(Failure::DbMissing)));
+    }
+
+    // 스키마 갱신은 수집 스레드의 최초 수집 전 작업: DB 없음·정상은 조용, 열 수 없는 손상 파일은 오류 원문을 돌려줌
+    #[test]
+    fn schema_upgrade_runs_on_the_poller_side_and_reports_a_failure_detail() {
+        let dir = std::env::temp_dir().join(format!("cm-schema-upgrade-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let config = AppConfig {
+            data_dir: dir.clone(),
+            ..crate::tui::test_support::sample_config()
+        };
+
+        // DB 없음: 만들지 않고 실패도 아님
+        assert_eq!(upgrade_store_schema(&config), None);
+        assert!(!dir.join(DB_FILE_NAME).exists());
+
+        // 정상 DB: 실패 없음
+        drop(Store::open_store(&dir.join(DB_FILE_NAME)).unwrap());
+        assert_eq!(upgrade_store_schema(&config), None);
+
+        // SQLite 가 아닌 파일: 실패 원문을 돌려줌 (알림은 UI 스레드가 화면 언어로 만듦)
+        fs::write(dir.join(DB_FILE_NAME), vec![b'x'; 4096]).unwrap();
+        let detail = upgrade_store_schema(&config);
+        assert!(detail.is_some_and(|text| !text.is_empty()));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

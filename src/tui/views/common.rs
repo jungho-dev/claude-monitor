@@ -20,9 +20,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Cell, Padding, Paragraph, Row, Table};
 use unicode_width::UnicodeWidthChar;
 
-// 글자 열이 줄어드는 최소 폭 (드래그 하한 포함), 열 사이 간격
+// 글자 열이 줄어드는 최소 폭 (드래그 하한 포함), 열 사이 간격, 열 경계 잡는 칸이 양옆 열로 넓어지는 칸 수
 const MIN_COLUMN_WIDTH: u16 = 3;
 const TABLE_COLUMN_GAP: u16 = 1;
+const COLUMN_GRAB_REACH: u16 = 1;
 
 // 표 열 맞춤: 숫자·짧은 열은 고정, 글자 열은 좁아지면 먼저 줄고(Shrink), 남는 폭은 맨 오른쪽 Grow 열이 가짐
 // Keep·GrowKeep 은 명세 폭을 읽을 수 있는 최소 폭으로 지키는 글자 열 (그 폭보다 좁아지면 줄이지 않고 오른쪽 열을 먼저 숨김),
@@ -321,6 +322,7 @@ pub fn render_card_table(frame: &mut Frame, state: &mut AppState, area: Rect, ta
     view.scroll = view.scroll.min(total.saturating_sub(visible));
     view.selected = view.selected.min(total.saturating_sub(1));
     let (scroll, selected) = (view.scroll, view.selected);
+    let table_part = (scroll + visible).min(table_total) - scroll.min(table_total);
 
     // 3. 열 폭 계획 (자연 폭 = 머리글·가장 넓은 칸, 숫자·고정 열은 선호 폭 이상으로 줄지 않음, Keep 열은 지킬 폭 아래로 줄지 않음)
     let plans: Vec<ColumnPlan> = columns
@@ -401,13 +403,36 @@ pub fn render_card_table(frame: &mut Frame, state: &mut AppState, area: Rect, ta
         }
 
         // 열 경계 (마지막 보이는 열 오른쪽은 경계 없음, 폭 범위 = 다른 열 최소 폭을 남긴 만큼)
+        // 잡는 칸은 경계 칸 양옆으로 한 칸씩 넓힘 (옆 열이 최소 폭보다 넓을 때만, 이웃 경계 잡는 칸과 겹치지 않음)
         if position + 1 < shown.len() && *index < MAX_TABLE_COLUMNS && header_height > 0 {
             let others_floor = (shown_floors - plans[*index].floor).saturating_add(shown_gaps);
+            let edge_x = cursor + width;
+            let next_width = widths[shown[position + 1]];
+            let reach_left = if width > MIN_COLUMN_WIDTH {
+                COLUMN_GRAB_REACH
+            } else {
+                0
+            };
+            let reach_right = if next_width > MIN_COLUMN_WIDTH {
+                COLUMN_GRAB_REACH
+            } else {
+                0
+            };
             state.hit_areas.column_hits.push(ColumnHit {
                 card,
                 column: *index,
-                grab: Rect::new(cursor + width, inner.y, TABLE_COLUMN_GAP, 1),
-                line: Rect::new(cursor + width, inner.y, TABLE_COLUMN_GAP, inner.height),
+                grab: Rect::new(
+                    edge_x - reach_left,
+                    inner.y,
+                    reach_left + TABLE_COLUMN_GAP + reach_right,
+                    1,
+                ),
+                line: Rect::new(
+                    edge_x,
+                    inner.y,
+                    TABLE_COLUMN_GAP,
+                    header_height + table_part as u16,
+                ),
                 width,
                 min: plans[*index].floor,
                 max: inner
@@ -447,7 +472,6 @@ pub fn render_card_table(frame: &mut Frame, state: &mut AppState, area: Rect, ta
         );
     }
     frame.render_widget(block, area);
-    let table_part = (scroll + visible).min(table_total) - scroll.min(table_total);
     let body_rows: Vec<Row<'static>> = rows
         .into_iter()
         .skip(scroll)
@@ -999,21 +1023,22 @@ fn wrap_styled_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
 }
 
 // 15. 열 경계 손잡이 ----------------------------------------------------------
-// 평소에는 아무것도 그리지 않고, 마우스 아래는 머리글 칸 하나·끌는 동안은 표 높이 전체 세로선
+// 평소에는 머리글 행 경계 칸에 흐린 │ 로 위치만 표시, 마우스 아래·끄는 동안은 머리글과 본문 행 전체 세로선 ┃
 pub fn render_column_handles(frame: &mut Frame, state: &AppState) {
     let dragging = state.column_drag.map(|drag| (drag.card, drag.column));
     let buf = frame.buffer_mut();
     for hit in &state.hit_areas.column_hits {
         let key = Some((hit.card, hit.column));
-        let dragged = dragging == key;
-        let hovered = dragging.is_none() && state.column_hover == key;
-        if !dragged && !hovered {
-            continue;
-        }
-        let (color, line) = if dragged {
-            (theme::SPLIT_GRIP_DRAG, hit.line)
+        let line = hit.line;
+        let color = if dragging == key {
+            theme::SPLIT_GRIP_DRAG
+        } else if dragging.is_none() && state.column_hover == key {
+            theme::SPLIT_GRIP_HOT
         } else {
-            (theme::SPLIT_GRIP_HOT, hit.grab)
+            buf[(line.x, line.y)]
+                .set_symbol("│")
+                .set_fg(theme::FG_FAINT);
+            continue;
         };
         for y in line.y..line.bottom() {
             buf[(line.x, y)].set_symbol("┃").set_fg(color);

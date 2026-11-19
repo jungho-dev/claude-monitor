@@ -9,13 +9,17 @@ use crate::core::model::{
     StatusSnapshot, ToolCallRow,
 };
 use crate::inventory::{AgentEntry, DoctorFinding, HookEntry, Inventory, McpEntry};
+use crate::store::limits::LimitSnapshot;
+use crate::store::metrics::{AttributionDimension, MetricAttributionRow};
+use crate::store::otel_events::CompactionStat;
 use crate::store::query::{
     AgentStatsRow, CacheBreakRow, HookStatRow, MinuteBucket, ModelStatsRow, OverviewStats,
-    ToolLatencyRow,
+    ProjectStatsRow, ToolLatencyRow,
 };
+use crate::store::ratelimit::RatelimitSnapshotRow;
 use crate::tui::i18n::Lang;
-use crate::tui::state::{AppState, DashboardSnapshot, DbState, Panel};
-use chrono::{NaiveDate, Utc};
+use crate::tui::state::{AppState, DashboardSnapshot, DbState, LimitsData, Panel};
+use chrono::{DateTime, Duration, NaiveDate, SecondsFormat, TimeZone, Utc};
 use std::path::PathBuf;
 
 // 1. 합성 설정 ----------------------------------------------------------------
@@ -197,6 +201,8 @@ pub fn sample_state_with_tables() -> AppState {
     ]);
     state.snapshot.model_stats = Panel::Ready(vec![
         ModelStatsRow {
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
             model: "claude-sonnet-5-5".to_string(),
             requests: 900,
             sessions: 3,
@@ -212,6 +218,8 @@ pub fn sample_state_with_tables() -> AppState {
             last_ts: "2026-11-15T01:00:00Z".to_string(),
         },
         ModelStatsRow {
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
             model: "claude-haiku-4-5".to_string(),
             requests: 1_500,
             sessions: 5,
@@ -229,6 +237,8 @@ pub fn sample_state_with_tables() -> AppState {
     ]);
     state.snapshot.agent_stats = Panel::Ready(vec![
         AgentStatsRow {
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
             agent: "main".to_string(),
             runs: 3,
             requests: 700,
@@ -247,6 +257,8 @@ pub fn sample_state_with_tables() -> AppState {
             last_ts: "2026-11-15T01:00:00Z".to_string(),
         },
         AgentStatsRow {
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
             agent: "worker".to_string(),
             runs: 12,
             requests: 1_700,
@@ -264,6 +276,77 @@ pub fn sample_state_with_tables() -> AppState {
             top_model: "claude-haiku-4-5".to_string(),
             last_ts: "2026-11-15T01:30:00Z".to_string(),
         },
+    ]);
+    state.snapshot.projects = Panel::Ready(vec![
+        ProjectStatsRow {
+            project: "claude-monitor".to_string(),
+            git_branch: "main".to_string(),
+            requests: 900,
+            sessions: 3,
+            input_tokens: 1_200_000,
+            output_tokens: 300_000,
+            cache_read_tokens: 6_000_000,
+            cache_creation_5m_tokens: 200_000,
+            cache_creation_1h_tokens: 100_000,
+            cost_usd_estimate: 8.4,
+            last_ts: "2026-11-15T01:30:00Z".to_string(),
+        },
+        ProjectStatsRow {
+            project: "claude-monitor".to_string(),
+            git_branch: "feature/projects-tab".to_string(),
+            requests: 400,
+            sessions: 2,
+            input_tokens: 500_000,
+            output_tokens: 120_000,
+            cache_read_tokens: 2_500_000,
+            cache_creation_5m_tokens: 90_000,
+            cache_creation_1h_tokens: 0,
+            cost_usd_estimate: 3.1,
+            last_ts: "2026-11-15T01:10:00Z".to_string(),
+        },
+        ProjectStatsRow {
+            project: "rust-fs-mcp".to_string(),
+            git_branch: String::new(),
+            requests: 100,
+            sessions: 1,
+            input_tokens: 80_000,
+            output_tokens: 20_000,
+            cache_read_tokens: 400_000,
+            cache_creation_5m_tokens: 10_000,
+            cache_creation_1h_tokens: 0,
+            cost_usd_estimate: 0.5,
+            last_ts: "2026-11-15T00:50:00Z".to_string(),
+        },
+    ]);
+    let attribution_row = |name: &str, cost_usd: f64| MetricAttributionRow {
+        name: name.to_string(),
+        cost_usd,
+        input_tokens: 40_000,
+        output_tokens: 9_000,
+        cache_read_tokens: 300_000,
+        cache_creation_tokens: 12_000,
+    };
+    state.snapshot.attribution = Panel::Ready(vec![
+        (
+            AttributionDimension::Skill,
+            vec![
+                attribution_row("frontend-tui", 1.25),
+                attribution_row("languages-rust", 0.75),
+            ],
+        ),
+        (
+            AttributionDimension::McpServer,
+            vec![attribution_row("serena-mcp", 0.4)],
+        ),
+        (AttributionDimension::Plugin, Vec::new()),
+        (
+            AttributionDimension::Agent,
+            vec![attribution_row("agent-planner", 2.0)],
+        ),
+        (
+            AttributionDimension::Model,
+            vec![attribution_row("claude-sonnet-5-5", 3.5)],
+        ),
     ]);
     state.inventory = Panel::Ready(Inventory {
         hooks: vec![
@@ -387,5 +470,77 @@ pub fn sample_state_with_long_report(count: usize) -> AppState {
         markdown.push_str(&format!("\n## 항목 {index}\n본문\n"));
     }
     state.report = Panel::Ready(Some(markdown));
+    state
+}
+
+// 5. 한도·캐시 카드용 합성 입력 -----------------------------------------------
+// 시계를 이 값으로 고정해 카운트다운 문구 단언이 흔들리지 않게 함
+pub fn fixed_limits_now() -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 11, 19, 10, 0, 0).unwrap()
+}
+
+// now 기준: 5시간 창 2시간 경과 70% (한 시간 전 50%, 리셋 3시간 뒤), 7일 창 하루 경과 35%,
+// 컨텍스트 62%에 컴팩션 2회, 캡시 4분 12초 남음 (적중 82%, 미스 9/50), API 키 요청 480/500·토큰 80K/100K
+pub fn sample_limits_data(now: DateTime<Utc>) -> LimitsData {
+    let stamp = |offset_secs: i64| {
+        (now + Duration::seconds(offset_secs)).to_rfc3339_opts(SecondsFormat::Millis, true)
+    };
+    let five_hour_resets_at = (now + Duration::hours(3)).timestamp();
+    let seven_day_resets_at = (now + Duration::days(6)).timestamp();
+    let earlier = LimitSnapshot {
+        ts: stamp(-3_600),
+        session_id: "sess-1".to_string(),
+        five_hour_pct: Some(50.0),
+        five_hour_resets_at: Some(five_hour_resets_at),
+        seven_day_pct: Some(34.0),
+        seven_day_resets_at: Some(seven_day_resets_at),
+        ..LimitSnapshot::default()
+    };
+    let latest = LimitSnapshot {
+        ts: stamp(-12),
+        five_hour_pct: Some(70.0),
+        seven_day_pct: Some(35.0),
+        context_pct: Some(62.0),
+        cache_warm: Some(true),
+        cache_caching_observed: Some(true),
+        cache_ttl: Some("5m".to_string()),
+        cache_expires_at: Some((now + Duration::seconds(252)).timestamp()),
+        cache_requests: Some(50),
+        cache_misses: Some(9),
+        cache_hit_ratio: Some(0.82),
+        cache_last_miss_at: Some((now - Duration::seconds(180)).timestamp()),
+        cache_last_miss_cause: Some("ttl_expired".to_string()),
+        ..earlier.clone()
+    };
+    LimitsData {
+        latest: Some(latest.clone()),
+        history: vec![earlier, latest],
+        api_key: Some(RatelimitSnapshotRow {
+            ts: stamp(-30),
+            requests_limit: Some(500),
+            requests_remaining: Some(480),
+            requests_reset: Some(stamp(720)),
+            tokens_limit: Some(100_000),
+            tokens_remaining: Some(80_000),
+            ..RatelimitSnapshotRow::default()
+        }),
+        compaction: Some(CompactionStat {
+            session_id: "sess-1".to_string(),
+            count: 2,
+            ..CompactionStat::default()
+        }),
+        estimate_5h: None,
+        estimate_7d: None,
+    }
+}
+
+// 개요·모델 탭 공용: 시계 고정, 스냅샷은 마지막 수집 12초 전
+pub fn sample_state_with_limits(lang: Lang) -> AppState {
+    let mut state = sample_state_with_tables();
+    state.lang = lang;
+    let now = fixed_limits_now();
+    state.clock_override = Some(now);
+    state.snapshot.taken_at = Some(now);
+    state.snapshot.limits = Panel::Ready(sample_limits_data(now));
     state
 }

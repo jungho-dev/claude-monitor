@@ -9,6 +9,8 @@ pub mod net;
 pub mod power;
 pub mod report;
 pub mod serve;
+pub mod statuscheck;
+pub mod statusline;
 pub mod store;
 pub mod transcript;
 pub mod tui;

@@ -7,10 +7,13 @@ pub mod record;
 pub mod relay;
 pub mod rewrite;
 pub mod standby;
+pub mod statusline;
 pub mod upstream;
 
 #[cfg(test)]
 mod chain_tests;
+#[cfg(test)]
+mod statusline_tests;
 
 pub use client::run_hook_client;
 
@@ -98,6 +101,7 @@ async fn route_hook_request(state: &HookState, req: Request<Incoming>) -> Respon
     // 3. 경로 판별
     let is_chain = path == "/hook/pretool-chain";
     let is_standby = path == "/hook/standby-hint";
+    let is_statusline = path == "/hook/statusline";
     let relay_route: Option<String> = path.strip_prefix("/hook/relay/").map(str::to_string);
     if let Some(route) = &relay_route {
         let valid = !route.is_empty()
@@ -107,8 +111,23 @@ async fn route_hook_request(state: &HookState, req: Request<Incoming>) -> Respon
         if !valid {
             return text_response(StatusCode::BAD_REQUEST, "invalid relay route");
         }
-    } else if !is_chain && !is_standby {
+    } else if !is_chain && !is_standby && !is_statusline {
         return text_response(StatusCode::NOT_FOUND, "not found");
+    }
+
+    // 3-1. 한도 스냅샷 (훅 이벤트로 기록하지 않음)
+    if is_statusline {
+        if statusline::record_statusline_snapshot(&state.ctx, &body).await
+            == statusline::StatuslineIntake::Malformed
+        {
+            return text_response(StatusCode::BAD_REQUEST, "invalid statusline payload");
+        }
+        let mut response = Response::new(full_body(Bytes::from_static(b"{}")));
+        response.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/json; charset=utf-8"),
+        );
+        return response;
     }
 
     // 4. 대기 복귀 안내

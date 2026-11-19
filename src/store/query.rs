@@ -1,6 +1,7 @@
 //! store/query.rs
 //! TUI·리포트·관리 API 공용 집계 조회 (구간은 RFC 3339 UTC 반열린 구간).
 
+use crate::core::config::{ModelRateConfig, PricingConfig, price_overrides};
 use crate::core::model::{
     ApiRequestRow, DENY_ROUND_TRIP_MS, DataSource, HookEventRow, HookOutcome, LiveEvent,
     ToolCallRow,
@@ -11,6 +12,26 @@ use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+// 5분 캐시 쓰기 효과값 (분리 값이 없는 이전 행은 쓰기 합계 전부를 5분으로 계산)
+macro_rules! write_5m_sql {
+    () => {
+        "MAX(cache_creation_tokens - cache_creation_1h_tokens, cache_creation_5m_tokens)"
+    };
+}
+
+// 요청 프롬프트 토큰 (입력 + 캐시 읽기 + 캐시 쓰기)
+macro_rules! prompt_tokens_sql {
+    () => {
+        concat!(
+            "(input_tokens + cache_read_tokens + ",
+            write_5m_sql!(),
+            " + cache_creation_1h_tokens)"
+        )
+    };
+}
+
+// 프롬프트가 이 토큰을 넘으면 긴 프롬프트 단가 (haiku-5-5 만 두 단계)
+const LONG_PROMPT_TOKENS: i64 = 100_000;
 const CACHE_BREAK_MIN_CREATION: i64 = 20_000;
 const CACHE_BREAK_READ_SHARE: f64 = 0.5;
 const GAP_IDLE_HOUR_SECS: i64 = 3600;
@@ -35,9 +56,35 @@ pub(crate) const CACHE_BREAK_PREVIOUS_SQL: &str = "SELECT ts, model, \
     AND agent = ?2 AND ts < ?3 ORDER BY ts DESC LIMIT 1";
 
 // 통계 요청 원본 (ts 인덱스 구간)
-pub(crate) const STATS_REQUESTS_SQL: &str = "SELECT model, session_id, agent, input_tokens, \
-    output_tokens, cache_read_tokens, cache_creation_tokens, duration_ms, ts FROM api_requests \
-    WHERE source = 'transcript' AND ts >= ?1 AND ts < ?2";
+pub(crate) const STATS_REQUESTS_SQL: &str = concat!(
+    "SELECT model, session_id, agent, input_tokens, output_tokens, cache_read_tokens, \
+     cache_creation_tokens, duration_ms, ts, ",
+    write_5m_sql!(),
+    ", cache_creation_1h_tokens FROM api_requests \
+     WHERE source = 'transcript' AND ts >= ?1 AND ts < ?2"
+);
+
+// 모델·에이전트 사용량 (프롬프트 길이 단계별 묶음, 단계별 합으로 비용 산출)
+const MODEL_USAGE_SQL: &str = concat!(
+    "SELECT model, agent, COUNT(*), SUM(input_tokens), SUM(output_tokens), \
+     SUM(cache_read_tokens), SUM(cache_creation_tokens), SUM(",
+    write_5m_sql!(),
+    "), SUM(cache_creation_1h_tokens) FROM api_requests \
+     WHERE source = 'transcript' AND ts >= ?1 AND ts < ?2 \
+     GROUP BY model, agent, ",
+    prompt_tokens_sql!(),
+    " > ?3"
+);
+
+// 프로젝트·브랜치 집계 원본 (프로젝트는 요청 값, 없으면 세션 폴더명)
+const PROJECT_REQUESTS_SQL: &str = concat!(
+    "SELECT COALESCE(NULLIF(r.project, ''), s.project, ''), r.git_branch, r.session_id, r.model, \
+     r.input_tokens, r.output_tokens, r.cache_read_tokens, ",
+    write_5m_sql!(),
+    ", r.cache_creation_1h_tokens, r.ts FROM api_requests r \
+     LEFT JOIN sessions s ON s.session_id = r.session_id \
+     WHERE r.source = 'transcript' AND r.ts >= ?1 AND r.ts < ?2"
+);
 
 // 통계 도구 호출 원본 (ts 인덱스 구간)
 pub(crate) const STATS_TOOL_CALLS_SQL: &str = "SELECT agent, is_error, ts FROM tool_calls \
@@ -99,6 +146,8 @@ pub struct ModelUsageRow {
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
     pub cache_creation_tokens: i64,
+    pub cache_creation_5m_tokens: i64,
+    pub cache_creation_1h_tokens: i64,
     pub cost_usd_estimate: f64,
 }
 
@@ -159,6 +208,8 @@ pub struct ModelStatsRow {
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
     pub cache_creation_tokens: i64,
+    pub cache_creation_5m_tokens: i64,
+    pub cache_creation_1h_tokens: i64,
     pub cache_hit_ratio: f64,
     pub wait_p50_ms: Option<i64>,
     pub wait_p90_ms: Option<i64>,
@@ -178,6 +229,8 @@ pub struct AgentStatsRow {
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
     pub cache_creation_tokens: i64,
+    pub cache_creation_5m_tokens: i64,
+    pub cache_creation_1h_tokens: i64,
     pub cache_hit_ratio: f64,
     pub wait_p50_ms: Option<i64>,
     pub wait_p90_ms: Option<i64>,
@@ -185,6 +238,23 @@ pub struct AgentStatsRow {
     pub tool_calls: u64,
     pub tool_errors: u64,
     pub top_model: String,
+    pub last_ts: String,
+}
+
+// 8-2-1. 프로젝트·브랜치 통계 행 ----------------------------------------------
+// 프로젝트는 작업 폴더 마지막 요소 (없으면 기록 세션 폴더명), 브랜치가 없으면 빈 문자열
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProjectStatsRow {
+    pub project: String,
+    pub git_branch: String,
+    pub requests: u64,
+    pub sessions: u64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_creation_5m_tokens: i64,
+    pub cache_creation_1h_tokens: i64,
+    pub cost_usd_estimate: f64,
     pub last_ts: String,
 }
 
@@ -198,6 +268,9 @@ struct ModelStatsTotals {
     output_tokens: i64,
     cache_read_tokens: i64,
     cache_creation_tokens: i64,
+    cache_creation_5m_tokens: i64,
+    cache_creation_1h_tokens: i64,
+    cost_usd_estimate: f64,
     waits: Vec<i64>,
     last_ts: String,
 }
@@ -212,6 +285,8 @@ struct AgentStatsTotals {
     output_tokens: i64,
     cache_read_tokens: i64,
     cache_creation_tokens: i64,
+    cache_creation_5m_tokens: i64,
+    cache_creation_1h_tokens: i64,
     cost_usd_estimate: f64,
     waits: Vec<i64>,
     model_requests: BTreeMap<String, u64>,
@@ -231,6 +306,20 @@ struct CacheProbeRow {
     cache_creation_tokens: i64,
 }
 
+// 9-1. 프로젝트·브랜치 통계 누적 ----------------------------------------------
+#[derive(Default)]
+struct ProjectStatsTotals {
+    requests: u64,
+    sessions: BTreeSet<String>,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+    cache_creation_5m_tokens: i64,
+    cache_creation_1h_tokens: i64,
+    cost_usd_estimate: f64,
+    last_ts: String,
+}
+
 // 10. 백분위 요약 -------------------------------------------------------------
 // 정렬 후 최근접 순위법 p50·p90
 pub fn summarize_percentiles(values: &mut [i64]) -> (Option<i64>, Option<i64>) {
@@ -245,40 +334,226 @@ pub fn summarize_percentiles(values: &mut [i64]) -> (Option<i64>, Option<i64>) {
     (Some(rank_at(50)), Some(rank_at(90)))
 }
 
-// 11. 비용 추정 ---------------------------------------------------------------
-// API 단가 기준 USD 추정 (MTok 단위 입력·출력), 알 수 없는 모델은 0
+// 11. 단가표 ------------------------------------------------------------------
+// USD per MTok, 쓰기 단가는 5분·1시간 TTL 별
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ModelRates {
+    input: f64,
+    output: f64,
+    cache_write_5m: f64,
+    cache_write_1h: f64,
+    cache_read: f64,
+}
+
+// 모델 이름 접두어별 단가 (가장 긴 접두어 우선), long_prompt 는 프롬프트 초과 구간 단가
+struct RateEntry {
+    prefix: &'static str,
+    rates: ModelRates,
+    long_prompt: Option<ModelRates>,
+}
+
+// 쓰기 5분 1.25배, 1시간 2배, 읽기 0.1배 기본 배수
+const fn standard_rates(input: f64, output: f64) -> ModelRates {
+    ModelRates {
+        input,
+        output,
+        cache_write_5m: input * 1.25,
+        cache_write_1h: input * 2.0,
+        cache_read: input * 0.1,
+    }
+}
+
+// 출처 platform.claude.com/docs/en/about-claude/pricing (2026-11-19 조회, 전 항목 확인)
+// opus-4 는 Opus 4·4.1 (4.5 이후는 개별 항목), sonnet-4 는 Sonnet 4 와 날짜판
+const RATE_TABLE: [RateEntry; 17] = [
+    RateEntry {
+        prefix: "opus-5-5",
+        rates: ModelRates {
+            input: 4.0,
+            output: 20.0,
+            cache_write_5m: 5.0,
+            cache_write_1h: 8.0,
+            cache_read: 0.20,
+        },
+        long_prompt: None,
+    },
+    RateEntry {
+        prefix: "opus-5",
+        rates: standard_rates(5.0, 25.0),
+        long_prompt: None,
+    },
+    RateEntry {
+        prefix: "opus-4-8",
+        rates: standard_rates(5.0, 25.0),
+        long_prompt: None,
+    },
+    RateEntry {
+        prefix: "opus-4-7",
+        rates: standard_rates(5.0, 25.0),
+        long_prompt: None,
+    },
+    RateEntry {
+        prefix: "opus-4-6",
+        rates: standard_rates(5.0, 25.0),
+        long_prompt: None,
+    },
+    RateEntry {
+        prefix: "opus-4-5",
+        rates: standard_rates(5.0, 25.0),
+        long_prompt: None,
+    },
+    RateEntry {
+        prefix: "opus-4",
+        rates: standard_rates(15.0, 75.0),
+        long_prompt: None,
+    },
+    RateEntry {
+        prefix: "sonnet-5-5",
+        rates: ModelRates {
+            input: 2.0,
+            output: 10.0,
+            cache_write_5m: 2.50,
+            cache_write_1h: 4.0,
+            cache_read: 0.10,
+        },
+        long_prompt: None,
+    },
+    RateEntry {
+        prefix: "sonnet-5",
+        rates: standard_rates(2.0, 10.0),
+        long_prompt: None,
+    },
+    RateEntry {
+        prefix: "sonnet-4-6",
+        rates: standard_rates(3.0, 15.0),
+        long_prompt: None,
+    },
+    RateEntry {
+        prefix: "sonnet-4-5",
+        rates: standard_rates(3.0, 15.0),
+        long_prompt: None,
+    },
+    RateEntry {
+        prefix: "sonnet-4",
+        rates: standard_rates(3.0, 15.0),
+        long_prompt: None,
+    },
+    RateEntry {
+        prefix: "haiku-5-5",
+        rates: standard_rates(0.10, 0.50),
+        long_prompt: Some(standard_rates(0.50, 2.50)),
+    },
+    RateEntry {
+        prefix: "haiku-4-5",
+        rates: standard_rates(1.0, 5.0),
+        long_prompt: None,
+    },
+    RateEntry {
+        prefix: "fable-5-2",
+        rates: ModelRates {
+            input: 8.0,
+            output: 40.0,
+            cache_write_5m: 10.0,
+            cache_write_1h: 16.0,
+            cache_read: 0.20,
+        },
+        long_prompt: None,
+    },
+    RateEntry {
+        prefix: "fable-5-1",
+        rates: ModelRates {
+            input: 10.0,
+            output: 50.0,
+            cache_write_5m: 12.50,
+            cache_write_1h: 20.0,
+            cache_read: 0.25,
+        },
+        long_prompt: None,
+    },
+    RateEntry {
+        prefix: "fable-5",
+        rates: standard_rates(10.0, 50.0),
+        long_prompt: None,
+    },
+];
+
+// 11-1. 단가 조회 -------------------------------------------------------------
+// 설정 덮어쓰기가 맞으면 그 중 가장 긴 키 (단일 단가), 아니면 내장표에서 가장 긴 접두어, 없으면 None
+fn find_rates(model: &str, overrides: &PricingConfig) -> Option<(ModelRates, Option<ModelRates>)> {
+    let name = model.strip_prefix("claude-").unwrap_or(model);
+    let custom: Option<(usize, &ModelRateConfig)> = overrides
+        .models
+        .iter()
+        .filter_map(|(key, rate)| {
+            let trimmed = key.trim();
+            let prefix = trimmed.strip_prefix("claude-").unwrap_or(trimmed);
+            name.starts_with(prefix).then_some((prefix.len(), rate))
+        })
+        .max_by_key(|(length, _)| *length);
+    if let Some((_, rate)) = custom {
+        let rates = ModelRates {
+            input: rate.input,
+            output: rate.output,
+            cache_write_5m: rate.cache_write_5m.unwrap_or(rate.input * 1.25),
+            cache_write_1h: rate.cache_write_1h.unwrap_or(rate.input * 2.0),
+            cache_read: rate.cache_read.unwrap_or(rate.input * 0.1),
+        };
+        return Some((rates, None));
+    }
+    RATE_TABLE
+        .iter()
+        .filter(|entry| name.starts_with(entry.prefix))
+        .max_by_key(|entry| entry.prefix.len())
+        .map(|entry| (entry.rates, entry.long_prompt))
+}
+
+// 11-2. 비용 추정 -------------------------------------------------------------
+// 요청 1건 단위 USD 추정 (프롬프트 단계 단가 판정이 요청 단위이므로 합산값이 아닌 요청 값을 넣음), 알 수 없는 모델은 0
+pub fn estimate_cost_with_overrides(
+    model: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+    cache_write_5m_tokens: i64,
+    cache_write_1h_tokens: i64,
+    overrides: &PricingConfig,
+) -> f64 {
+    let Some((standard, long_prompt)) = find_rates(model, overrides) else {
+        return 0.0;
+    };
+    let prompt_tokens =
+        input_tokens + cache_read_tokens + cache_write_5m_tokens + cache_write_1h_tokens;
+    let rates = match long_prompt {
+        Some(long) if prompt_tokens > LONG_PROMPT_TOKENS => long,
+        _ => standard,
+    };
+    (input_tokens as f64 * rates.input
+        + output_tokens as f64 * rates.output
+        + cache_read_tokens as f64 * rates.cache_read
+        + cache_write_5m_tokens as f64 * rates.cache_write_5m
+        + cache_write_1h_tokens as f64 * rates.cache_write_1h)
+        / 1_000_000.0
+}
+
+// 11-3. 설치된 단가 덮어쓰기로 비용 추정 --------------------------------------
+// cache_write_5m 은 이전 행을 위한 효과값 (분리 없으면 쓰기 합계)
 pub fn estimate_cost_usd(
     model: &str,
     input_tokens: i64,
     output_tokens: i64,
     cache_read_tokens: i64,
-    cache_creation_tokens: i64,
+    cache_write_5m_tokens: i64,
+    cache_write_1h_tokens: i64,
 ) -> f64 {
-    let name = model.strip_prefix("claude-").unwrap_or(model);
-    let (input_rate, output_rate) = if name.starts_with("opus-5-5") {
-        (4.0, 20.0)
-    } else if name.starts_with("opus-5") || name.starts_with("opus-4") {
-        (5.0, 25.0)
-    } else if name.starts_with("sonnet-5") {
-        (2.0, 10.0)
-    } else if name.starts_with("sonnet-4-6") {
-        (3.0, 15.0)
-    } else if name.starts_with("haiku-5-5") {
-        (0.10, 0.50)
-    } else if name.starts_with("haiku-4-5") {
-        (1.0, 5.0)
-    } else if name.starts_with("fable-5-2") {
-        (8.0, 40.0)
-    } else if name.starts_with("fable-5") {
-        (10.0, 50.0)
-    } else {
-        return 0.0;
-    };
-    (input_tokens as f64 * input_rate
-        + output_tokens as f64 * output_rate
-        + cache_read_tokens as f64 * input_rate * 0.1
-        + cache_creation_tokens as f64 * input_rate * 1.25)
-        / 1_000_000.0
+    estimate_cost_with_overrides(
+        model,
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_write_5m_tokens,
+        cache_write_1h_tokens,
+        price_overrides(),
+    )
 }
 
 // 12. 집계 조회 ---------------------------------------------------------------
@@ -477,18 +752,27 @@ impl Store {
         until: &str,
     ) -> anyhow::Result<Vec<ModelUsageRow>> {
         self.with_conn(|conn| {
-            // 1. 모델·에이전트 합산 (하위 에이전트 인스턴스 접미사 제거 후 병합)
-            let mut stmt = conn.prepare_cached(
-                "SELECT model, agent, COUNT(*), SUM(input_tokens), SUM(output_tokens), \
-                 SUM(cache_read_tokens), SUM(cache_creation_tokens) FROM api_requests \
-                 WHERE source = 'transcript' AND ts >= ?1 AND ts < ?2 GROUP BY model, agent",
-            )?;
+            // 1. 모델·에이전트 합산 (하위 에이전트 인스턴스 접미사 제거 후 병합, 비용은 프롬프트 단계 묶음별로 산출)
+            let mut stmt = conn.prepare_cached(MODEL_USAGE_SQL)?;
             let mut merged: BTreeMap<(String, String), ModelUsageRow> = BTreeMap::new();
-            let mut rows = stmt.query(params![since, until])?;
+            let mut rows = stmt.query(params![since, until, LONG_PROMPT_TOKENS])?;
             while let Some(row) = rows.next()? {
                 let model: String = row.get(0)?;
                 let agent_full: String = row.get(1)?;
                 let agent = agent_full.split('#').next().unwrap_or("").to_string();
+                let input_tokens: i64 = row.get(3)?;
+                let output_tokens: i64 = row.get(4)?;
+                let cache_read_tokens: i64 = row.get(5)?;
+                let cache_creation_5m_tokens: i64 = row.get(7)?;
+                let cache_creation_1h_tokens: i64 = row.get(8)?;
+                let cost = estimate_cost_usd(
+                    &model,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_creation_5m_tokens,
+                    cache_creation_1h_tokens,
+                );
                 let entry = merged
                     .entry((model.clone(), agent.clone()))
                     .or_insert_with(|| ModelUsageRow {
@@ -497,23 +781,17 @@ impl Store {
                         ..ModelUsageRow::default()
                     });
                 entry.requests += row.get::<_, i64>(2)? as u64;
-                entry.input_tokens += row.get::<_, i64>(3)?;
-                entry.output_tokens += row.get::<_, i64>(4)?;
-                entry.cache_read_tokens += row.get::<_, i64>(5)?;
+                entry.input_tokens += input_tokens;
+                entry.output_tokens += output_tokens;
+                entry.cache_read_tokens += cache_read_tokens;
                 entry.cache_creation_tokens += row.get::<_, i64>(6)?;
+                entry.cache_creation_5m_tokens += cache_creation_5m_tokens;
+                entry.cache_creation_1h_tokens += cache_creation_1h_tokens;
+                entry.cost_usd_estimate += cost;
             }
 
-            // 2. 비용 추정·정렬
+            // 2. 정렬
             let mut usage: Vec<ModelUsageRow> = merged.into_values().collect();
-            for entry in &mut usage {
-                entry.cost_usd_estimate = estimate_cost_usd(
-                    &entry.model,
-                    entry.input_tokens,
-                    entry.output_tokens,
-                    entry.cache_read_tokens,
-                    entry.cache_creation_tokens,
-                );
-            }
             usage.sort_by(|left, right| {
                 right
                     .cost_usd_estimate
@@ -740,7 +1018,8 @@ impl Store {
             let mut api_stmt = conn.prepare_cached(
                 "SELECT source, request_key, ts, session_id, agent, model, input_tokens, \
                  output_tokens, cache_read_tokens, cache_creation_tokens, duration_ms, \
-                 first_byte_ms, first_token_ms, status FROM api_requests \
+                 first_byte_ms, first_token_ms, status, cache_creation_5m_tokens, \
+                 cache_creation_1h_tokens, project, git_branch FROM api_requests \
                  ORDER BY ts DESC LIMIT ?1",
             )?;
             let mut rows = api_stmt.query(params![cap])?;
@@ -761,6 +1040,10 @@ impl Store {
                     first_byte_ms: row.get(11)?,
                     first_token_ms: row.get(12)?,
                     status: row.get(13)?,
+                    cache_creation_5m_tokens: row.get(14)?,
+                    cache_creation_1h_tokens: row.get(15)?,
+                    project: row.get(16)?,
+                    git_branch: row.get(17)?,
                 };
                 stamped.push((api_row.ts.clone(), LiveEvent::Api(api_row)));
             }
@@ -857,16 +1140,32 @@ impl Store {
                 let session_id: String = row.get(1)?;
                 let agent_full: String = row.get(2)?;
                 let request_ts: String = row.get(8)?;
+                let input_tokens: i64 = row.get(3)?;
+                let output_tokens: i64 = row.get(4)?;
+                let cache_read_tokens: i64 = row.get(5)?;
+                let cache_creation_5m_tokens: i64 = row.get(9)?;
+                let cache_creation_1h_tokens: i64 = row.get(10)?;
+                let cost = estimate_cost_usd(
+                    &model,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_creation_5m_tokens,
+                    cache_creation_1h_tokens,
+                );
                 let entry = grouped.entry(model).or_default();
                 entry.requests += 1;
                 entry.sessions.insert(session_id);
                 entry
                     .agent_types
                     .insert(agent_full.split('#').next().unwrap_or("").to_string());
-                entry.input_tokens += row.get::<_, i64>(3)?;
-                entry.output_tokens += row.get::<_, i64>(4)?;
-                entry.cache_read_tokens += row.get::<_, i64>(5)?;
+                entry.input_tokens += input_tokens;
+                entry.output_tokens += output_tokens;
+                entry.cache_read_tokens += cache_read_tokens;
                 entry.cache_creation_tokens += row.get::<_, i64>(6)?;
+                entry.cache_creation_5m_tokens += cache_creation_5m_tokens;
+                entry.cache_creation_1h_tokens += cache_creation_1h_tokens;
+                entry.cost_usd_estimate += cost;
                 if let Some(elapsed) = row.get::<_, Option<i64>>(7)? {
                     entry.waits.push(elapsed);
                 }
@@ -886,13 +1185,7 @@ impl Store {
                 }
                 let (wait_p50_ms, wait_p90_ms) = summarize_percentiles(&mut totals.waits);
                 stats.push(ModelStatsRow {
-                    cost_usd_estimate: estimate_cost_usd(
-                        &model,
-                        totals.input_tokens,
-                        totals.output_tokens,
-                        totals.cache_read_tokens,
-                        totals.cache_creation_tokens,
-                    ),
+                    cost_usd_estimate: totals.cost_usd_estimate,
                     model,
                     requests: totals.requests,
                     sessions: totals.sessions.len() as u64,
@@ -901,6 +1194,8 @@ impl Store {
                     output_tokens: totals.output_tokens,
                     cache_read_tokens: totals.cache_read_tokens,
                     cache_creation_tokens: totals.cache_creation_tokens,
+                    cache_creation_5m_tokens: totals.cache_creation_5m_tokens,
+                    cache_creation_1h_tokens: totals.cache_creation_1h_tokens,
                     cache_hit_ratio,
                     wait_p50_ms,
                     wait_p90_ms,
@@ -940,6 +1235,8 @@ impl Store {
                 let output_tokens: i64 = row.get(4)?;
                 let cache_read_tokens: i64 = row.get(5)?;
                 let cache_creation_tokens: i64 = row.get(6)?;
+                let cache_creation_5m_tokens: i64 = row.get(9)?;
+                let cache_creation_1h_tokens: i64 = row.get(10)?;
                 let agent = agent_full.split('#').next().unwrap_or("").to_string();
                 let run_key = if agent == "main" {
                     session_id.clone()
@@ -954,12 +1251,15 @@ impl Store {
                 entry.output_tokens += output_tokens;
                 entry.cache_read_tokens += cache_read_tokens;
                 entry.cache_creation_tokens += cache_creation_tokens;
+                entry.cache_creation_5m_tokens += cache_creation_5m_tokens;
+                entry.cache_creation_1h_tokens += cache_creation_1h_tokens;
                 entry.cost_usd_estimate += estimate_cost_usd(
                     &model,
                     input_tokens,
                     output_tokens,
                     cache_read_tokens,
-                    cache_creation_tokens,
+                    cache_creation_5m_tokens,
+                    cache_creation_1h_tokens,
                 );
                 if let Some(elapsed) = row.get::<_, Option<i64>>(7)? {
                     entry.waits.push(elapsed);
@@ -1013,6 +1313,8 @@ impl Store {
                     output_tokens: totals.output_tokens,
                     cache_read_tokens: totals.cache_read_tokens,
                     cache_creation_tokens: totals.cache_creation_tokens,
+                    cache_creation_5m_tokens: totals.cache_creation_5m_tokens,
+                    cache_creation_1h_tokens: totals.cache_creation_1h_tokens,
                     cache_hit_ratio,
                     wait_p50_ms,
                     wait_p90_ms,
@@ -1031,6 +1333,82 @@ impl Store {
                     .total_cmp(&left.cost_usd_estimate)
                     .then_with(|| right.requests.cmp(&left.requests))
                     .then_with(|| left.agent.cmp(&right.agent))
+            });
+            Ok(stats)
+        })
+    }
+}
+
+// 12-12. 프로젝트·브랜치별 통계
+impl Store {
+    pub fn query_project_stats(
+        &self,
+        since: &str,
+        until: &str,
+    ) -> anyhow::Result<Vec<ProjectStatsRow>> {
+        self.with_conn(|conn| {
+            // 1. 요청 누적 (프로젝트·브랜치 쌍별, 비용은 요청 단위)
+            let mut stmt = conn.prepare_cached(PROJECT_REQUESTS_SQL)?;
+            let mut grouped: BTreeMap<(String, String), ProjectStatsTotals> = BTreeMap::new();
+            let mut rows = stmt.query(params![since, until])?;
+            while let Some(row) = rows.next()? {
+                let project: String = row.get(0)?;
+                let git_branch: String = row.get(1)?;
+                let session_id: String = row.get(2)?;
+                let model: String = row.get(3)?;
+                let input_tokens: i64 = row.get(4)?;
+                let output_tokens: i64 = row.get(5)?;
+                let cache_read_tokens: i64 = row.get(6)?;
+                let cache_creation_5m_tokens: i64 = row.get(7)?;
+                let cache_creation_1h_tokens: i64 = row.get(8)?;
+                let request_ts: String = row.get(9)?;
+                let entry = grouped.entry((project, git_branch)).or_default();
+                entry.requests += 1;
+                entry.sessions.insert(session_id);
+                entry.input_tokens += input_tokens;
+                entry.output_tokens += output_tokens;
+                entry.cache_read_tokens += cache_read_tokens;
+                entry.cache_creation_5m_tokens += cache_creation_5m_tokens;
+                entry.cache_creation_1h_tokens += cache_creation_1h_tokens;
+                entry.cost_usd_estimate += estimate_cost_usd(
+                    &model,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_creation_5m_tokens,
+                    cache_creation_1h_tokens,
+                );
+                if request_ts > entry.last_ts {
+                    entry.last_ts = request_ts;
+                }
+            }
+
+            // 2. 행 구성
+            let mut stats: Vec<ProjectStatsRow> = Vec::new();
+            for ((project, git_branch), totals) in grouped {
+                stats.push(ProjectStatsRow {
+                    project,
+                    git_branch,
+                    requests: totals.requests,
+                    sessions: totals.sessions.len() as u64,
+                    input_tokens: totals.input_tokens,
+                    output_tokens: totals.output_tokens,
+                    cache_read_tokens: totals.cache_read_tokens,
+                    cache_creation_5m_tokens: totals.cache_creation_5m_tokens,
+                    cache_creation_1h_tokens: totals.cache_creation_1h_tokens,
+                    cost_usd_estimate: totals.cost_usd_estimate,
+                    last_ts: totals.last_ts,
+                });
+            }
+
+            // 3. 비용·요청 순 정렬
+            stats.sort_by(|left, right| {
+                right
+                    .cost_usd_estimate
+                    .total_cmp(&left.cost_usd_estimate)
+                    .then_with(|| right.requests.cmp(&left.requests))
+                    .then_with(|| left.project.cmp(&right.project))
+                    .then_with(|| left.git_branch.cmp(&right.git_branch))
             });
             Ok(stats)
         })
@@ -1088,21 +1466,124 @@ mod tests {
         assert_eq!(summarize_percentiles(&mut empty), (None, None));
     }
 
+    // 토큰 다섯 칸 (입력, 출력, 캐시 읽기, 5분 쓰기, 1시간 쓰기) 각 1M 의 비용이 단가 합과 같은지 확인
+    fn assert_million_cost(model: &str, expected: f64) {
+        let million = 1_000_000;
+        let cost = estimate_cost_usd(model, million, million, million, million, million);
+        assert!(
+            (cost - expected).abs() < 1e-9,
+            "{model}: {cost} != {expected}"
+        );
+    }
+
     #[test]
     fn cost_follows_rate_table() {
-        let opus = estimate_cost_usd(
-            "claude-opus-5-5",
-            1_000_000,
-            1_000_000,
-            1_000_000,
-            1_000_000,
+        // 1. 모델별 단가 (입력 + 출력 + 읽기 + 5분 쓰기 + 1시간 쓰기)
+        assert_million_cost("claude-opus-5-5", 4.0 + 20.0 + 0.20 + 5.0 + 8.0);
+        for model in [
+            "claude-opus-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6-20260101",
+            "claude-opus-4-5",
+        ] {
+            assert_million_cost(model, 5.0 + 25.0 + 0.50 + 6.25 + 10.0);
+        }
+        for model in ["claude-opus-4-1-20250805", "claude-opus-4-20250514"] {
+            assert_million_cost(model, 15.0 + 75.0 + 1.50 + 18.75 + 30.0);
+        }
+        assert_million_cost("claude-sonnet-4-20250514", 3.0 + 15.0 + 0.30 + 3.75 + 6.0);
+        assert_million_cost("claude-sonnet-5-5", 2.0 + 10.0 + 0.10 + 2.50 + 4.0);
+        assert_million_cost("claude-sonnet-5", 2.0 + 10.0 + 0.20 + 2.50 + 4.0);
+        assert_million_cost("claude-sonnet-4-6", 3.0 + 15.0 + 0.30 + 3.75 + 6.0);
+        assert_million_cost("claude-sonnet-4-5-20250929", 3.0 + 15.0 + 0.30 + 3.75 + 6.0);
+        assert_million_cost("claude-haiku-4-5-20251001", 1.0 + 5.0 + 0.10 + 1.25 + 2.0);
+        assert_million_cost("claude-fable-5-2", 8.0 + 40.0 + 0.20 + 10.0 + 16.0);
+        assert_million_cost("claude-fable-5-1", 10.0 + 50.0 + 0.25 + 12.50 + 20.0);
+        assert_million_cost("claude-fable-5-3", 10.0 + 50.0 + 1.0 + 12.50 + 20.0);
+
+        // 2. 모르는 모델·매핑 없는 계열은 0, claude- 접두사 없이도 매칭
+        assert_eq!(estimate_cost_usd("claude-unknown-9", 5, 5, 5, 5, 5), 0.0);
+        assert_eq!(estimate_cost_usd("claude-sonnet-3-7", 5, 5, 5, 5, 5), 0.0);
+        assert_eq!(estimate_cost_usd("", 5, 5, 5, 5, 5), 0.0);
+        assert!((estimate_cost_usd("opus-5-5", 1_000_000, 0, 0, 0, 0) - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn haiku_five_five_switches_rate_above_one_hundred_thousand_prompt_tokens() {
+        // haiku-5-5 하위 0.10/0.50/0.125/0.20/0.01, 상위 0.50/2.50/0.625/1/0.05 (공식 단가표)
+        // 1. 프롬프트 정확히 100k (입력 + 읽기 + 쓰기): 하위 단가
+        let at_limit = estimate_cost_usd("claude-haiku-5-5", 50_000, 10_000, 30_000, 20_000, 0);
+        let expected_low =
+            (50_000.0 * 0.10 + 10_000.0 * 0.50 + 30_000.0 * 0.01 + 20_000.0 * 0.125) / 1_000_000.0;
+        assert!((at_limit - expected_low).abs() < 1e-12, "{at_limit}");
+
+        // 2. 1토큰 초과: 상위 단가
+        let above = estimate_cost_usd("claude-haiku-5-5", 50_001, 10_000, 30_000, 20_000, 0);
+        let expected_high =
+            (50_001.0 * 0.50 + 10_000.0 * 2.50 + 30_000.0 * 0.05 + 20_000.0 * 0.625) / 1_000_000.0;
+        assert!((above - expected_high).abs() < 1e-12, "{above}");
+
+        // 3. 1시간 쓰기도 프롬프트에 포함
+        let with_hour = estimate_cost_usd("claude-haiku-5-5", 50_000, 0, 30_000, 10_000, 10_001);
+        let expected_hour =
+            (50_000.0 * 0.50 + 30_000.0 * 0.05 + 10_000.0 * 0.625 + 10_001.0 * 1.0) / 1_000_000.0;
+        assert!((with_hour - expected_hour).abs() < 1e-12, "{with_hour}");
+    }
+
+    #[test]
+    fn price_overrides_replace_matching_models_only() {
+        let mut overrides = PricingConfig::default();
+        overrides.models.insert(
+            "opus-5-5".to_string(),
+            ModelRateConfig {
+                input: 1.0,
+                output: 2.0,
+                cache_write_5m: Some(3.0),
+                cache_write_1h: None,
+                cache_read: Some(0.5),
+            },
         );
-        assert!((opus - (4.0 + 20.0 + 0.4 + 5.0)).abs() < 1e-9);
-        let older_opus = estimate_cost_usd("claude-opus-4-1", 1_000_000, 0, 0, 0);
-        assert!((older_opus - 5.0).abs() < 1e-9);
-        let haiku = estimate_cost_usd("claude-haiku-4-5-20251001", 1_000_000, 1_000_000, 0, 0);
-        assert!((haiku - 6.0).abs() < 1e-9);
-        assert_eq!(estimate_cost_usd("claude-unknown-9", 5, 5, 5, 5), 0.0);
+        overrides.models.insert(
+            "claude-brand-new".to_string(),
+            ModelRateConfig {
+                input: 10.0,
+                output: 20.0,
+                cache_write_5m: None,
+                cache_write_1h: None,
+                cache_read: None,
+            },
+        );
+        overrides.models.insert(
+            "haiku-5-5".to_string(),
+            ModelRateConfig {
+                input: 0.10,
+                output: 0.50,
+                cache_write_5m: None,
+                cache_write_1h: None,
+                cache_read: None,
+            },
+        );
+        let million = 1_000_000;
+        let cost = |model: &str| {
+            estimate_cost_with_overrides(
+                model, million, million, million, million, million, &overrides,
+            )
+        };
+
+        // 1. 덮어쓴 모델 (생략한 쓰기 1시간은 입력의 2배)
+        assert!((cost("claude-opus-5-5-20260101") - (1.0 + 2.0 + 0.5 + 3.0 + 2.0)).abs() < 1e-9);
+
+        // 2. 내장표에 없는 모델 추가 (기본 배수)
+        assert!((cost("claude-brand-new-1") - (10.0 + 20.0 + 1.0 + 12.5 + 20.0)).abs() < 1e-9);
+
+        // 3. 다른 모델은 내장표 유지, 덮어쓴 haiku 는 프롬프트가 커도 단일 단가
+        assert!((cost("claude-opus-5") - (5.0 + 25.0 + 0.5 + 6.25 + 10.0)).abs() < 1e-9);
+        assert!((cost("claude-haiku-5-5") - (0.10 + 0.50 + 0.01 + 0.125 + 0.20)).abs() < 1e-9);
+        assert_eq!(
+            estimate_cost_with_overrides("claude-unknown-9", 1, 1, 1, 1, 1, &overrides),
+            0.0
+        );
     }
 
     #[test]
@@ -1464,7 +1945,7 @@ mod tests {
             (Some(3000), Some(6000))
         );
         assert_eq!(opus.last_ts, "2026-11-10T13:00:00.000Z");
-        let expected_cost = estimate_cost_usd("claude-opus-5-5", 500, 250, 4000, 500);
+        let expected_cost = estimate_cost_usd("claude-opus-5-5", 500, 250, 4000, 500, 0);
         assert!((opus.cost_usd_estimate - expected_cost).abs() < 1e-12);
 
         // 2. 대기 없는 요청은 백분위 제외, 에이전트 종류 3
@@ -1502,8 +1983,8 @@ mod tests {
         assert_eq!((main.tool_calls, main.tool_errors), (2, 1));
         assert_eq!(main.input_tokens, 400);
         assert!((main.cache_hit_ratio - 0.8).abs() < 1e-9);
-        let main_cost = 3.0 * estimate_cost_usd("claude-opus-5-5", 100, 50, 800, 100)
-            + estimate_cost_usd("claude-sonnet-5", 100, 50, 800, 100);
+        let main_cost = 3.0 * estimate_cost_usd("claude-opus-5-5", 100, 50, 800, 100, 0)
+            + estimate_cost_usd("claude-sonnet-5", 100, 50, 800, 100, 0);
         assert!((main.cost_usd_estimate - main_cost).abs() < 1e-12);
 
         // 2. 워커 (실행은 '#' 포함 전체 라벨 3개, 최다 모델 동률은 이름순)
@@ -1546,6 +2027,191 @@ mod tests {
             .collect();
         assert!(plans[0].contains("idx_api_requests_ts"), "{}", plans[0]);
         assert!(plans[1].contains("idx_tool_calls_ts"), "{}", plans[1]);
+        drop(store);
+        remove_temp_dir(&dir);
+    }
+
+    // 크기 분리 시드 행 (매개: 키, 모델, 입력, 읽기, 쓰기 합계, (5분, 1시간))
+    fn split_api_row(
+        key: &str,
+        model: &str,
+        input: i64,
+        read: i64,
+        total: i64,
+        split: (i64, i64),
+    ) -> ApiRequestRow {
+        ApiRequestRow {
+            source: DataSource::Transcript,
+            request_key: key.to_string(),
+            ts: "2026-11-10T12:00:00.000Z".to_string(),
+            session_id: "sess-s".to_string(),
+            agent: "main".to_string(),
+            model: model.to_string(),
+            input_tokens: input,
+            output_tokens: 1_000,
+            cache_read_tokens: read,
+            cache_creation_tokens: total,
+            cache_creation_5m_tokens: split.0,
+            cache_creation_1h_tokens: split.1,
+            ..ApiRequestRow::default()
+        }
+    }
+
+    #[test]
+    fn cache_split_feeds_stats_and_per_request_cost() {
+        // 1. 시드 (이전 행은 분리 없음, 새 행은 5분·1시간, haiku 두 건은 프롬프트 크기가 다름)
+        let dir = unique_temp_dir("query-split");
+        let store = Store::open_store(&dir.join("cm.sqlite")).expect("DB 열기");
+        let opus = "claude-opus-5-5";
+        let haiku = "claude-haiku-5-5";
+        let rows = vec![
+            split_api_row("old", opus, 100, 0, 1_000, (0, 0)),
+            split_api_row("new", opus, 100, 0, 3_000, (1_000, 2_000)),
+            split_api_row("big", haiku, 60_000, 50_000, 5_000, (5_000, 0)),
+            split_api_row("small", haiku, 1_000, 0, 0, (0, 0)),
+        ];
+        store
+            .insert_batch(&IngestBatch {
+                api_requests: rows,
+                ..IngestBatch::default()
+            })
+            .expect("시드 적재");
+
+        // 2. 모델 통계 (이전 행의 쓰기 합계는 5분, 종합 합계는 유지)
+        let stats = store
+            .query_model_stats(STATS_SINCE, STATS_UNTIL)
+            .expect("모델 통계");
+        let opus_row = stats.iter().find(|row| row.model == opus).expect("opus");
+        assert_eq!(opus_row.cache_creation_tokens, 4_000);
+        assert_eq!(opus_row.cache_creation_5m_tokens, 2_000);
+        assert_eq!(opus_row.cache_creation_1h_tokens, 2_000);
+        let expected_opus = estimate_cost_usd(opus, 100, 1_000, 0, 1_000, 0)
+            + estimate_cost_usd(opus, 100, 1_000, 0, 1_000, 2_000);
+        assert!((opus_row.cost_usd_estimate - expected_opus).abs() < 1e-12);
+
+        // 3. haiku 비용은 요청별 단계 (합산 토큰으로 한 번에 계산한 값과 달라야 함)
+        let haiku_row = stats.iter().find(|row| row.model == haiku).expect("haiku");
+        let per_request = estimate_cost_usd(haiku, 60_000, 1_000, 50_000, 5_000, 0)
+            + estimate_cost_usd(haiku, 1_000, 1_000, 0, 0, 0);
+        let from_sums = estimate_cost_usd(haiku, 61_000, 2_000, 50_000, 5_000, 0);
+        assert!((haiku_row.cost_usd_estimate - per_request).abs() < 1e-12);
+        assert!((per_request - from_sums).abs() > 1e-6);
+
+        // 4. 모델 사용량·에이전트 통계도 같은 비용
+        let usage = store
+            .query_model_usage(STATS_SINCE, STATS_UNTIL)
+            .expect("사용량");
+        let usage_haiku = usage.iter().find(|row| row.model == haiku).expect("haiku");
+        assert!((usage_haiku.cost_usd_estimate - per_request).abs() < 1e-12);
+        assert_eq!(usage_haiku.cache_creation_5m_tokens, 5_000);
+        let usage_opus = usage.iter().find(|row| row.model == opus).expect("opus");
+        assert_eq!(usage_opus.cache_creation_5m_tokens, 2_000);
+        assert_eq!(usage_opus.cache_creation_1h_tokens, 2_000);
+        assert!((usage_opus.cost_usd_estimate - expected_opus).abs() < 1e-12);
+        let agents = store
+            .query_agent_stats(STATS_SINCE, STATS_UNTIL)
+            .expect("에이전트 통계");
+        assert_eq!(agents[0].cache_creation_5m_tokens, 7_000);
+        assert_eq!(agents[0].cache_creation_1h_tokens, 2_000);
+        assert!((agents[0].cost_usd_estimate - (expected_opus + per_request)).abs() < 1e-12);
+        drop(store);
+        remove_temp_dir(&dir);
+    }
+
+    // 프로젝트 시드 행 (매개: 키, 프로젝트, 브랜치, 세션, 시각)
+    fn project_api_row(
+        key: &str,
+        project: &str,
+        branch: &str,
+        session_id: &str,
+        ts: &str,
+    ) -> ApiRequestRow {
+        ApiRequestRow {
+            project: project.to_string(),
+            git_branch: branch.to_string(),
+            session_id: session_id.to_string(),
+            ..api_row(key, ts, "claude-opus-5-5", 0, 0)
+        }
+    }
+
+    #[test]
+    fn project_stats_group_by_project_and_branch() {
+        // 1. 시드 (플래그·구간 밖·OTLP 행은 제외, 프로젝트 비어 있으면 세션 폴더명)
+        let dir = unique_temp_dir("query-project");
+        let store = Store::open_store(&dir.join("cm.sqlite")).expect("DB 열기");
+        let mut grown =
+            project_api_row("a2", "alpha", "main", "sess-1", "2026-11-10T12:05:00.000Z");
+        grown.cache_creation_tokens = 3_000;
+        grown.cache_creation_5m_tokens = 1_000;
+        grown.cache_creation_1h_tokens = 2_000;
+        let batch = IngestBatch {
+            api_requests: vec![
+                project_api_row("a1", "alpha", "main", "sess-1", "2026-11-10T12:00:00.000Z"),
+                grown,
+                project_api_row("a3", "alpha", "main", "sess-2", "2026-11-10T12:10:00.000Z"),
+                project_api_row(
+                    "f1",
+                    "alpha",
+                    "feature/x",
+                    "sess-3",
+                    "2026-11-10T13:00:00.000Z",
+                ),
+                project_api_row("s1", "", "", "sess-4", "2026-11-10T14:00:00.000Z"),
+                project_api_row("n1", "", "", "sess-none", "2026-11-10T14:01:00.000Z"),
+                ApiRequestRow {
+                    source: DataSource::Otlp,
+                    ..project_api_row("o1", "alpha", "main", "sess-1", "2026-11-10T12:01:00.000Z")
+                },
+                project_api_row("out", "alpha", "main", "sess-1", "2026-11-11T00:00:00.000Z"),
+            ],
+            sessions: vec![SessionRow {
+                session_id: "sess-4".to_string(),
+                project: "folder-beta".to_string(),
+                first_ts: "2026-11-10T14:00:00.000Z".to_string(),
+                last_ts: "2026-11-10T14:00:00.000Z".to_string(),
+            }],
+            ..IngestBatch::default()
+        };
+        store.insert_batch(&batch).expect("시드 적재");
+
+        // 2. 묶음 개수·정렬 (비용 큰 alpha/main 이 첫 행, 비용·요청 같으면 프로젝트 이름순)
+        let stats = store
+            .query_project_stats(STATS_SINCE, STATS_UNTIL)
+            .expect("프로젝트 통계");
+        let keys: Vec<(&str, &str)> = stats
+            .iter()
+            .map(|row| (row.project.as_str(), row.git_branch.as_str()))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                ("alpha", "main"),
+                ("", ""),
+                ("alpha", "feature/x"),
+                ("folder-beta", "")
+            ]
+        );
+
+        // 3. alpha/main (요청 3건, 세션 2개, 토큰·쓰기 분리·비용·마지막 시각)
+        let main = &stats[0];
+        assert_eq!((main.requests, main.sessions), (3, 2));
+        assert_eq!((main.input_tokens, main.output_tokens), (30, 150));
+        assert_eq!(main.cache_creation_5m_tokens, 1_000);
+        assert_eq!(main.cache_creation_1h_tokens, 2_000);
+        let expected = 2.0 * estimate_cost_usd("claude-opus-5-5", 10, 50, 0, 0, 0)
+            + estimate_cost_usd("claude-opus-5-5", 10, 50, 0, 1_000, 2_000);
+        assert!((main.cost_usd_estimate - expected).abs() < 1e-12);
+        assert_eq!(main.last_ts, "2026-11-10T12:10:00.000Z");
+
+        // 4. 세션 없음·다른 브랜치·세션 폴더명 대체 (각 1건)
+        for single in &stats[1..] {
+            assert_eq!(
+                (single.requests, single.sessions),
+                (1, 1),
+                "{}",
+                single.project
+            );
+        }
         drop(store);
         remove_temp_dir(&dir);
     }

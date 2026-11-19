@@ -18,6 +18,8 @@ pub struct TranscriptLine {
     pub session_id: Option<String>,
     pub agent_id: Option<String>,
     pub is_sidechain: Option<bool>,
+    pub cwd: Option<String>,
+    pub git_branch: Option<String>,
     pub message: Option<LineMessage>,
 }
 
@@ -40,6 +42,15 @@ pub struct LineUsage {
     pub output_tokens: Option<i64>,
     pub cache_read_input_tokens: Option<i64>,
     pub cache_creation_input_tokens: Option<i64>,
+    pub cache_creation: Option<LineCacheCreation>,
+}
+
+// 3-1. 캐시 쓰기 분리 ---------------------------------------------------------
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
+#[serde(default)]
+pub struct LineCacheCreation {
+    pub ephemeral_5m_input_tokens: Option<i64>,
+    pub ephemeral_1h_input_tokens: Option<i64>,
 }
 
 // 4. 내용 블록 ----------------------------------------------------------------

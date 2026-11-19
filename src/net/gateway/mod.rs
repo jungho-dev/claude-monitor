@@ -1,6 +1,9 @@
 //! net/gateway/mod.rs
-//! Anthropic API 투명 중계 서버: 헤더 복사, 상류 호출, 응답 계측 연결 (HTTPS_PROXY 환경변수 미적용).
+//! Anthropic API 투명 중계 서버: 헤더 복사, 상류 호출(HTTPS_PROXY·NO_PROXY 환경변수 적용), 응답 계측 연결.
 
+mod decode;
+mod proxy;
+mod ratelimit;
 mod tap;
 #[cfg(test)]
 mod tests;
@@ -22,6 +25,8 @@ use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
+use proxy::{ProxyChoice, ProxyConnector, ProxySettings, read_proxy_settings};
+use ratelimit::extract_ratelimit_snapshot;
 use serde::Deserialize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,7 +39,7 @@ const MESSAGES_PATH: &str = "/v1/messages";
 const SESSION_HEADER: &str = "x-claude-code-session-id";
 const AGENT_HEADER: &str = "x-claude-code-agent-id";
 
-type UpstreamClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
+type UpstreamClient = Client<HttpsConnector<ProxyConnector>, Full<Bytes>>;
 
 // 1. 중계 상태 ----------------------------------------------------------------
 struct GatewayState {
@@ -182,7 +187,7 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Incoming>) -> Resp
         Ok(Ok(response)) => response,
         Err(_elapsed) => {
             if let Some(mut tap) = tap {
-                tap.set_response_meta(504, "", true);
+                tap.set_response_meta(504, "", "");
             }
             return json_response(
                 StatusCode::GATEWAY_TIMEOUT,
@@ -207,7 +212,7 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Incoming>) -> Resp
                 source = inner.source();
             }
             if let Some(mut tap) = tap {
-                tap.set_response_meta(502, "", true);
+                tap.set_response_meta(502, "", "");
             }
             return json_response(
                 StatusCode::BAD_GATEWAY,
@@ -230,7 +235,12 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Incoming>) -> Resp
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let encoded = response_parts.headers.contains_key(CONTENT_ENCODING);
+    let content_encoding = response_parts
+        .headers
+        .get(CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     let mut response_headers = HeaderMap::new();
     for (name, value) in response_parts.headers.iter() {
         if !is_hop_by_hop(name) {
@@ -242,7 +252,9 @@ async fn proxy_request(state: Arc<GatewayState>, req: Request<Incoming>) -> Resp
         .boxed();
     let final_body = match tap {
         Some(mut tap) => {
-            tap.set_response_meta(response_parts.status.as_u16(), &content_type, encoded);
+            let status = response_parts.status.as_u16();
+            tap.set_response_meta(status, &content_type, &content_encoding);
+            tap.set_ratelimit_snapshot(extract_ratelimit_snapshot(&response_parts.headers, status));
             TapBody::new(boxed_body, tap).boxed()
         }
         None => boxed_body,
@@ -283,17 +295,43 @@ pub fn validate_gateway_upstream(config: &GatewayConfig) -> anyhow::Result<Strin
 
 // 7. 중계 상태 구성 -----------------------------------------------------------
 fn build_gateway_state(ctx: Arc<AppContext>) -> anyhow::Result<Arc<GatewayState>> {
+    // 프록시 설정은 환경변수만 사용 (자격 증명은 출력하지 않고 프록시 호스트만 알림)
+    let proxy_settings = read_proxy_settings(|name| std::env::var(name).ok());
+    match &proxy_settings.proxy {
+        ProxyChoice::Unset => {}
+        ProxyChoice::Tunnel(endpoint) => {
+            let authority = endpoint.uri.authority().map(|value| value.as_str());
+            eprintln!(
+                "claude-monitor: gateway upstream via HTTPS_PROXY {}",
+                authority.unwrap_or_default()
+            );
+        }
+        ProxyChoice::Invalid(reason) => {
+            eprintln!(
+                "claude-monitor: HTTPS_PROXY ignored for tunneling, upstream requests will fail: {reason}"
+            );
+        }
+    }
+    build_gateway_state_with_proxy(ctx, proxy_settings)
+}
+
+fn build_gateway_state_with_proxy(
+    ctx: Arc<AppContext>,
+    proxy_settings: ProxySettings,
+) -> anyhow::Result<Arc<GatewayState>> {
     // 1. 상류 주소 검증
     let upstream_base = validate_gateway_upstream(&ctx.config.gateway)?;
 
     // 2. 클라이언트 (rustls ring 제공자는 1회만 설치, 본문 시간 제한 없음)
     let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut http_connector = HttpConnector::new();
+    http_connector.enforce_http(false);
     let connector = HttpsConnectorBuilder::new()
         .with_webpki_roots()
         .https_only()
         .enable_http1()
         .enable_http2()
-        .build();
+        .wrap_connector(ProxyConnector::new(http_connector, proxy_settings));
     let client = Client::builder(TokioExecutor::new())
         .pool_idle_timeout(Duration::from_secs(POOL_IDLE_SECS))
         .build(connector);

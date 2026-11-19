@@ -63,6 +63,10 @@ pub fn index_transcripts_with_events(
     if !root.is_dir() {
         return Ok((summary, Vec::new()));
     }
+    // 열 추가 마이그레이션 뒤 남은 대기 표식이 있으면 커서를 다시 비워 전체를 새 열로 다시 읽음
+    if store.consume_index_backfill()? {
+        eprintln!("[cm] 색인 커서 초기화: 새 열 백필을 위해 전체 다시 읽음");
+    }
     let cutoff_ms =
         Utc::now().timestamp_millis() - i64::from(config.indexer.backfill_days) * DAY_MS;
     let transcript_files = discover_transcript_files(&root, cutoff_ms);

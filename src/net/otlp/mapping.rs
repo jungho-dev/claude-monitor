@@ -2,13 +2,17 @@
 //! OTLP http/json 로그 봉투 해석과 기록 행 변환 (속성 일부만 취함, 본문·프롬프트 미보관).
 
 use crate::core::model::{
-    ApiRequestRow, DataSource, HookEventRow, HookOutcome, IngestBatch, SessionRow, ToolCallRow,
+    ApiRequestRow, DataSource, HookEventRow, HookOutcome, IngestBatch, OtelEventRow, SessionRow,
+    ToolCallRow,
 };
 use anyhow::Context;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
+
+// 상세 문구 상한 (문자 수)
+const DETAIL_MAX_CHARS: usize = 200;
 
 // 1. 변환 결과 ----------------------------------------------------------------
 #[derive(Debug, Default)]
@@ -124,7 +128,13 @@ pub fn map_logs_payload(payload: &[u8]) -> anyhow::Result<OtlpMapping> {
                 mapping.batch.hook_events.push(map_hook_complete(&fields));
                 true
             }
-            _ => false,
+            other => match map_otel_event(other, &fields) {
+                Some(row) => {
+                    mapping.batch.otel_events.push(row);
+                    true
+                }
+                None => false,
+            },
         };
         if !mapped {
             mapping.ignored_events += 1;
@@ -242,6 +252,11 @@ fn map_api_request(fields: &EventFields) -> ApiRequestRow {
         .or_else(|| attrs.get("query_source"))
         .cloned()
         .unwrap_or_default();
+    let creation_5m = read_i64_attr(attrs, "cache_creation_5m_tokens").unwrap_or(0);
+    let creation_1h = read_i64_attr(attrs, "cache_creation_1h_tokens").unwrap_or(0);
+    let creation_total = read_i64_attr(attrs, "cache_creation_tokens")
+        .unwrap_or(0)
+        .max(creation_5m + creation_1h);
     ApiRequestRow {
         source: DataSource::Otlp,
         request_key,
@@ -252,7 +267,9 @@ fn map_api_request(fields: &EventFields) -> ApiRequestRow {
         input_tokens: read_i64_attr(attrs, "input_tokens").unwrap_or(0),
         output_tokens: read_i64_attr(attrs, "output_tokens").unwrap_or(0),
         cache_read_tokens: read_i64_attr(attrs, "cache_read_tokens").unwrap_or(0),
-        cache_creation_tokens: read_i64_attr(attrs, "cache_creation_tokens").unwrap_or(0),
+        cache_creation_tokens: creation_total,
+        cache_creation_5m_tokens: creation_5m,
+        cache_creation_1h_tokens: creation_1h,
         duration_ms: read_i64_attr(attrs, "duration_ms"),
         ..ApiRequestRow::default()
     }
@@ -302,4 +319,107 @@ fn map_hook_complete(fields: &EventFields) -> HookEventRow {
         duration_ms: read_i64_attr(attrs, "total_duration_ms"),
         ..HookEventRow::default()
     }
+}
+
+// 11. 상세 문구 다듬기 --------------------------------------------------------
+// 제어 문자는 공백으로 바꾸고 200자에서 자름
+fn clip_detail(text: &str) -> String {
+    text.trim()
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .take(DETAIL_MAX_CHARS)
+        .collect()
+}
+
+// 12. 신규 이벤트 변환 --------------------------------------------------------
+// compaction, subagent_completed, api_error, api_retries_exhausted, tool_decision,
+// permission_mode_changed 만 취하고 사용자 식별 속성(user.*, organization.id)과 내용은 보관하지 않음
+fn map_otel_event(event_name: &str, fields: &EventFields) -> Option<OtelEventRow> {
+    let attrs = &fields.attrs;
+    let text_of = |key: &str| attrs.get(key).cloned().unwrap_or_default();
+    let mut row = OtelEventRow {
+        ts: fields.ts.clone(),
+        session_id: fields.session_id.clone(),
+        agent_id: text_of("agent_id"),
+        duration_ms: read_i64_attr(attrs, "duration_ms"),
+        ..OtelEventRow::default()
+    };
+
+    // 1. 이벤트별 필드
+    let mut key_suffix = String::new();
+    match event_name {
+        "compaction" => {
+            row.category = "compaction".to_string();
+            row.status = text_of("trigger");
+            row.tokens_before = read_i64_attr(attrs, "pre_tokens");
+            row.tokens_after = read_i64_attr(attrs, "post_tokens");
+            row.detail = if attrs.get("success").map(String::as_str) == Some("false") {
+                clip_detail(&format!("failed {}", text_of("error")))
+            } else {
+                "ok".to_string()
+            };
+        }
+        "subagent_completed" => {
+            row.category = "subagent".to_string();
+            row.name = text_of("agent_type");
+            row.status = if attrs.get("is_async").map(String::as_str) == Some("true") {
+                "async".to_string()
+            } else {
+                "sync".to_string()
+            };
+            row.tokens_after = read_i64_attr(attrs, "total_tokens");
+            row.count = read_i64_attr(attrs, "total_tool_uses");
+            let mut parts = vec![format!("model={}", text_of("model"))];
+            if attrs.get("model_swapped").map(String::as_str) == Some("true") {
+                parts.push(format!("final={}", text_of("final_model")));
+            }
+            if let Some(source) = attrs.get("agent.source").filter(|text| !text.is_empty()) {
+                parts.push(format!("source={source}"));
+            }
+            row.detail = clip_detail(&parts.join(" "));
+        }
+        "api_error" => {
+            row.category = "api_error".to_string();
+            row.name = text_of("model");
+            row.status = text_of("status_code");
+            row.count = read_i64_attr(attrs, "attempt");
+            row.detail = clip_detail(&text_of("error"));
+        }
+        "api_retries_exhausted" => {
+            row.category = "api_retries".to_string();
+            row.status = "exhausted".to_string();
+            row.count = read_i64_attr(attrs, "total_attempts");
+            row.duration_ms = read_i64_attr(attrs, "total_retry_duration_ms");
+        }
+        "tool_decision" => {
+            row.category = "tool_decision".to_string();
+            row.name = text_of("tool_name");
+            row.status = text_of("decision");
+            row.detail = clip_detail(&format!(
+                "source={} mode={}",
+                text_of("source"),
+                text_of("permission_mode")
+            ));
+            key_suffix = format!(":{}", text_of("tool_use_id"));
+        }
+        "permission_mode_changed" => {
+            row.category = "permission_mode".to_string();
+            row.name = text_of("trigger");
+            row.status = text_of("to_mode");
+            row.detail = clip_detail(&format!("{}->{}", text_of("from_mode"), text_of("to_mode")));
+        }
+        _ => return None,
+    }
+
+    // 2. 중복 제거 키 (세션, 에이전트, 순번 또는 시각, 이벤트 이름)
+    let order_part = if fields.sequence.is_empty() {
+        &fields.ts
+    } else {
+        &fields.sequence
+    };
+    row.event_key = format!(
+        "otlp:{}:{}:{order_part}:{event_name}{key_suffix}",
+        fields.session_id, row.agent_id
+    );
+    Some(row)
 }

@@ -4,10 +4,15 @@
 use crate::core::config::{AppConfig, TUI_STATE_FILE_NAME};
 use crate::core::model::{LiveEvent, StatusSnapshot};
 use crate::inventory::{DoctorFinding, Inventory};
+use crate::report::week_start_of;
+use crate::store::limits::LimitSnapshot;
+use crate::store::metrics::{AttributionDimension, MetricAttributionRow};
+use crate::store::otel_events::CompactionStat;
 use crate::store::query::{
     AgentStatsRow, CacheBreakRow, HookStatRow, MinuteBucket, ModelStatsRow, OverviewStats,
-    ToolLatencyRow,
+    ProjectStatsRow, ToolLatencyRow,
 };
+use crate::store::ratelimit::RatelimitSnapshotRow;
 use crate::tui::cards::{
     CARD_COUNT, CardId, CardKind, CardMove, CardPress, CardView, ColumnDrag, CursorMotion,
     MAX_TABLE_COLUMNS, ScrollDrag, UiAction, UiHitAreas,
@@ -17,25 +22,36 @@ use crate::tui::i18n::{self, Failure, Lang, Msg};
 use crate::tui::layout::{CardLayout, SplitDrag, SplitGroup};
 use crate::tui::poller::{AdminAction, AdminOutcome, live_event_key};
 use crate::tui::sort::{
-    SortChange, SortState, compare_agent_row, compare_cache_break_row, compare_event_row,
-    compare_hook_row, compare_model_row, compare_tool_row, default_card_sorts, sort_rows,
-    sort_spec,
+    SortChange, SortState, compare_agent_row, compare_attribution_row, compare_cache_break_row,
+    compare_event_row, compare_hook_row, compare_model_row, compare_project_row, compare_tool_row,
+    default_card_sorts, sort_rows, sort_spec,
 };
-use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, Utc};
+use crate::tui::views::projects::attribution_rows;
+use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveDate, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-pub const TAB_COUNT: usize = 7;
+pub const TAB_COUNT: usize = 8;
 pub const TOAST_LIFETIME: Duration = Duration::from_secs(4);
 // 정렬해도 같은 행을 따라가는 선택 가능 표 카드
-const SELECTABLE_SORT_CARDS: [CardId; 6] = [
+const SELECTABLE_SORT_CARDS: [CardId; 8] = [
     CardId::EventFeed,
     CardId::ToolTable,
     CardId::HookTable,
     CardId::ModelTable,
     CardId::AgentTable,
     CardId::CacheBreaks,
+    CardId::ProjectTable,
+    CardId::AttributionTable,
+];
+// 프로젝트 탭 귀속 표의 차원 순환 순서 (d 키)
+pub const ATTRIBUTION_DIMENSIONS: [AttributionDimension; 5] = [
+    AttributionDimension::Skill,
+    AttributionDimension::McpServer,
+    AttributionDimension::Plugin,
+    AttributionDimension::Agent,
+    AttributionDimension::Model,
 ];
 
 // 1. 탭 -----------------------------------------------------------------------
@@ -48,6 +64,7 @@ pub enum ActiveTab {
     Agents,
     Settings,
     Report,
+    Projects,
 }
 
 impl ActiveTab {
@@ -59,6 +76,7 @@ impl ActiveTab {
         Self::Agents,
         Self::Settings,
         Self::Report,
+        Self::Projects,
     ];
 
     pub fn tab_label(self, lang: Lang) -> &'static str {
@@ -70,6 +88,7 @@ impl ActiveTab {
             Self::Agents => Msg::TabAgents,
             Self::Settings => Msg::TabSettings,
             Self::Report => Msg::TabReport,
+            Self::Projects => Msg::TabProjects,
         };
         i18n::text(lang, msg)
     }
@@ -84,6 +103,7 @@ impl ActiveTab {
             Self::Agents => CardId::AgentTable,
             Self::Settings => CardId::SettingsHooks,
             Self::Report => CardId::ReportBody,
+            Self::Projects => CardId::ProjectTable,
         }
     }
 
@@ -102,6 +122,7 @@ impl ActiveTab {
                 CardId::SettingsDoctor,
             ],
             Self::Report => &[],
+            Self::Projects => &[CardId::ProjectTable, CardId::AttributionTable],
         }
     }
 
@@ -121,6 +142,7 @@ impl ActiveTab {
             Self::Agents => &[SplitGroup::AgentsRows],
             Self::Settings => &[SplitGroup::SettingsRows],
             Self::Report => &[SplitGroup::ReportCols],
+            Self::Projects => &[SplitGroup::ProjectsRows],
         }
     }
 }
@@ -188,6 +210,22 @@ pub struct DashboardSnapshot {
     pub cache_breaks: Panel<Vec<CacheBreakRow>>,
     pub minutes: Panel<Vec<MinuteBucket>>,
     pub events: Panel<Vec<LiveEvent>>,
+    pub projects: Panel<Vec<ProjectStatsRow>>,
+    // 차원별 귀속 행 (ATTRIBUTION_DIMENSIONS 순서)
+    pub attribution: Panel<Vec<(AttributionDimension, Vec<MetricAttributionRow>)>>,
+    pub limits: Panel<LimitsData>,
+}
+
+// 한도·캐시 카드 입력 (latest = 공식 최신 스냅샷, history = 소진 예상용 최근 스냅샷 오래된 순,
+// api_key = 구간 안 최신 레이트리밋 헤더, compaction = 최신 세션의 컴팩션, estimate_* = 로컬 토큰 집계)
+#[derive(Debug, Clone, Default)]
+pub struct LimitsData {
+    pub latest: Option<LimitSnapshot>,
+    pub history: Vec<LimitSnapshot>,
+    pub api_key: Option<RatelimitSnapshotRow>,
+    pub compaction: Option<CompactionStat>,
+    pub estimate_5h: Option<OverviewStats>,
+    pub estimate_7d: Option<OverviewStats>,
 }
 
 // 5. 알림 ---------------------------------------------------------------------
@@ -226,6 +264,15 @@ pub enum UiMessage {
     StateSaveFailed {
         detail: String,
     },
+    // 주간 리포트 본문 (week_start = 해당 주의 월요일)
+    WeeklyReport {
+        week_start: NaiveDate,
+        body: Panel<Option<String>>,
+    },
+    // 수집 스레드의 DB 스키마 갱신 실패 (detail = 번역하지 않는 오류 원문, 알림 문구는 UI 스레드가 만듦)
+    SchemaUpgradeFailed {
+        detail: String,
+    },
 }
 
 // 7. 입력 → 실행 요청 ---------------------------------------------------------
@@ -241,6 +288,9 @@ pub enum UiCommand {
     SetTopmost(bool),
     // 카드 배치(순서·경계·열 폭)나 표시 언어가 확정돼 상태 파일 저장 필요 (쓰기는 저장 스레드가 함)
     SaveState,
+    // 주간 보기: 해당 주의 월요일로 본문 적재·생성 요청
+    LoadWeeklyReport(NaiveDate),
+    GenerateWeeklyReport(NaiveDate),
 }
 
 // 8. 화면 상태 ----------------------------------------------------------------
@@ -290,10 +340,17 @@ pub struct AppState {
     pub doctor: Panel<Vec<DoctorFinding>>,
     pub settings_requested: bool,
     pub should_quit: bool,
+    // 프로젝트 탭 귀속 표가 보이는 차원 (d 키로 순환)
+    pub attribution_dimension: AttributionDimension,
+    // 리포트 탭 주간 보기 (기본은 일간), 선택한 주의 월요일 (기본은 이번 주)
+    pub report_weekly: bool,
+    pub report_week: NaiveDate,
+    // 테스트가 지금 시각을 고정 (None 이면 시스템 시각)
+    pub clock_override: Option<DateTime<Utc>>,
 }
 
 impl AppState {
-    // 8-1. 초기 상태 (리포트 날짜 기본값 = 어제)
+    // 8-1. 초기 상태 (리포트 날짜 기본값 = 오늘, 주간 보기 기본 주 = 이번 주)
     pub fn new(config: AppConfig, today: NaiveDate) -> Self {
         Self {
             state_file: config.data_dir.join(TUI_STATE_FILE_NAME),
@@ -323,13 +380,17 @@ impl AppState {
             always_on_top: false,
             show_help: false,
             toast: None,
-            report_date: today.pred_opt().unwrap_or(today),
+            report_date: today,
             report: Panel::Pending,
             report_row_starts: Vec::new(),
             inventory: Panel::Pending,
             doctor: Panel::Pending,
             settings_requested: false,
             should_quit: false,
+            attribution_dimension: ATTRIBUTION_DIMENSIONS[0],
+            report_weekly: false,
+            report_week: week_start_of(today),
+            clock_override: None,
         }
     }
 
@@ -347,10 +408,51 @@ impl AppState {
                 self.settings_requested = true;
                 UiCommand::LoadSettings
             }
+            ActiveTab::Report if self.report_weekly => {
+                UiCommand::LoadWeeklyReport(self.report_week)
+            }
             ActiveTab::Report => UiCommand::LoadReport(self.report_date),
             _ => UiCommand::None,
         };
         self.merge_save(saved, command)
+    }
+
+    // 8-2-1. 오늘 갱신: 시계가 넘어간 날로 today 를 옮기고, "오늘"·"이번 주"를 보던 리포트는 새 날·새 주로 따라감
+    // 반환 = 오늘이 바뀔을 때만 Some (리포트 탭이 보는 대상이 바뀔으면 그 본문 적재 명령, 아니면 UiCommand::None)
+    // 지금 시각은 now_utc() 라 테스트가 clock_override 로 날짜를 고정할 수 있음
+    pub fn refresh_today(&mut self) -> Option<UiCommand> {
+        let today = self.now_utc().with_timezone(&Local).date_naive();
+        if today == self.today {
+            return None;
+        }
+
+        // 1. 오늘을 보던 날짜·이번 주를 보던 주는 새 값으로 (지난 날·지난 주를 보던 중이면 그대로)
+        let previous = self.today;
+        let was_today = self.report_date == previous;
+        let was_week = self.report_week == week_start_of(previous);
+        self.today = today;
+        if was_today {
+            self.report_date = today;
+        }
+        if was_week {
+            self.report_week = week_start_of(today);
+        }
+
+        // 2. 리포트 탭이 보는 대상이 옮겨갔을 때만 본문 다시 적재 (오늘이 바뀌면 주는 월요일에만 바뀜)
+        let moved = if self.report_weekly {
+            was_week && week_start_of(today) != week_start_of(previous)
+        } else {
+            was_today
+        };
+        if self.tab != ActiveTab::Report || !moved {
+            return Some(UiCommand::None);
+        }
+        self.reset_report_view();
+        Some(if self.report_weekly {
+            UiCommand::LoadWeeklyReport(self.report_week)
+        } else {
+            UiCommand::LoadReport(self.report_date)
+        })
     }
 
     // 8-3. 키 입력 대상 카드 (클릭한 카드가 이 탭 것이면 그 카드, 아니면 탭의 주 카드)
@@ -403,7 +505,7 @@ impl AppState {
                 self.switch_tab(ActiveTab::ALL[(slot + TAB_COUNT - 1) % TAB_COUNT])
             }
             KeyCode::Tab => self.switch_tab(ActiveTab::ALL[(slot + 1) % TAB_COUNT]),
-            KeyCode::Char(digit @ '1'..='7') => {
+            KeyCode::Char(digit @ '1'..='8') => {
                 self.switch_tab(ActiveTab::ALL[digit as usize - '1' as usize])
             }
             // Shift+방향키는 포커스 카드 위치 이동 (리포트 날짜 이동 등 일반 방향키보다 먼저)
@@ -450,6 +552,13 @@ impl AppState {
             KeyCode::Char('t' | 'T') => self.perform_action(UiAction::TogglePin),
             KeyCode::Char('l') => self.perform_action(UiAction::ResetLayout),
             KeyCode::Char('L') => self.perform_action(UiAction::ToggleLanguage),
+            KeyCode::Char('d' | 'D') if self.tab == ActiveTab::Projects => {
+                self.cycle_attribution_dimension();
+                UiCommand::SaveState
+            }
+            KeyCode::Char('v' | 'V') if self.tab == ActiveTab::Report => {
+                self.perform_action(UiAction::ReportToggleView)
+            }
             _ => UiCommand::None,
         }
     }
@@ -476,6 +585,9 @@ impl AppState {
             }
             UiAction::RefreshView => match self.tab {
                 ActiveTab::Settings => UiCommand::LoadSettings,
+                ActiveTab::Report if self.report_weekly => {
+                    UiCommand::LoadWeeklyReport(self.report_week)
+                }
                 ActiveTab::Report => UiCommand::LoadReport(self.report_date),
                 _ => UiCommand::RefreshNow,
             },
@@ -513,11 +625,25 @@ impl AppState {
                 UiCommand::SaveState
             }
             UiAction::ReportPrev => {
+                if self.report_weekly {
+                    self.report_week -= ChronoDuration::days(7);
+                    self.reset_report_view();
+                    return UiCommand::LoadWeeklyReport(self.report_week);
+                }
                 self.report_date = self.report_date.pred_opt().unwrap_or(self.report_date);
                 self.reset_report_view();
                 UiCommand::LoadReport(self.report_date)
             }
             UiAction::ReportNext => {
+                if self.report_weekly {
+                    let next_week = self.report_week + ChronoDuration::days(7);
+                    if next_week > week_start_of(self.today) {
+                        return UiCommand::None;
+                    }
+                    self.report_week = next_week;
+                    self.reset_report_view();
+                    return UiCommand::LoadWeeklyReport(self.report_week);
+                }
                 let next_date = self.report_date.succ_opt().unwrap_or(self.report_date);
                 if next_date > self.today {
                     return UiCommand::None;
@@ -526,8 +652,31 @@ impl AppState {
                 self.reset_report_view();
                 UiCommand::LoadReport(self.report_date)
             }
+            UiAction::ReportGenerate if self.report_weekly => {
+                UiCommand::GenerateWeeklyReport(self.report_week)
+            }
             UiAction::ReportGenerate => UiCommand::GenerateReport(self.report_date),
+            UiAction::ReportToggleView => {
+                self.report_weekly = !self.report_weekly;
+                self.reset_report_view();
+                if self.report_weekly {
+                    UiCommand::LoadWeeklyReport(self.report_week)
+                } else {
+                    UiCommand::LoadReport(self.report_date)
+                }
+            }
         }
+    }
+
+    // 귀속 표 차원 순환 (프로젝트 탭 d 키, 다른 차원의 행이라 선택·스크롤은 처음으로)
+    pub fn cycle_attribution_dimension(&mut self) {
+        let current = ATTRIBUTION_DIMENSIONS
+            .iter()
+            .position(|dimension| *dimension == self.attribution_dimension)
+            .unwrap_or(0);
+        self.attribution_dimension =
+            ATTRIBUTION_DIMENSIONS[(current + 1) % ATTRIBUTION_DIMENSIONS.len()];
+        self.card_views[CardId::AttributionTable as usize] = CardView::default();
     }
 
     // 리포트 날짜가 바뀌면 본문·목차 위치 처음으로
@@ -648,7 +797,12 @@ impl AppState {
                 self.doctor = doctor;
             }
             UiMessage::Report { date, body } => {
-                if date == self.report_date {
+                if date == self.report_date && !self.report_weekly {
+                    self.report = body;
+                }
+            }
+            UiMessage::WeeklyReport { week_start, body } => {
+                if week_start == self.report_week && self.report_weekly {
                     self.report = body;
                 }
             }
@@ -663,6 +817,13 @@ impl AppState {
             UiMessage::StateSaveFailed { detail } => {
                 self.toast = Some(Toast {
                     text: i18n::state_save_failed(self.lang, &detail),
+                    level: ToastLevel::Error,
+                    expires_at: now + TOAST_LIFETIME,
+                });
+            }
+            UiMessage::SchemaUpgradeFailed { detail } => {
+                self.toast = Some(Toast {
+                    text: i18n::schema_upgrade_failed(self.lang, &detail),
                     level: ToastLevel::Error,
                     expires_at: now + TOAST_LIFETIME,
                 });
@@ -743,6 +904,25 @@ impl AppState {
                         .collect(),
                 )
             }
+            CardId::ProjectTable => {
+                let Panel::Ready(projects) = &self.snapshot.projects else {
+                    return None;
+                };
+                let mut sorted = projects.clone();
+                sort_rows(&mut sorted, sort, compare_project_row);
+                Some(
+                    sorted
+                        .iter()
+                        .map(|row| [row.project.as_str(), row.git_branch.as_str()].join("\u{1}"))
+                        .collect(),
+                )
+            }
+            CardId::AttributionTable => {
+                let rows = attribution_rows(&self.snapshot, self.attribution_dimension)?;
+                let mut sorted = rows.to_vec();
+                sort_rows(&mut sorted, sort, compare_attribution_row);
+                Some(sorted.iter().map(|row| row.name.clone()).collect())
+            }
             _ => None,
         }
     }
@@ -787,11 +967,19 @@ impl AppState {
     }
 }
 
+// 8-n. 지금 시각 (카운트다운이 다시 그릴 때마다 흐르도록 그리기에서 읽음)
+impl AppState {
+    pub fn now_utc(&self) -> DateTime<Utc> {
+        self.clock_override.unwrap_or_else(Utc::now)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tui::cards::SlotGroupHit;
     use crate::tui::test_support::sample_config;
+    use chrono::TimeZone;
     use crossterm::event::KeyEventKind;
 
     fn press(code: KeyCode) -> KeyEvent {
@@ -822,7 +1010,7 @@ mod tests {
         state.handle_key_event(press(KeyCode::BackTab));
         assert_eq!(state.tab, ActiveTab::Overview);
         state.handle_key_event(press(KeyCode::BackTab));
-        assert_eq!(state.tab, ActiveTab::Report);
+        assert_eq!(state.tab, ActiveTab::Projects);
 
         state.handle_key_event(press(KeyCode::Tab));
         assert_eq!(state.tab, ActiveTab::Overview);
@@ -830,7 +1018,7 @@ mod tests {
         let shift_tab =
             KeyEvent::new_with_kind(KeyCode::Tab, KeyModifiers::SHIFT, KeyEventKind::Press);
         state.handle_key_event(shift_tab);
-        assert_eq!(state.tab, ActiveTab::Report);
+        assert_eq!(state.tab, ActiveTab::Projects);
     }
 
     #[test]
@@ -854,25 +1042,23 @@ mod tests {
             UiCommand::LoadSettings
         );
 
-        let yesterday = NaiveDate::from_ymd_opt(2026, 11, 14).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 11, 15).unwrap();
         assert_eq!(
             state.handle_key_event(press(KeyCode::Char('7'))),
-            UiCommand::LoadReport(yesterday)
+            UiCommand::LoadReport(today)
         );
         assert_eq!(
             state.handle_key_event(press(KeyCode::Char('g'))),
-            UiCommand::GenerateReport(yesterday)
+            UiCommand::GenerateReport(today)
         );
     }
 
     #[test]
-    fn report_date_moves_with_arrows_and_stops_at_today() {
+    fn report_date_starts_today_moves_with_arrows_and_stops_at_today() {
         let mut state = sample_state();
         state.handle_key_event(press(KeyCode::Char('7')));
         let today = NaiveDate::from_ymd_opt(2026, 11, 15).unwrap();
-
-        let moved = state.handle_key_event(press(KeyCode::Right));
-        assert_eq!(moved, UiCommand::LoadReport(today));
+        let yesterday = NaiveDate::from_ymd_opt(2026, 11, 14).unwrap();
         assert_eq!(state.report_date, today);
 
         // 오늘 이후로는 이동 없음
@@ -882,12 +1068,129 @@ mod tests {
         );
         assert_eq!(state.report_date, today);
 
-        let earlier = NaiveDate::from_ymd_opt(2026, 11, 14).unwrap();
         assert_eq!(
             state.handle_key_event(press(KeyCode::Left)),
-            UiCommand::LoadReport(earlier)
+            UiCommand::LoadReport(yesterday)
         );
         assert!(matches!(state.report, Panel::Pending));
+        assert_eq!(
+            state.handle_key_event(press(KeyCode::Right)),
+            UiCommand::LoadReport(today)
+        );
+        assert_eq!(state.report_date, today);
+    }
+
+    #[test]
+    fn v_key_switches_to_the_current_week_and_arrows_move_by_week() {
+        let mut state = sample_state();
+        // today 2026-11-15 (일요일) -> 이번 주는 11-09 월요일부터
+        let this_week = NaiveDate::from_ymd_opt(2026, 11, 9).unwrap();
+        let last_week = NaiveDate::from_ymd_opt(2026, 11, 2).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 11, 15).unwrap();
+        assert!(!state.report_weekly);
+        assert_eq!(state.report_week, this_week);
+
+        // v 는 리포트 탭에서만, 일간이 기본이고 일간 날짜는 그대로
+        assert_eq!(
+            state.handle_key_event(press(KeyCode::Char('v'))),
+            UiCommand::None
+        );
+        assert!(!state.report_weekly);
+        state.handle_key_event(press(KeyCode::Char('7')));
+        assert_eq!(
+            state.handle_key_event(press(KeyCode::Char('v'))),
+            UiCommand::LoadWeeklyReport(this_week)
+        );
+        assert!(state.report_weekly);
+        assert!(matches!(state.report, Panel::Pending));
+        assert_eq!(state.report_date, today);
+
+        // 이번 주를 넘어 다음 주로 가지 않고, 지난 주로는 번지수로 이동
+        assert_eq!(
+            state.handle_key_event(press(KeyCode::Right)),
+            UiCommand::None
+        );
+        assert_eq!(
+            state.handle_key_event(press(KeyCode::Left)),
+            UiCommand::LoadWeeklyReport(last_week)
+        );
+        assert_eq!(state.report_week, last_week);
+        assert_eq!(
+            state.handle_key_event(press(KeyCode::Char('g'))),
+            UiCommand::GenerateWeeklyReport(last_week)
+        );
+        assert_eq!(
+            state.handle_key_event(press(KeyCode::Char('r'))),
+            UiCommand::LoadWeeklyReport(last_week)
+        );
+        assert_eq!(
+            state.handle_key_event(press(KeyCode::Right)),
+            UiCommand::LoadWeeklyReport(this_week)
+        );
+
+        // 다른 탭을 거쳐 돌아와도 주간 보기 유지, 일간으로 되돌리면 오늘 리포트
+        state.handle_key_event(press(KeyCode::Char('1')));
+        assert_eq!(
+            state.handle_key_event(press(KeyCode::Char('7'))),
+            UiCommand::LoadWeeklyReport(this_week)
+        );
+        assert_eq!(
+            state.handle_key_event(press(KeyCode::Char('v'))),
+            UiCommand::LoadReport(today)
+        );
+        assert!(!state.report_weekly);
+    }
+
+    #[test]
+    fn report_messages_apply_only_to_the_view_and_period_on_screen() {
+        let mut state = sample_state();
+        let today = NaiveDate::from_ymd_opt(2026, 11, 15).unwrap();
+        let this_week = NaiveDate::from_ymd_opt(2026, 11, 9).unwrap();
+        let now = Instant::now();
+
+        // 일간 보기: 주간 본문은 버림
+        state.apply_ui_message(
+            UiMessage::WeeklyReport {
+                week_start: this_week,
+                body: Panel::Ready(Some("weekly".to_string())),
+            },
+            now,
+        );
+        assert!(matches!(state.report, Panel::Pending));
+        state.apply_ui_message(
+            UiMessage::Report {
+                date: today,
+                body: Panel::Ready(Some("daily".to_string())),
+            },
+            now,
+        );
+        assert!(matches!(&state.report, Panel::Ready(Some(text)) if text == "daily"));
+
+        // 주간 보기: 일간 본문과 다른 주 본문은 버림
+        state.perform_action(UiAction::ReportToggleView);
+        state.apply_ui_message(
+            UiMessage::Report {
+                date: today,
+                body: Panel::Ready(Some("late daily".to_string())),
+            },
+            now,
+        );
+        state.apply_ui_message(
+            UiMessage::WeeklyReport {
+                week_start: NaiveDate::from_ymd_opt(2026, 11, 2).unwrap(),
+                body: Panel::Ready(Some("other week".to_string())),
+            },
+            now,
+        );
+        assert!(matches!(state.report, Panel::Pending));
+        state.apply_ui_message(
+            UiMessage::WeeklyReport {
+                week_start: this_week,
+                body: Panel::Ready(Some("weekly".to_string())),
+            },
+            now,
+        );
+        assert!(matches!(&state.report, Panel::Ready(Some(text)) if text == "weekly"));
     }
 
     #[test]
@@ -1066,11 +1369,14 @@ mod tests {
             state.handle_key_event(press(KeyCode::Char(digit)));
             assert_eq!(state.tab, tab, "{digit}");
         }
-        assert_eq!(TAB_COUNT, 7);
+        assert_eq!(TAB_COUNT, 8);
         assert_eq!(ActiveTab::Models.main_card(), CardId::ModelTable);
         assert_eq!(ActiveTab::Agents.main_card(), CardId::AgentTable);
         state.handle_key_event(press(KeyCode::Char('8')));
-        assert_eq!(state.tab, ActiveTab::Report);
+        assert_eq!(state.tab, ActiveTab::Projects);
+        assert_eq!(ActiveTab::Projects.main_card(), CardId::ProjectTable);
+        state.handle_key_event(press(KeyCode::Char('9')));
+        assert_eq!(state.tab, ActiveTab::Projects);
     }
 
     #[test]
@@ -1374,12 +1680,12 @@ mod tests {
         let today = NaiveDate::from_ymd_opt(2026, 11, 15).unwrap();
         let yesterday = NaiveDate::from_ymd_opt(2026, 11, 14).unwrap();
         assert_eq!(
-            state.handle_key_event(press(KeyCode::Right)),
-            UiCommand::LoadReport(today)
-        );
-        assert_eq!(
             state.handle_key_event(press(KeyCode::Left)),
             UiCommand::LoadReport(yesterday)
+        );
+        assert_eq!(
+            state.handle_key_event(press(KeyCode::Right)),
+            UiCommand::LoadReport(today)
         );
         assert_eq!(
             state.card_layout.order_of(SplitGroup::ReportCols)[..2],
@@ -1843,6 +2149,126 @@ mod tests {
         assert_eq!(
             state.toast.as_ref().unwrap().text,
             "Saving UI state failed: access denied"
+        );
+    }
+
+    #[test]
+    fn a_schema_upgrade_failure_becomes_an_error_toast_in_the_active_language() {
+        let mut state = sample_state();
+        let now = Instant::now();
+        let failed = || UiMessage::SchemaUpgradeFailed {
+            detail: "database is locked".to_string(),
+        };
+        state.apply_ui_message(failed(), now);
+        let toast = state.toast.as_ref().unwrap();
+        assert_eq!(toast.text, "DB 스키마 갱신 실패: database is locked");
+        assert_eq!(toast.level, ToastLevel::Error);
+        assert_eq!(toast.expires_at, now + TOAST_LIFETIME);
+
+        state.lang = Lang::En;
+        state.apply_ui_message(failed(), now);
+        assert_eq!(
+            state.toast.as_ref().unwrap().text,
+            "DB schema upgrade failed: database is locked"
+        );
+    }
+
+    // 자정 직후 (시계를 지정한 날 정오 로컬로 고정, 시간대와 무관)
+    fn local_noon(year: i32, month: u32, day: u32) -> DateTime<Utc> {
+        Local
+            .with_ymd_and_hms(year, month, day, 12, 0, 0)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn date(year: i32, month: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(year, month, day).unwrap()
+    }
+
+    #[test]
+    fn crossing_midnight_moves_today_and_follows_the_day_and_week_being_viewed() {
+        // 시작 때 today = 2026-11-15(일), 일간 보기는 오늘, 주간 기본 주 = 11-09(월)
+        let mut state = sample_state();
+        state.tab = ActiveTab::Report;
+        state.clock_override = Some(local_noon(2026, 11, 15));
+        assert_eq!(state.refresh_today(), None);
+
+        // 1. 자정을 넘김: 오늘 리포트를 보던 중이면 새 오늘로 따라가고 본문 재적재
+        state.report = Panel::Ready(Some("old live body".to_string()));
+        state.clock_override = Some(local_noon(2026, 11, 16));
+        assert_eq!(
+            state.refresh_today(),
+            Some(UiCommand::LoadReport(date(2026, 11, 16)))
+        );
+        assert_eq!(state.today, date(2026, 11, 16));
+        assert_eq!(state.report_date, date(2026, 11, 16));
+        assert_eq!(state.report_week, date(2026, 11, 16));
+        assert!(matches!(state.report, Panel::Pending));
+        assert_eq!(state.refresh_today(), None);
+
+        // 새 오늘은 다시 "오늘"이라 다음 날 이동은 막히고, 하루 전은 허용
+        assert_eq!(
+            state.handle_key_event(press(KeyCode::Right)),
+            UiCommand::None
+        );
+        assert_eq!(
+            state.handle_key_event(press(KeyCode::Left)),
+            UiCommand::LoadReport(date(2026, 11, 15))
+        );
+    }
+
+    #[test]
+    fn crossing_midnight_keeps_a_past_day_and_week_and_skips_reloads_that_change_nothing() {
+        // 지난 날짜를 보는 중이면 그대로 (today 만 옮김, 본문 재적재 없음)
+        let mut state = sample_state();
+        state.tab = ActiveTab::Report;
+        state.report_date = date(2026, 11, 13);
+        state.report = Panel::Ready(Some("stored body".to_string()));
+        state.clock_override = Some(local_noon(2026, 11, 16));
+        assert_eq!(state.refresh_today(), Some(UiCommand::None));
+        assert_eq!(state.today, date(2026, 11, 16));
+        assert_eq!(state.report_date, date(2026, 11, 13));
+        assert!(matches!(state.report, Panel::Ready(Some(_))));
+
+        // 주간 보기: 지난 주를 보는 중이면 그대로, 이번 주를 보는 중이면 새 주를 따라감
+        let mut state = sample_state();
+        state.tab = ActiveTab::Report;
+        state.report_weekly = true;
+        state.report_week = date(2026, 11, 2);
+        state.clock_override = Some(local_noon(2026, 11, 16));
+        assert_eq!(state.refresh_today(), Some(UiCommand::None));
+        assert_eq!(state.report_week, date(2026, 11, 2));
+
+        let mut state = sample_state();
+        state.tab = ActiveTab::Report;
+        state.report_weekly = true;
+        state.clock_override = Some(local_noon(2026, 11, 16));
+        assert_eq!(
+            state.refresh_today(),
+            Some(UiCommand::LoadWeeklyReport(date(2026, 11, 16)))
+        );
+
+        // 같은 주 안의 자정(화→수)은 주간 본문을 다시 적재하지 않음
+        let mut state = sample_state();
+        state.tab = ActiveTab::Report;
+        state.today = date(2026, 11, 10);
+        state.report_date = date(2026, 11, 10);
+        state.report_week = date(2026, 11, 9);
+        state.report_weekly = true;
+        state.report = Panel::Ready(Some("weekly".to_string()));
+        state.clock_override = Some(local_noon(2026, 11, 11));
+        assert_eq!(state.refresh_today(), Some(UiCommand::None));
+        assert_eq!(state.report_week, date(2026, 11, 9));
+        assert!(matches!(state.report, Panel::Ready(Some(_))));
+
+        // 리포트 탭이 아니면 날짜만 따라가고 적재 요청은 없음 (탭에 들어갈 때 새 날로 적재)
+        let mut state = sample_state();
+        state.clock_override = Some(local_noon(2026, 11, 16));
+        assert_eq!(state.refresh_today(), Some(UiCommand::None));
+        assert_eq!(state.report_date, date(2026, 11, 16));
+        assert_eq!(
+            state.switch_tab(ActiveTab::Report),
+            UiCommand::LoadReport(date(2026, 11, 16))
         );
     }
 }

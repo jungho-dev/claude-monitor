@@ -4,10 +4,12 @@
 use anyhow::{Context, bail};
 use hyper::Uri;
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 pub const APP_DIR_NAME: &str = "claude-monitor";
 pub const CONFIG_HOME_DIR_NAME: &str = ".config";
@@ -71,13 +73,23 @@ pub struct IndexerConfig {
     pub backfill_days: u32,
 }
 
-// 6. 일일 리포트 설정 ---------------------------------------------------------
+// 6. 리포트 설정 --------------------------------------------------------------
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReportConfig {
     pub enabled: bool,
     pub dir: Option<PathBuf>,
     pub run_hour: u32,
+    pub language: ReportLanguage,
+}
+
+// 6-1. 리포트 출력 언어 -------------------------------------------------------
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReportLanguage {
+    #[default]
+    Ko,
+    En,
 }
 
 // 7. 최신 대기 대응 설정 ------------------------------------------------------
@@ -89,6 +101,26 @@ pub struct PowerConfig {
     pub awake_grace_secs: u64,
     pub gap_threshold_secs: u64,
     pub hint_window_secs: u64,
+}
+
+// 7-1. 단가 덮어쓰기 설정 -----------------------------------------------------
+// models 키는 claude- 접두사를 넌 모델 이름 접두어 (예: "opus-5-5")
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PricingConfig {
+    pub models: BTreeMap<String, ModelRateConfig>,
+}
+
+// 7-2. 모델 단가 (USD per MTok) -----------------------------------------------
+// 생략한 캐시 항목은 입력 단가의 5분 쓰기 1.25배, 1시간 쓰기 2배, 읽기 0.1배
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelRateConfig {
+    pub input: f64,
+    pub output: f64,
+    pub cache_write_5m: Option<f64>,
+    pub cache_write_1h: Option<f64>,
+    pub cache_read: Option<f64>,
 }
 
 // 8. 설정 파일 형태 -----------------------------------------------------------
@@ -103,7 +135,14 @@ struct ConfigFile {
     indexer: IndexerConfig,
     report: ReportConfig,
     power: PowerConfig,
+    pricing: PricingConfig,
 }
+
+// 적재된 단가 덮어쓰기 (첨에 적재한 값 유지, 미적재면 빈 표)
+static PRICE_OVERRIDES: OnceLock<PricingConfig> = OnceLock::new();
+static NO_PRICE_OVERRIDES: PricingConfig = PricingConfig {
+    models: BTreeMap::new(),
+};
 
 // 9. 기본값 -------------------------------------------------------------------
 impl Default for PortConfig {
@@ -155,6 +194,7 @@ impl Default for ReportConfig {
             enabled: true,
             dir: None,
             run_hour: 0,
+            language: ReportLanguage::Ko,
         }
     }
 }
@@ -231,6 +271,12 @@ pub fn resolve_tui_state_path(
     }
 }
 
+// 11-1. 단가 덮어쓰기 조회 ----------------------------------------------------
+/// 비용 추정이 쓰는 설정 파일 [pricing]. AppConfig 적재가 한 번 설치하며 설치 전에는 빈 표.
+pub fn price_overrides() -> &'static PricingConfig {
+    PRICE_OVERRIDES.get().unwrap_or(&NO_PRICE_OVERRIDES)
+}
+
 // 12. 설정 적재 ---------------------------------------------------------------
 impl AppConfig {
     /// 명시 경로 > CM_CONFIG > ~/.config/claude-monitor/config.toml > 기본값 순 적재.
@@ -277,8 +323,9 @@ impl AppConfig {
             None => (ConfigFile::default(), None),
         };
 
-        // 3. 값 검증
+        // 3. 값 검증 (단가 덮어쓰기는 프로세스 전역에 첫 적재만 반영)
         validate_config_file(&file)?;
+        let _ = PRICE_OVERRIDES.set(file.pricing.clone());
 
         // 4. Claude 홈 (설정 파일 claude_home > CLAUDE_CONFIG_DIR > USERPROFILE/.claude > HOME/.claude, 빈 값은 없는 것으로 봄)
         let claude_home = match file.claude_home {
@@ -338,7 +385,7 @@ impl AppConfig {
         }
     }
 
-    /// 일일 리포트 출력 폴더.
+    /// 일일·주간 리포트 출력 폴더.
     pub fn report_dir(&self) -> PathBuf {
         match &self.report.dir {
             Some(dir) => dir.clone(),
@@ -395,6 +442,32 @@ fn validate_config_file(file: &ConfigFile) -> anyhow::Result<()> {
         && all_ports.contains(&relay_port)
     {
         bail!("hooks.relay_target 이 자기 포트를 가리킴 (훅 중계 순환): {relay_port}");
+    }
+
+    // 5. 단가 덮어쓰기 (접두사 claude- 를 떼고 남는 이름이 비면 모든 모델과 맞으므로 거부, 음수·비유한 값 거부)
+    for (name, rate) in &file.pricing.models {
+        let trimmed_name = name.trim();
+        if trimmed_name
+            .strip_prefix("claude-")
+            .unwrap_or(trimmed_name)
+            .is_empty()
+        {
+            bail!("pricing.models 모델 이름이 비어 있음: {name:?}");
+        }
+        let named_rates = [
+            ("input", Some(rate.input)),
+            ("output", Some(rate.output)),
+            ("cache_write_5m", rate.cache_write_5m),
+            ("cache_write_1h", rate.cache_write_1h),
+            ("cache_read", rate.cache_read),
+        ];
+        for (field, value) in named_rates {
+            if let Some(price) = value
+                && (!price.is_finite() || price < 0.0)
+            {
+                bail!("pricing.models.{name}.{field} 는 0 이상의 유한값: {price}");
+            }
+        }
     }
     Ok(())
 }
@@ -477,6 +550,16 @@ mod tests {
             ..ConfigFile::default()
         };
         validate_config_file(&edge).expect("23 통과");
+    }
+
+    // 4-1. 리포트 언어 키 -----------------------------------------------------
+    #[test]
+    fn parses_report_language_and_rejects_unknown_value() {
+        let english: ConfigFile = toml::from_str("[report]\nlanguage = \"en\"").expect("en 파싱");
+        assert_eq!(english.report.language, ReportLanguage::En);
+        let default_file = ConfigFile::default();
+        assert_eq!(default_file.report.language, ReportLanguage::Ko);
+        assert!(toml::from_str::<ConfigFile>("[report]\nlanguage = \"fr\"").is_err());
     }
 
     // 5. 비루프백 중계 대상 거부 ----------------------------------------------
@@ -937,6 +1020,62 @@ mod tests {
         );
         assert!(!state_path.starts_with(&moved_data));
         fs::remove_dir_all(&root).expect("임시 폴더 정리");
+    }
+
+    // 19-1. 단가 덮어쓰기 파싱·검증 -------------------------------------------
+    #[test]
+    fn parses_and_validates_pricing_overrides() {
+        // 1. 전체 키·정수 값 파싱
+        let text = "[pricing.models.\"opus-5-5\"]\ninput = 4.0\noutput = 20\ncache_write_5m = 5.0\ncache_write_1h = 8.0\ncache_read = 0.2\n\n[pricing.models.\"sonnet-4-5\"]\ninput = 3\noutput = 15\n";
+        let parsed: ConfigFile = toml::from_str(text).expect("단가 파싱");
+        let opus = &parsed.pricing.models["opus-5-5"];
+        assert_eq!((opus.input, opus.output), (4.0, 20.0));
+        assert_eq!(opus.cache_write_1h, Some(8.0));
+        assert_eq!(opus.cache_read, Some(0.2));
+        let sonnet = &parsed.pricing.models["sonnet-4-5"];
+        assert_eq!(sonnet.cache_write_5m, None);
+        validate_config_file(&parsed).expect("정상 단가 통과");
+
+        // 2. 알 수 없는 키·필수 키 누락 거부
+        assert!(
+            toml::from_str::<ConfigFile>(
+                "[pricing.models.x]\ninput = 1.0\noutput = 2.0\ncache_wrte = 1.0"
+            )
+            .is_err()
+        );
+        assert!(toml::from_str::<ConfigFile>("[pricing.models.x]\ninput = 1.0").is_err());
+        assert!(toml::from_str::<ConfigFile>("[pricing]\nmodel = 1").is_err());
+
+        // 3. 음수·비유한·빈 이름 거부
+        for body in [
+            "input = -1.0\noutput = 2.0",
+            "input = 1.0\noutput = nan",
+            "input = 1.0\noutput = 2.0\ncache_read = inf",
+            "input = 1.0\noutput = 2.0\ncache_write_1h = -0.5",
+        ] {
+            let file: ConfigFile =
+                toml::from_str(&format!("[pricing.models.m]\n{body}")).expect(body);
+            let message = format!("{:#}", validate_config_file(&file).expect_err(body));
+            assert!(message.contains("pricing.models.m."), "{body}: {message}");
+        }
+        let blank: ConfigFile =
+            toml::from_str("[pricing.models.\" \"]\ninput = 1.0\noutput = 2.0").expect("빈 이름");
+        assert!(validate_config_file(&blank).is_err());
+    }
+
+    // 19-2. 접두사만 남는 단가 키 거부 ----------------------------------------
+    #[test]
+    fn rejects_pricing_key_that_is_empty_after_claude_prefix() {
+        for key in ["claude-", " claude- ", ""] {
+            let text = format!("[pricing.models.\"{key}\"]\ninput = 1.0\noutput = 2.0");
+            let file: ConfigFile = toml::from_str(&text).expect(key);
+            let message = format!("{:#}", validate_config_file(&file).expect_err(key));
+            assert!(message.contains("비어 있음"), "{key:?}: {message}");
+        }
+        let named: ConfigFile =
+            toml::from_str("[pricing.models.\"claude-opus-5\"]\ninput = 1.0\noutput = 2.0")
+                .expect("정상 키");
+        validate_config_file(&named).expect("이름 있는 키 통과");
     }
 
     // 20. 임시 폴더 -----------------------------------------------------------

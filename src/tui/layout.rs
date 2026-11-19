@@ -8,7 +8,7 @@ use ratatui::layout::Rect;
 pub const MAX_CUTS: usize = 5;
 pub const MAX_SLOTS: usize = MAX_CUTS + 1;
 const RATIO_SCALE: u32 = 10_000;
-pub const GROUP_COUNT: usize = SplitGroup::ReportCols as usize + 1;
+pub const GROUP_COUNT: usize = SplitGroup::ProjectsRows as usize + 1;
 // 순서를 바꾸지 않은 칸 배치 (칸 번호 = 카드 번호)
 pub const IDENTITY_ORDER: [u8; MAX_SLOTS] = [0, 1, 2, 3, 4, 5];
 
@@ -28,6 +28,7 @@ pub enum SplitGroup {
     AgentsRows,
     SettingsRows,
     ReportCols,
+    ProjectsRows,
 }
 
 impl SplitGroup {
@@ -43,6 +44,7 @@ impl SplitGroup {
         Self::AgentsRows,
         Self::SettingsRows,
         Self::ReportCols,
+        Self::ProjectsRows,
     ];
 
     // 배치 파일에서 그룹을 가리키는 고정 이름 (열거형 번호는 쓰지 않음)
@@ -59,6 +61,7 @@ impl SplitGroup {
             Self::AgentsRows => "agents_rows",
             Self::SettingsRows => "settings_rows",
             Self::ReportCols => "report_cols",
+            Self::ProjectsRows => "projects_rows",
         }
     }
 
@@ -68,14 +71,23 @@ impl SplitGroup {
             Self::OverviewRows => 4,
             Self::OverviewCompactRows => 3,
             Self::OverviewKpiCols => 6,
-            Self::OverviewTrendCols => 3,
-            Self::ModelsRows => 3,
+            Self::OverviewTrendCols => 4,
+            Self::ModelsRows => 4,
             Self::SettingsRows => 4,
             Self::OverviewFeedCols
             | Self::ToolsRows
             | Self::HooksRows
             | Self::AgentsRows
             | Self::ReportCols => 2,
+            Self::ProjectsRows => 3,
+        }
+    }
+
+    // 카드가 늘기 전 배치 파일이 담던 칸 수 (새 카드는 맨 뒤 칸), 늘지 않은 그룹은 None
+    pub fn legacy_card_count(self) -> Option<usize> {
+        match self {
+            Self::OverviewTrendCols | Self::ModelsRows => Some(3),
+            _ => None,
         }
     }
 
@@ -302,6 +314,68 @@ impl CardLayout {
         Some((cut - hit.prev_end, hit.next_cut.saturating_sub(cut + gap)))
     }
 
+    // 숨길 카드가 놓인 칸은 크기 0, 보이는 칸은 보이는 카드의 기본 크기·최소 크기를 앞 칸부터 받음 (칸 크기는 칸에 남는 규칙 그대로)
+    // sizes·mins = 카드 번호 순서의 기본 크기·최소 크기, span = 분할 구간 길이
+    // 반환 = (split_cards 의 기본 경계 위치, 칸별 최소 크기), 보이는 마지막 칸이 남는 길이를 모두 받음
+    pub fn visible_slot_plan(
+        &self,
+        group: SplitGroup,
+        hidden: &[usize],
+        sizes: &[u16],
+        mins: &[u16],
+        span: u16,
+    ) -> (Vec<u16>, Vec<u16>) {
+        let count = group.card_count().min(sizes.len()).min(mins.len());
+        let gap = match group.axis() {
+            SplitAxis::Columns => 1,
+            SplitAxis::Rows => 0,
+        };
+        let order = self.order_of(group);
+        let mut shares = (0..count)
+            .filter(|card| !hidden.contains(card))
+            .map(|card| (sizes[card], mins[card]));
+
+        // 1. 칸별 크기·최소 크기 (숨길 카드의 칸은 0)
+        let mut slot_shares: Vec<Option<(u16, u16)>> = Vec::with_capacity(count);
+        for placed in &order[..count] {
+            slot_shares.push(if hidden.contains(&usize::from(*placed)) {
+                None
+            } else {
+                shares.next()
+            });
+        }
+        let last_visible = slot_shares.iter().rposition(Option::is_some);
+
+        // 2. 칸 끝 위치 (숨긴 칸은 앞 칸 끝에 겹침, 보이는 마지막 칸은 구간 끝까지)
+        let mut ends = Vec::with_capacity(count);
+        let mut prev_end = 0u16;
+        for (slot, share) in slot_shares.iter().enumerate() {
+            let start = if slot == 0 {
+                0
+            } else {
+                prev_end.saturating_add(gap)
+            };
+            prev_end = match share {
+                _ if Some(slot) == last_visible => span,
+                Some((size, _)) => start.saturating_add(*size).min(span),
+                None if slot == 0 => 0,
+                None => prev_end,
+            };
+            ends.push(prev_end);
+        }
+        ends.pop();
+        let slot_mins = slot_shares
+            .iter()
+            .map(|share| share.map_or(0, |(_, min)| min))
+            .collect();
+        (ends, slot_mins)
+    }
+
+    // 경계 비율만 기본으로 되돌림 (카드 순서는 유지)
+    pub fn clear_ratios(&mut self, group: SplitGroup) {
+        self.ratios[group as usize] = None;
+    }
+
     // 칸별 카드 번호 (기본 배치는 칸 번호 = 카드 번호)
     pub fn order_of(&self, group: SplitGroup) -> [u8; MAX_SLOTS] {
         self.orders[group as usize].unwrap_or(IDENTITY_ORDER)
@@ -342,9 +416,12 @@ impl CardLayout {
     }
 
     // 배치 파일 복원용: 길이·범위·중복이 맞을 때만 반영, 반환 = 반영 여부
+    // 카드가 늘기 전 길이(legacy_card_count)의 순서는 저장한 순서를 그대로 두고 새 카드를 기본 칸(맨 뒤)에 붙여 이어받음
     pub fn restore_order(&mut self, group: SplitGroup, values: &[i64]) -> bool {
         let count = group.card_count();
-        if !group.is_reorderable() || values.len() != count {
+        let stored = values.len();
+        if !group.is_reorderable() || (stored != count && group.legacy_card_count() != Some(stored))
+        {
             return false;
         }
         let mut order = IDENTITY_ORDER;
@@ -353,7 +430,7 @@ impl CardLayout {
             let Ok(card) = usize::try_from(*value) else {
                 return false;
             };
-            if card >= count || seen[card] {
+            if card >= stored || seen[card] {
                 return false;
             }
             seen[card] = true;
@@ -363,8 +440,12 @@ impl CardLayout {
         true
     }
 
+    // 카드가 늘기 전 길이의 비율은 저장한 경계를 그대로 두고 새 경계(새 카드 앞)를 구간 끝(만분율 10000)에 둔다
+    // 새 카드는 칸 최소 크기만 받고 기존 카드 크기는 보존 (기본 경계는 칸 수가 아니라 셀 수라 비율로 환산할 수 없음)
     pub fn restore_ratios(&mut self, group: SplitGroup, values: &[i64]) -> bool {
-        if values.len() != group.card_count() - 1 {
+        let cuts = group.card_count() - 1;
+        let stored = values.len();
+        if stored != cuts && group.legacy_card_count().map(|legacy| legacy - 1) != Some(stored) {
             return false;
         }
         let mut ratios = [0u16; MAX_CUTS];
@@ -377,6 +458,7 @@ impl CardLayout {
             }
             ratios[slot] = ratio;
         }
+        ratios[stored..cuts].fill(RATIO_SCALE as u16);
         self.ratios[group as usize] = Some(ratios);
         true
     }
@@ -649,7 +731,7 @@ mod tests {
             .iter()
             .filter(|group| group.is_reorderable())
             .count();
-        assert_eq!(reorderable, 9);
+        assert_eq!(reorderable, 10);
         assert_eq!(SplitGroup::ReportCols.axis(), SplitAxis::Columns);
         assert_eq!(SplitGroup::OverviewKpiCols.axis(), SplitAxis::Columns);
         assert_eq!(SplitGroup::SettingsRows.axis(), SplitAxis::Rows);
@@ -683,5 +765,125 @@ mod tests {
         );
         let (panes, _) = split_tools(&layout);
         assert_eq!(panes[0].height, 18);
+    }
+
+    // 숨긴 카드의 칸은 위치와 상관없이 크기 0, 보이는 칸이 기본 크기를 앞 칸부터 받아 구간을 채움
+    #[test]
+    fn hidden_card_collapses_its_slot_wherever_it_sits_and_visible_slots_tile_the_span() {
+        let sizes = [8, 9, 4, 3];
+        let mins = [5, 4, 3, 3];
+        let plan_for = |layout: &CardLayout, hidden: &[usize]| {
+            let (cuts, slot_mins) =
+                layout.visible_slot_plan(SplitGroup::ModelsRows, hidden, &sizes, &mins, 24);
+            let mut hit_areas = UiHitAreas::default();
+            let panes = layout.split_cards(
+                &mut hit_areas,
+                SplitGroup::ModelsRows,
+                SplitAxis::Rows,
+                Rect::new(0, 0, 100, 24),
+                &cuts,
+                &slot_mins,
+            );
+            let heights: Vec<u16> = panes.iter().map(|pane| pane.height).collect();
+            (cuts, slot_mins, heights)
+        };
+
+        // 숨김 없음: 칸 크기 그대로
+        let (cuts, slot_mins, heights) = plan_for(&CardLayout::default(), &[]);
+        assert_eq!((cuts, slot_mins), (vec![8, 17, 21], vec![5, 4, 3, 3]));
+        assert_eq!(heights, [8, 9, 4, 3]);
+
+        // 카드 3 을 숨김: 맨 뒤 칸, 중간 칸, 맨 앞 칸 어느 자리에 놓여도 그 카드만 높이 0
+        let default_layout = CardLayout::default();
+        let (cuts, slot_mins, heights) = plan_for(&default_layout, &[3]);
+        assert_eq!((cuts, slot_mins), (vec![8, 17, 24], vec![5, 4, 3, 0]));
+        assert_eq!(heights, [8, 9, 7, 0]);
+
+        let mut layout = CardLayout::default();
+        layout.move_card_to_slot(SplitGroup::ModelsRows, &IDENTITY_ORDER, 3, 1);
+        let (cuts, slot_mins, heights) = plan_for(&layout, &[3]);
+        assert_eq!((cuts, slot_mins), (vec![8, 8, 17], vec![5, 0, 4, 3]));
+        assert_eq!(heights, [8, 9, 7, 0]);
+
+        let mut layout = CardLayout::default();
+        layout.move_card_to_slot(SplitGroup::ModelsRows, &IDENTITY_ORDER, 3, 0);
+        let (cuts, slot_mins, heights) = plan_for(&layout, &[3]);
+        assert_eq!((cuts, slot_mins), (vec![0, 8, 17], vec![0, 5, 4, 3]));
+        assert_eq!(heights, [8, 9, 7, 0]);
+    }
+
+    // 가로 그룹: 숨긴 칸은 폭 0, 빈 칸 1열이 겹쳐 쌓이지 않고 보이는 두 칸이 구간을 모두 씀
+    #[test]
+    fn hidden_columns_leave_no_extra_gap_and_the_visible_cards_fill_the_width() {
+        let layout = CardLayout::default();
+        let (cuts, slot_mins) = layout.visible_slot_plan(
+            SplitGroup::OverviewTrendCols,
+            &[1, 2],
+            &[26, 0, 0, 33],
+            &[24, 16, 16, 28],
+            60,
+        );
+        assert_eq!(
+            (cuts.clone(), slot_mins.clone()),
+            (vec![26, 26, 26], vec![24, 0, 0, 28])
+        );
+        let mut hit_areas = UiHitAreas::default();
+        let panes = layout.split_cards(
+            &mut hit_areas,
+            SplitGroup::OverviewTrendCols,
+            SplitAxis::Columns,
+            Rect::new(0, 0, 60, 6),
+            &cuts,
+            &slot_mins,
+        );
+        let widths: Vec<u16> = panes.iter().map(|pane| pane.width).collect();
+        assert_eq!(widths, [26, 0, 0, 33]);
+        assert_eq!(panes[3].right(), 60);
+    }
+
+    // 카드가 늘기 전 파일: 3 칸 순서는 그대로 두고 새 카드를 맨 뒤 칸에, 3 칸 비율은 새 경계를 구간 끝에 둠
+    #[test]
+    fn legacy_three_card_orders_and_ratios_migrate_for_the_two_grown_groups() {
+        for group in [SplitGroup::ModelsRows, SplitGroup::OverviewTrendCols] {
+            let mut layout = CardLayout::default();
+            assert!(layout.restore_order(group, &[1, 0, 2]), "{group:?}");
+            assert_eq!(layout.order_of(group)[..4], [1, 0, 2, 3], "{group:?}");
+            assert_eq!(layout.custom_order(group), Some(vec![1, 0, 2, 3]));
+            assert!(layout.restore_ratios(group, &[2_000, 6_000]), "{group:?}");
+            assert_eq!(
+                layout.custom_ratios(group),
+                Some(vec![2_000, 6_000, RATIO_SCALE as u16]),
+                "{group:?}"
+            );
+
+            // 3 칸 순서가 아닌 카드 번호·중복·다른 길이는 여전히 거부
+            let mut layout = CardLayout::default();
+            assert!(!layout.restore_order(group, &[0, 1, 3]));
+            assert!(!layout.restore_order(group, &[0, 1, 1]));
+            assert!(!layout.restore_order(group, &[0, 1]));
+            assert!(!layout.restore_ratios(group, &[2_000]));
+            assert!(!layout.restore_ratios(group, &[2_000, 20_000]));
+            assert_eq!(layout, CardLayout::default());
+        }
+
+        // 늘지 않은 그룹은 3 칸 순서·2 개 비율을 받지 않음
+        let mut layout = CardLayout::default();
+        assert!(!layout.restore_order(SplitGroup::SettingsRows, &[0, 1, 2]));
+        assert!(!layout.restore_ratios(SplitGroup::SettingsRows, &[2_000, 6_000]));
+
+        // 옮겨 온 비율: 저장한 두 경계는 그대로, 새 카드는 칸 최소 크기만 받음
+        let mut layout = CardLayout::default();
+        assert!(layout.restore_ratios(SplitGroup::ModelsRows, &[2_000, 6_000]));
+        let mut hit_areas = UiHitAreas::default();
+        let panes = layout.split_cards(
+            &mut hit_areas,
+            SplitGroup::ModelsRows,
+            SplitAxis::Rows,
+            Rect::new(0, 0, 100, 50),
+            &[10, 20, 30],
+            &[5, 4, 3, 3],
+        );
+        let heights: Vec<u16> = panes.iter().map(|pane| pane.height).collect();
+        assert_eq!(heights, [10, 20, 17, 3]);
     }
 }

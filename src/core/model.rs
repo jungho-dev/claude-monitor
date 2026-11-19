@@ -64,12 +64,18 @@ pub struct ApiRequestRow {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
+    // 캐시 쓰기 합계 (5분·1시간 분리 값이 없는 출처는 합계만 채움)
     pub cache_creation_tokens: i64,
+    pub cache_creation_5m_tokens: i64,
+    pub cache_creation_1h_tokens: i64,
     // 트리거부터 마지막 블록까지 모델 대기
     pub duration_ms: Option<i64>,
     pub first_byte_ms: Option<i64>,
     pub first_token_ms: Option<i64>,
     pub status: Option<i64>,
+    // 작업 폴더의 마지막 경로 요소 (전체 경로 보관 금지)
+    pub project: String,
+    pub git_branch: String,
 }
 
 // 4. 도구 호출 행 -------------------------------------------------------------
@@ -113,6 +119,33 @@ pub struct HookEventRow {
     pub saved_ms: Option<i64>,
 }
 
+// 6-1. OTLP 신규 이벤트 행 ----------------------------------------------------
+// compaction, subagent_completed, api_error, api_retries_exhausted, tool_decision, permission_mode_changed
+// LiveEvent 의 kind 태그와 겹치지 않도록 필드 이름은 category (저장 열 이름은 kind)
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OtelEventRow {
+    // 세션·순번·이벤트 이름 기반 중복 제거 키
+    pub event_key: String,
+    pub ts: String,
+    pub session_id: String,
+    pub agent_id: String,
+    // compaction, subagent, api_error, api_retries, tool_decision, permission_mode
+    pub category: String,
+    // 도구 이름, 서브에이전트 종류, 모델
+    pub name: String,
+    // 허용 판정, 상태 코드, 압축 트리거, 전환 후 모드
+    pub status: String,
+    pub duration_ms: Option<i64>,
+    // 압축 전 토큰
+    pub tokens_before: Option<i64>,
+    // 압축 후 토큰, 서브에이전트는 마지막 요청 total_tokens
+    pub tokens_after: Option<i64>,
+    // 시도 횟수, 서브에이전트 도구 사용 횟수
+    pub count: Option<i64>,
+    // 오류 종류·모드 전환 등 메타데이터만 (200자 이내, 원문 금지)
+    pub detail: String,
+}
+
 // 7. 세션 행 ------------------------------------------------------------------
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SessionRow {
@@ -129,6 +162,7 @@ pub struct IngestBatch {
     pub tool_calls: Vec<ToolCallRow>,
     pub tool_completions: Vec<ToolCompletionRow>,
     pub hook_events: Vec<HookEventRow>,
+    pub otel_events: Vec<OtelEventRow>,
     pub sessions: Vec<SessionRow>,
 }
 
@@ -139,6 +173,7 @@ pub struct IngestCounts {
     pub tool_calls: u64,
     pub tool_completions: u64,
     pub hook_events: u64,
+    pub otel_events: u64,
     pub sessions: u64,
 }
 
@@ -149,6 +184,7 @@ pub enum LiveEvent {
     Api(ApiRequestRow),
     Tool(ToolCallRow),
     Hook(HookEventRow),
+    Otel(OtelEventRow),
     Notice {
         ts: String,
         level: String,

@@ -3,8 +3,9 @@
 
 use crate::core::model::LiveEvent;
 use crate::inventory::{AgentEntry, DoctorFinding, HookEntry, McpEntry};
+use crate::store::metrics::MetricAttributionRow;
 use crate::store::query::{
-    AgentStatsRow, CacheBreakRow, HookStatRow, ModelStatsRow, ToolLatencyRow,
+    AgentStatsRow, CacheBreakRow, HookStatRow, ModelStatsRow, ProjectStatsRow, ToolLatencyRow,
 };
 use crate::tui::cards::{CARD_COUNT, CardId};
 use crate::tui::format::{short_model, short_tool};
@@ -13,7 +14,7 @@ use crate::tui::views::feed::feed_event_name;
 use std::cmp::Ordering;
 
 // 정렬 가능한 카드
-pub const SORTABLE_CARDS: [CardId; 10] = [
+pub const SORTABLE_CARDS: [CardId; 12] = [
     CardId::EventFeed,
     CardId::ToolTable,
     CardId::HookTable,
@@ -24,6 +25,8 @@ pub const SORTABLE_CARDS: [CardId; 10] = [
     CardId::SettingsMcp,
     CardId::SettingsAgents,
     CardId::SettingsDoctor,
+    CardId::ProjectTable,
+    CardId::AttributionTable,
 ];
 
 // 1. 정렬 상태 ----------------------------------------------------------------
@@ -245,6 +248,39 @@ pub fn sort_spec(card: CardId) -> Option<SortSpec> {
             kinds: &[SortKind::Text, SortKind::Text, SortKind::Text],
             default: SortState::default(),
         },
+        CardId::ProjectTable => SortSpec {
+            kinds: &[
+                SortKind::Text,
+                SortKind::Text,
+                SortKind::Number,
+                SortKind::Number,
+                SortKind::Number,
+                SortKind::Number,
+                SortKind::Number,
+                SortKind::Number,
+                SortKind::Number,
+                SortKind::Number,
+                SortKind::Number,
+            ],
+            default: SortState {
+                column: 9,
+                descending: true,
+            },
+        },
+        CardId::AttributionTable => SortSpec {
+            kinds: &[
+                SortKind::Text,
+                SortKind::Number,
+                SortKind::Number,
+                SortKind::Number,
+                SortKind::Number,
+                SortKind::Number,
+            ],
+            default: SortState {
+                column: 1,
+                descending: true,
+            },
+        },
         _ => return None,
     };
     Some(spec)
@@ -378,6 +414,49 @@ pub fn compare_cache_break_row(
     }
 }
 
+// 프로젝트 열: 프로젝트, 브랜치, 요청, 세션, 입력, 출력, 캐시읽기, 캐시생성 5분, 캐시생성 1시간, 비용, 최근
+pub fn compare_project_row(
+    left: &ProjectStatsRow,
+    right: &ProjectStatsRow,
+    column: usize,
+) -> Ordering {
+    match column {
+        0 => compare_display_text(&left.project, &right.project),
+        1 => compare_display_text(&left.git_branch, &right.git_branch),
+        2 => left.requests.cmp(&right.requests),
+        3 => left.sessions.cmp(&right.sessions),
+        4 => left.input_tokens.cmp(&right.input_tokens),
+        5 => left.output_tokens.cmp(&right.output_tokens),
+        6 => left.cache_read_tokens.cmp(&right.cache_read_tokens),
+        7 => left
+            .cache_creation_5m_tokens
+            .cmp(&right.cache_creation_5m_tokens),
+        8 => left
+            .cache_creation_1h_tokens
+            .cmp(&right.cache_creation_1h_tokens),
+        9 => left.cost_usd_estimate.total_cmp(&right.cost_usd_estimate),
+        10 => left.last_ts.cmp(&right.last_ts),
+        _ => Ordering::Equal,
+    }
+}
+
+// 귀속 열: 이름, 비용, 입력, 출력, 캐시읽기, 캐시생성
+pub fn compare_attribution_row(
+    left: &MetricAttributionRow,
+    right: &MetricAttributionRow,
+    column: usize,
+) -> Ordering {
+    match column {
+        0 => compare_display_text(&left.name, &right.name),
+        1 => left.cost_usd.total_cmp(&right.cost_usd),
+        2 => left.input_tokens.cmp(&right.input_tokens),
+        3 => left.output_tokens.cmp(&right.output_tokens),
+        4 => left.cache_read_tokens.cmp(&right.cache_read_tokens),
+        5 => left.cache_creation_tokens.cmp(&right.cache_creation_tokens),
+        _ => Ordering::Equal,
+    }
+}
+
 // 피드 열: 시각, 종류, 이름, 소요, 에이전트, 입력, 출력, 캐시읽기 (화면에 보이는 값 기준)
 pub fn compare_event_row(left: &LiveEvent, right: &LiveEvent, column: usize) -> Ordering {
     // 종류는 표시 언어와 무관한 고정 순서 (API, 도구, 알림, 훅)
@@ -386,6 +465,7 @@ pub fn compare_event_row(left: &LiveEvent, right: &LiveEvent, column: usize) -> 
         LiveEvent::Tool(_) => 1,
         LiveEvent::Notice { .. } => 2,
         LiveEvent::Hook(_) => 3,
+        LiveEvent::Otel(_) => 4,
     };
     let agent_label = |event: &LiveEvent| match event {
         LiveEvent::Api(row) => row.agent.clone(),
@@ -404,6 +484,7 @@ pub fn compare_event_row(left: &LiveEvent, right: &LiveEvent, column: usize) -> 
         LiveEvent::Api(row) => row.duration_ms,
         LiveEvent::Tool(row) => row.duration_ms,
         LiveEvent::Hook(row) => row.saved_ms.or(row.duration_ms),
+        LiveEvent::Otel(row) => row.duration_ms,
         LiveEvent::Notice { .. } => None,
     };
     match column {

@@ -1,10 +1,12 @@
 //! power/tests.rs
 //! 대기 구간 판정, 절전 유예 전환, 복귀 안내 문구 테스트.
 
-use super::{HintEvent, MonitorTick, PowerState, StandbyGap};
+use super::{HintEvent, MonitorTick, PowerState, StandbyGap, persist_gap};
 use crate::core::config::PowerConfig;
+use crate::core::model::LiveEvent;
 use crate::hooks::standby::evaluate_standby_hint;
 use crate::net::admin::test_support::{build_test_config, build_test_context};
+use crate::store::power::MAX_STORED_GAPS;
 use chrono::Utc;
 use serde_json::Value;
 use std::sync::atomic::Ordering;
@@ -300,4 +302,192 @@ fn standby_hook_is_silent_when_power_disabled() {
     let skipped = evaluate_standby_hint(&ctx, prompt);
     assert!(!skipped.hinted);
     assert_eq!(skipped.body.as_ref(), b"{}");
+}
+
+// 11. 저장 후 복원 ------------------------------------------------------------
+#[test]
+fn persisted_gaps_reload_with_continuous_ids_and_still_hint() {
+    let config = PowerConfig::default();
+    let ctx = build_test_context(build_test_config("standby-reload"));
+    let now_ms = Utc::now().timestamp_millis();
+
+    // 1. 기록과 저장
+    for index in 0..3 {
+        let start_ms = now_ms - (30 - index * 10) * MINUTE_MS;
+        let gap = ctx
+            .power
+            .record_gap(detected_gap(start_ms, start_ms + 5 * MINUTE_MS, true));
+        assert!(persist_gap(&ctx, &gap));
+    }
+
+    // 2. 새 상태에 복원 (serve 재시작)
+    let restarted = PowerState::default();
+    assert_eq!(restarted.restore_gaps(&ctx.store).expect("복원"), 3);
+    assert_eq!(restarted.list_gaps(), ctx.power.list_gaps());
+
+    // 3. 번호 이어감
+    let next = restarted.record_gap(detected_gap(now_ms, now_ms + MINUTE_MS, false));
+    assert_eq!(next.id, 4);
+
+    // 4. 복원 구간 안내 (재시작 전 안내 이력은 유지 안 함)
+    assert!(
+        restarted
+            .build_standby_hint("s1", HintEvent::PromptSubmit, now_ms, &config)
+            .is_some()
+    );
+}
+
+// 12. 복원 상한 ---------------------------------------------------------------
+#[test]
+fn restore_loads_latest_entries_only() {
+    let ctx = build_test_context(build_test_config("standby-restore-cap"));
+    for index in 0..40 {
+        let gap = ctx
+            .power
+            .record_gap(detected_gap(BASE_MS + index, BASE_MS + index + 1, true));
+        assert!(persist_gap(&ctx, &gap));
+    }
+    let restarted = PowerState::default();
+    assert_eq!(restarted.restore_gaps(&ctx.store).expect("복원"), 32);
+    let gaps = restarted.list_gaps();
+    assert_eq!(gaps[0].id, 9);
+    assert_eq!(gaps[31].id, 40);
+    assert_eq!(
+        restarted
+            .record_gap(detected_gap(BASE_MS, BASE_MS + 1, true))
+            .id,
+        41
+    );
+
+    // 빈 저장소는 번호 1부터
+    let empty_ctx = build_test_context(build_test_config("standby-restore-empty"));
+    let fresh = PowerState::default();
+    assert_eq!(fresh.restore_gaps(&empty_ctx.store).expect("빈 복원"), 0);
+    assert_eq!(
+        fresh
+            .record_gap(detected_gap(BASE_MS, BASE_MS + 1, true))
+            .id,
+        1
+    );
+}
+
+// 13. 보관 상한 ---------------------------------------------------------------
+#[test]
+fn store_keeps_newest_rows_only() {
+    let ctx = build_test_context(build_test_config("standby-retention"));
+    let total = MAX_STORED_GAPS + 5;
+    for id in 1..=total {
+        let gap = StandbyGap {
+            id: u64::try_from(id).expect("번호"),
+            start_ms: BASE_MS + id,
+            end_ms: BASE_MS + id + 1,
+            active: true,
+        };
+        ctx.store.save_standby_gap(&gap).expect("저장");
+    }
+    let (rows, oldest): (i64, i64) = ctx
+        .store
+        .with_conn(|conn| {
+            conn.query_row("SELECT COUNT(*), MIN(id) FROM standby_gaps", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+        })
+        .expect("행 수 조회");
+    assert_eq!(rows, MAX_STORED_GAPS);
+    assert_eq!(oldest, 6);
+
+    // 같은 번호 재저장은 덮어쓰기
+    let rewritten = StandbyGap {
+        id: 6,
+        start_ms: 1,
+        end_ms: 2,
+        active: false,
+    };
+    ctx.store.save_standby_gap(&rewritten).expect("재저장");
+    let loaded = ctx.store.load_standby_gaps(1000).expect("조회");
+    assert_eq!(loaded.len(), 1000);
+    assert_eq!(loaded[0], rewritten);
+}
+
+// 14. 저장 실패 ---------------------------------------------------------------
+#[test]
+fn persist_failure_notifies_and_keeps_ledger_working() {
+    let ctx = build_test_context(build_test_config("standby-save-fail"));
+    let mut live_rx = ctx.live_tx.subscribe();
+    ctx.store
+        .with_conn(|conn| conn.execute_batch("DROP TABLE standby_gaps;"))
+        .expect("테이블 삭제");
+
+    // 1. 저장 실패는 알림만
+    let gap = ctx
+        .power
+        .record_gap(detected_gap(BASE_MS, BASE_MS + 10 * MINUTE_MS, true));
+    assert!(!persist_gap(&ctx, &gap));
+    match live_rx.try_recv().expect("알림 수신") {
+        LiveEvent::Notice { level, text, .. } => {
+            assert_eq!(level, "warn");
+            assert!(text.contains("저장 실패"), "{text}");
+        }
+        other => panic!("예상 밖 이벤트: {other:?}"),
+    }
+
+    // 2. 메모리 보관분과 번호는 그대로
+    let next = ctx
+        .power
+        .record_gap(detected_gap(BASE_MS, BASE_MS + MINUTE_MS, true));
+    assert_eq!(next.id, gap.id + 1);
+    assert_eq!(ctx.power.list_gaps().len(), 2);
+
+    // 3. 복원 실패도 오류 반환 (감시 시작은 계속)
+    assert!(PowerState::default().restore_gaps(&ctx.store).is_err());
+}
+
+// 14-1. 시작 복원 실패 뒤 번호 다시 맞춤 --------------------------------------
+#[test]
+fn failed_restore_is_retried_before_ids_overlap_stored_gaps() {
+    let ctx = build_test_context(build_test_config("standby-sync-retry"));
+    ctx.store
+        .save_standby_gap(&StandbyGap {
+            id: 5,
+            start_ms: BASE_MS,
+            end_ms: BASE_MS + MINUTE_MS,
+            active: true,
+        })
+        .expect("이전 실행 구간");
+
+    // 1. 시작 복원 실패 (표 일시 사라짐): 맞춤 실패
+    ctx.store
+        .with_conn(|conn| {
+            conn.execute_batch("ALTER TABLE standby_gaps RENAME TO standby_gaps_off;")
+        })
+        .expect("표 이름 변경");
+    let restarted = PowerState::default();
+    assert!(restarted.restore_gaps(&ctx.store).is_err());
+    assert!(!restarted.sync_gap_ids(&ctx.store));
+
+    // 2. 저장소 복구 뒤 첫 기록 전 맞춤: 번호는 저장된 최대값에서 이어짐
+    ctx.store
+        .with_conn(|conn| {
+            conn.execute_batch("ALTER TABLE standby_gaps_off RENAME TO standby_gaps;")
+        })
+        .expect("표 복구");
+    assert!(restarted.sync_gap_ids(&ctx.store));
+    let next = restarted.record_gap(detected_gap(
+        BASE_MS + 2 * MINUTE_MS,
+        BASE_MS + 3 * MINUTE_MS,
+        true,
+    ));
+    assert_eq!(next.id, 6);
+    assert!(persist_gap(&ctx, &next));
+    let stored = ctx.store.load_standby_gaps(10).expect("조회");
+    assert_eq!(
+        stored.iter().map(|gap| gap.id).collect::<Vec<u64>>(),
+        vec![5, 6]
+    );
+
+    // 3. 맞췄으면 다시 읽지 않음 (표가 없어도 true)
+    ctx.store
+        .with_conn(|conn| conn.execute_batch("DROP TABLE standby_gaps;"))
+        .expect("표 삭제");
+    assert!(restarted.sync_gap_ids(&ctx.store));
 }

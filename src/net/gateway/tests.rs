@@ -2,6 +2,7 @@
 //! 게이트웨이 테스트: SSE 경계 분할 파싱, 계측 본문 기록, 상류 오류 502·시간 초과 504, hop-by-hop 판별.
 
 use super::is_hop_by_hop;
+use super::ratelimit::extract_ratelimit_snapshot;
 use super::run_gateway_server;
 use super::tap::{SseUsageParser, TapBody, start_response_tap};
 use crate::core::context::AppContext;
@@ -12,11 +13,15 @@ use crate::net::admin::test_support::{
 use crate::net::common::{BoxError, ResponseBody};
 use crate::transcript::test_support::TempDirGuard;
 use bytes::Bytes;
+use flate2::Compression;
+use flate2::write::{GzEncoder, ZlibEncoder};
 use http_body_util::BodyExt;
+use hyper::HeaderMap;
 use hyper::body::{Body, Frame};
-use hyper::header::HeaderName;
+use hyper::header::{HeaderName, HeaderValue};
 use rusqlite::params;
 use std::collections::VecDeque;
+use std::io::Write;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -153,7 +158,7 @@ async fn tap_body_records_completed_stream() {
         ..ApiRequestRow::default()
     };
     let mut tap = start_response_tap(Arc::clone(&ctx), row, true);
-    tap.set_response_meta(200, "text/event-stream", false);
+    tap.set_response_meta(200, "text/event-stream", "");
     assert_eq!(
         ctx.counters.gateway_active_streams.load(Ordering::Relaxed),
         1
@@ -207,7 +212,7 @@ async fn tap_body_records_aborted_stream() {
         ..ApiRequestRow::default()
     };
     let mut tap = start_response_tap(Arc::clone(&ctx), row, true);
-    tap.set_response_meta(200, "text/event-stream", false);
+    tap.set_response_meta(200, "text/event-stream", "");
 
     // 첫 조각만 읽고 드롭
     let mut body = TapBody::new(inner, tap);
@@ -376,4 +381,242 @@ fn hop_by_hop_headers_are_filtered() {
     ] {
         assert!(!is_hop_by_hop(&HeaderName::from_static(name)), "{name}");
     }
+}
+
+// 10. 압축 조각 생성 ----------------------------------------------------------
+// 조각마다 sync flush 해서 스트림처럼 나눠 도착하는 압축 바이트 (마지막은 트레일러)
+fn encode_pieces(pieces: &[&str], use_zlib: bool) -> Vec<Bytes> {
+    let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
+    let mut zlib = ZlibEncoder::new(Vec::new(), Compression::default());
+    let mut chunks = Vec::new();
+    for piece in pieces {
+        let sink = if use_zlib {
+            zlib.write_all(piece.as_bytes()).expect("zlib 쓰기");
+            zlib.flush().expect("zlib flush");
+            zlib.get_mut()
+        } else {
+            gzip.write_all(piece.as_bytes()).expect("gzip 쓰기");
+            gzip.flush().expect("gzip flush");
+            gzip.get_mut()
+        };
+        chunks.push(Bytes::from(std::mem::take(sink)));
+    }
+    let trailer = if use_zlib {
+        zlib.finish().expect("zlib 종료")
+    } else {
+        gzip.finish().expect("gzip 종료")
+    };
+    chunks.push(Bytes::from(trailer));
+    chunks
+}
+
+// 11. 계측 본문 통과 ----------------------------------------------------------
+// 조각을 그대로 계측 본문에 흘리고 클라이언트가 받을 바이트 반환
+async fn pass_through_tap(
+    ctx: &Arc<AppContext>,
+    request_key: &str,
+    stream_requested: bool,
+    content_type: &str,
+    content_encoding: &str,
+    chunks: Vec<Bytes>,
+) -> Vec<u8> {
+    let row = ApiRequestRow {
+        source: DataSource::Gateway,
+        request_key: request_key.to_string(),
+        ts: "2026-11-19T00:00:00.000Z".to_string(),
+        agent: "main".to_string(),
+        model: "request-model".to_string(),
+        ..ApiRequestRow::default()
+    };
+    let mut tap = start_response_tap(Arc::clone(ctx), row, stream_requested);
+    tap.set_response_meta(200, content_type, content_encoding);
+    let inner: ResponseBody = ChunkBody {
+        chunks: VecDeque::from(chunks),
+    }
+    .boxed();
+    let collected = TapBody::new(inner, tap).collect().await.expect("본문 수집");
+    collected.to_bytes().to_vec()
+}
+
+// 11-1. 캐시 쓰기 5분·1시간 분리 판독 -----------------------------------------
+#[test]
+fn sse_usage_reads_the_cache_write_split() {
+    let mut parser = super::tap::SseUsageParser::default();
+    parser.feed(b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-test\",\"usage\":{\"input_tokens\":3,\"cache_creation_input_tokens\":900,\"cache_creation\":{\"ephemeral_5m_input_tokens\":600,\"ephemeral_1h_input_tokens\":300}}}}\n\n");
+    assert_eq!(parser.tally.cache_creation_tokens, 900);
+    assert_eq!(parser.tally.cache_creation_5m_tokens, 600);
+    assert_eq!(parser.tally.cache_creation_1h_tokens, 300);
+}
+
+// 12. gzip SSE 사용량 판독 ----------------------------------------------------
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gzip_sse_yields_usage_and_keeps_client_bytes() {
+    let config = build_test_config("gw-gzip-sse");
+    let _cleanup = TempDirGuard(config.data_dir.clone());
+    let ctx = build_test_context(config);
+    let ping_at = SSE_SAMPLE.find("event: ping").expect("ping 위치");
+    let delta_at = SSE_SAMPLE.find("event: message_delta").expect("delta 위치");
+    let chunks = encode_pieces(
+        &[
+            &SSE_SAMPLE[..ping_at],
+            &SSE_SAMPLE[ping_at..delta_at],
+            &SSE_SAMPLE[delta_at..],
+        ],
+        false,
+    );
+    let expected: Vec<u8> = chunks.iter().flat_map(|chunk| chunk.to_vec()).collect();
+
+    let delivered = pass_through_tap(
+        &ctx,
+        "gw:gzip:sse",
+        true,
+        "text/event-stream",
+        "gzip",
+        chunks,
+    )
+    .await;
+    assert_eq!(delivered, expected, "클라이언트 바이트는 압축 원본 그대로");
+
+    let (model, input, output, first_byte, first_token, status) =
+        wait_for_row(&ctx, "gw:gzip:sse").await;
+    assert_eq!(model, "claude-test");
+    assert_eq!((input, output), (12, 42));
+    assert!(first_byte.is_some());
+    assert!(first_token.is_some());
+    assert_eq!(status, Some(200));
+}
+
+// 13. 압축 JSON 사용량 판독 (인코딩별) ----------------------------------------
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compressed_json_usage_by_encoding() {
+    let config = build_test_config("gw-json-enc");
+    let _cleanup = TempDirGuard(config.data_dir.clone());
+    let ctx = build_test_context(config);
+    let json = "{\"id\":\"msg_j\",\"model\":\"claude-json\",\"usage\":{\"input_tokens\":7,\"output_tokens\":9}}";
+    let (head, tail) = json.split_at(json.len() / 2);
+
+    // 1. gzip, deflate: 해제해 사용량 기록, 클라이언트 바이트 동일
+    for (key, encoding, use_zlib) in [
+        ("gw:json:gzip", "gzip", false),
+        ("gw:json:deflate", "deflate", true),
+    ] {
+        let chunks = encode_pieces(&[head, tail], use_zlib);
+        let expected: Vec<u8> = chunks.iter().flat_map(|chunk| chunk.to_vec()).collect();
+        let delivered =
+            pass_through_tap(&ctx, key, false, "application/json", encoding, chunks).await;
+        assert_eq!(delivered, expected, "{encoding}");
+        let (model, input, output, _, _, _) = wait_for_row(&ctx, key).await;
+        assert_eq!(model, "claude-json", "{encoding}");
+        assert_eq!((input, output), (7, 9), "{encoding}");
+    }
+
+    // 2. br: 미지원 인코딩은 사용량 미판독 (요청 모델 유지), 바이트는 그대로
+    let raw = vec![Bytes::from_static(b"\x1b\x20\x00opaque-brotli-bytes")];
+    let delivered = pass_through_tap(
+        &ctx,
+        "gw:json:br",
+        false,
+        "application/json",
+        "br",
+        raw.clone(),
+    )
+    .await;
+    assert_eq!(delivered, raw[0].to_vec());
+    let (model, input, output, _, _, _) = wait_for_row(&ctx, "gw:json:br").await;
+    assert_eq!(model, "request-model");
+    assert_eq!((input, output), (0, 0));
+}
+
+type RatelimitCase<'a> = (&'a str, u16, &'a [(&'a str, &'a str)]);
+
+// 14. rate-limit 스냅샷 기록 --------------------------------------------------
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tap_records_ratelimit_snapshots() {
+    let config = build_test_config("gw-ratelimit");
+    let _cleanup = TempDirGuard(config.data_dir.clone());
+    let ctx = build_test_context(config);
+    let cases: [RatelimitCase; 3] = [
+        (
+            "gw:rl:429",
+            429,
+            &[
+                ("retry-after", "5"),
+                ("anthropic-ratelimit-unified-status", "rejected"),
+                ("x-api-key", "secret-key"),
+            ],
+        ),
+        ("gw:rl:429-bare", 429, &[]),
+        (
+            "gw:rl:200",
+            200,
+            &[
+                ("anthropic-ratelimit-requests-remaining", "10"),
+                ("anthropic-ratelimit-requests-reset", "2026-11-19T00:01:00Z"),
+            ],
+        ),
+    ];
+    for (key, status, pairs) in cases {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.append(
+                HeaderName::from_bytes(name.as_bytes()).expect("헤더 이름"),
+                HeaderValue::from_str(value).expect("헤더 값"),
+            );
+        }
+        let row = ApiRequestRow {
+            source: DataSource::Gateway,
+            request_key: key.to_string(),
+            ts: "2026-11-19T00:00:00.000Z".to_string(),
+            agent: "main".to_string(),
+            model: "request-model".to_string(),
+            ..ApiRequestRow::default()
+        };
+        let mut tap = start_response_tap(Arc::clone(&ctx), row, false);
+        tap.set_response_meta(status, "application/json", "");
+        tap.set_ratelimit_snapshot(extract_ratelimit_snapshot(&headers, status));
+        let inner: ResponseBody = ChunkBody {
+            chunks: VecDeque::from([Bytes::from_static(b"{}")]),
+        }
+        .boxed();
+        TapBody::new(inner, tap).collect().await.expect("본문 수집");
+        wait_for_row(&ctx, key).await;
+    }
+
+    // 저장은 비동기이므로 3건이 모일 때까지 대기
+    let mut snapshots = Vec::new();
+    for _ in 0..100 {
+        snapshots = ctx
+            .store
+            .ratelimit_snapshots_since("", 10)
+            .expect("스냅샷 조회");
+        if snapshots.len() >= 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    assert_eq!(snapshots.len(), 3);
+    let with_headers = snapshots
+        .iter()
+        .find(|snapshot| snapshot.retry_after_secs == Some(5))
+        .expect("retry-after 429 행");
+    assert_eq!(with_headers.status, Some(429));
+    assert_eq!(with_headers.model, "request-model");
+    assert!(
+        with_headers
+            .extra_json
+            .contains("anthropic-ratelimit-unified-status")
+    );
+    assert!(!with_headers.extra_json.contains("secret"));
+    let bare = snapshots
+        .iter()
+        .find(|snapshot| snapshot.status == Some(429) && snapshot.retry_after_secs.is_none())
+        .expect("헤더 없는 429 행");
+    assert_eq!(bare.requests_remaining, None);
+    assert_eq!(bare.extra_json, "{}");
+    let ok = snapshots
+        .iter()
+        .find(|snapshot| snapshot.status == Some(200))
+        .expect("200 행");
+    assert_eq!(ok.requests_remaining, Some(10));
+    assert_eq!(ok.requests_reset.as_deref(), Some("2026-11-19T00:01:00Z"));
 }

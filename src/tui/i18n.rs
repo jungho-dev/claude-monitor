@@ -109,7 +109,7 @@ define_messages! {
     HelpTruncated => ("… (enlarge window to show all)", "… (창을 키우면 전체 표시)"),
     HelpSectionKeyboard => ("Keyboard", "키보드"),
     HelpSectionMouse => ("Mouse", "마우스"),
-    HelpSwitchTab => ("Switch tab (Overview to Report)", "탭 이동 (개요 ~ 리포트 일곱 탭)"),
+    HelpSwitchTab => ("Switch tab (Overview to Projects)", "탭 이동 (개요 ~ 프로젝트 여덟 탭)"),
     HelpMoveRows => ("Move rows / scroll focused card", "선택 카드의 행 이동·스크롤"),
     HelpWindow => ("Cycle window (1h, 24h, 7d)", "집계 구간 전환 (1시간, 24시간, 7일)"),
     HelpSort => ("Next sort column / flip order, reset", "다음 정렬 열 / 방향 전환 → 기본 순환"),
@@ -369,6 +369,95 @@ define_messages! {
     ToastNeedServe => ("Available after running serve", "serve 실행 후 사용 가능"),
     AdminReindex => ("Reindex", "재색인"),
     AdminGenerateReport => ("Generate report", "리포트 생성"),
+
+    // 프로젝트 탭
+    TabProjects => ("Projects", "프로젝트"),
+    ColProject => ("Project", "프로젝트"),
+    ColBranch => ("Branch", "브랜치"),
+    ColCacheWrite5m => ("Cache wr 5m", "캐시생성 5m"),
+    ColCacheWrite1h => ("Cache wr 1h", "캐시생성 1h"),
+    ColName => ("Name", "이름"),
+    ColCost => ("Cost", "비용"),
+    TitleProjectStatsPending => ("Project stats (est.)", "프로젝트 통계 (추정)"),
+    TitleProjectDetail => ("Project detail", "프로젝트 상세"),
+    NoProjectSelected => ("No project selected", "선택한 프로젝트 없음"),
+    ProjectCounts => ("Reqs / sess", "요청 / 세션"),
+    ProjectCache => ("Cache rd / wr 5m / 1h", "캐시 읽기/생성 5m/1h"),
+    TitleAttributionPending => ("Cost attribution (OTel)", "비용 귀속 (OTel)"),
+    DimensionSkill => ("Skill", "스킬"),
+    DimensionMcpServer => ("MCP server", "MCP 서버"),
+    DimensionPlugin => ("Plugin", "플러그인"),
+    DimensionAgent => ("Agent", "에이전트"),
+    DimensionModel => ("Model", "모델"),
+    DimensionQuerySource => ("Query source", "호출 출처"),
+    AttributionNoMetrics => ("No OTel metrics in this window", "이 구간에 OTel 지표 없음"),
+    AttributionEnableHint => ("Set OTEL_METRICS_EXPORTER=otlp to collect", "OTEL_METRICS_EXPORTER=otlp 설정 시 수집"),
+    AttributionNoDimension => ("No data for this dimension", "이 차원의 데이터 없음"),
+    AttributionDimensionHint => ("Press d to change dimension", "d 키로 차원 변경"),
+    HintDimension => ("d Dimension", "d 차원"),
+    HelpDimension => ("Cycle attribution dimension (Projects tab)", "귀속 차원 전환 (프로젝트 탭)"),
+    // 피드: OTLP 신규 이벤트 태그(4칸 이하)·상세 제목·항목·낱말
+    TagSubagent => ("Sub ", "서브"),
+    TagCompaction => ("Comp", "압축"),
+    TagApiError => ("Err ", "오류"),
+    TagDecision => ("Perm", "권한"),
+    TagMode => ("Mode", "모드"),
+    FeedFailed => ("failed", "실패"),
+    DetailCompaction => ("Compaction", "컴팩션"),
+    DetailSubagent => ("Subagent", "서브에이전트"),
+    DetailApiError => ("API error", "API 오류"),
+    DetailApiRetries => ("API retries", "API 재시도"),
+    DetailDecision => ("Tool decision", "도구 권한 결정"),
+    DetailPermMode => ("Permission mode", "권한 모드 변경"),
+    DetailTrigger => ("Trigger", "트리거"),
+    DetailBefore => ("Before", "직전 토큰"),
+    DetailAfter => ("After", "이후 토큰"),
+    DetailType => ("Type", "유형"),
+    DetailMode => ("Mode", "모드"),
+    DetailStarted => ("Started", "시작"),
+    DetailEnded => ("Ended", "종료"),
+    DetailTokens => ("Tokens", "토큰"),
+    DetailToolUses => ("Tools", "도구 호출"),
+    DetailStatusCode => ("Status", "상태"),
+    DetailAttempt => ("Attempt", "시도"),
+    DetailRetryTime => ("Retry time", "대기 시간"),
+    DetailDecisionValue => ("Decision", "결정"),
+    DetailSource => ("Source", "출처"),
+    DetailFrom => ("From", "이전"),
+    DetailTo => ("To", "이후"),
+
+    // 리포트 탭 주간 보기
+    ReportViewDaily => ("Daily", "일간"),
+    ReportViewWeekly => ("Weekly", "주간"),
+    WeekThis => ("this week", "이번 주"),
+    WeekLast => ("last week", "지난주"),
+    HintReportView => ("v Daily/Weekly", "v 일간·주간"),
+    HintReportWeek => ("←→ Week", "←→ 주"),
+    HelpReportView => ("Daily / weekly report (← → then moves by week)", "일간·주간 리포트 전환 (주간에서 ← → 는 주 이동)"),
+
+    // 한도 카드 (개요 탭), 캐시 타이머 카드 (모델 탭)
+    TitleLimits => ("Limits", "한도"),
+    TitleCacheTimer => ("Cache timer", "캐시 타이머"),
+    LimitsLabelFiveHour => ("5h", "5h"),
+    LimitsLabelSevenDay => ("7d", "7d"),
+    LimitsLabelContext => ("ctx", "ctx"),
+    LimitsLabelApiKey => ("API", "API"),
+    LimitsPaceAhead => ("ahead", "빠름"),
+    LimitsPaceOn => ("on pace", "적정"),
+    LimitsPaceBehind => ("behind", "느림"),
+    LimitsOfficial => ("official", "공식"),
+    LimitsEstimate => ("estimate", "추정"),
+    LimitsTokensUnit => ("tok", "tok"),
+    LimitsRequestsShort => ("req", "req"),
+    LimitsEmpty => ("No official limit data", "공식 한도 값 없음"),
+    LimitsEmptyHint => ("Set statusLine to `claude-monitor statusline`", "statusLine 에 `claude-monitor statusline` 설정"),
+    LimitsResetDue => ("reset due", "리셋 예정"),
+    CacheWarm => ("warm", "유지"),
+    CacheCold => ("cold", "만료"),
+    CacheUnknown => ("not observed", "관측 없음"),
+    CacheHit => ("hit", "적중"),
+    CacheNoMiss => ("no miss recorded", "기록된 미스 없음"),
+    CacheEmpty => ("No cache data", "캐시 값 없음"),
 }
 
 // 3. 값이 들어가는 문구 -------------------------------------------------------
@@ -613,6 +702,37 @@ pub fn context_summary_hook(lang: Lang, hook: usize, denial: usize, rewrite: usi
     }
 }
 
+// 도구 호출 건수 (서브에이전트 이름 칸)
+pub fn tools_count_text(lang: Lang, count: i64) -> String {
+    match lang {
+        Lang::En => format!("{count} tools"),
+        Lang::Ko => format!("도구 {count}"),
+    }
+}
+
+// API 오류 시도 번호 (이름 칸)
+pub fn attempt_text(lang: Lang, attempt: i64) -> String {
+    match lang {
+        Lang::En => format!("attempt {attempt}"),
+        Lang::Ko => format!("{attempt}회차"),
+    }
+}
+
+// 재시도 소진 (이름 칸, tries 는 표시된 횟수 또는 -)
+pub fn retries_exhausted_text(lang: Lang, tries: &str) -> String {
+    match lang {
+        Lang::En => format!("retries exhausted · {tries} tries"),
+        Lang::Ko => format!("재시도 소진 · {tries}회"),
+    }
+}
+
+pub fn weekly_report_title(lang: Lang, week_key: &str) -> String {
+    match lang {
+        Lang::En => format!("Weekly report · {week_key}"),
+        Lang::Ko => format!("주간 리포트 · {week_key}"),
+    }
+}
+
 // 훅 판정 문자열 -> 라벨 (모르는 값은 -)
 pub fn outcome_label(lang: Lang, outcome: &str) -> &'static str {
     match (lang, outcome) {
@@ -665,6 +785,7 @@ pub fn admin_toast(
     let label = match action {
         AdminAction::Reindex => text(lang, Msg::AdminReindex),
         AdminAction::GenerateReport(_) => text(lang, Msg::AdminGenerateReport),
+        AdminAction::GenerateWeeklyReport(_) => text(lang, Msg::AdminGenerateReport),
     };
     match (lang, outcome) {
         (_, AdminOutcome::NoToken) => (
@@ -750,24 +871,47 @@ pub fn state_save_failed(lang: Lang, error: &str) -> String {
     }
 }
 
+pub fn schema_upgrade_failed(lang: Lang, error: &str) -> String {
+    match lang {
+        Lang::En => format!("DB schema upgrade failed: {error}"),
+        Lang::Ko => format!("DB 스키마 갱신 실패: {error}"),
+    }
+}
+
+pub fn project_table_title(lang: Lang, count: usize, cost: f64) -> String {
+    match lang {
+        Lang::En => format!("Projects · {count} · est. (API rates) · total ${cost:.2}"),
+        Lang::Ko => format!("프로젝트 · {count}개 · 추정 (API 단가) · 합계 ${cost:.2}"),
+    }
+}
+
+pub fn attribution_title(lang: Lang, dimension: &str, count: usize) -> String {
+    match lang {
+        Lang::En => format!("Attribution · by {dimension} · {count} names · OTel"),
+        Lang::Ko => format!("귀속 · {dimension} 기준 · {count}개 · OTel"),
+    }
+}
+
 // 7. 도움말 줄 ----------------------------------------------------------------
 // (키, 뜻) 쌍, 뜻이 빈 줄은 구역 제목, 키 글자는 번역하지 않음
 pub fn help_rows(lang: Lang) -> Vec<(&'static str, &'static str)> {
     let words = |msg: Msg| text(lang, msg);
     vec![
         (words(Msg::HelpSectionKeyboard), ""),
-        ("1-7, Tab, Shift-Tab", words(Msg::HelpSwitchTab)),
+        ("1-8, Tab, Shift-Tab", words(Msg::HelpSwitchTab)),
         ("↑ ↓ PgUp PgDn Home End", words(Msg::HelpMoveRows)),
         ("w", words(Msg::HelpWindow)),
         ("s / S", words(Msg::HelpSort)),
         ("←  →", words(Msg::HelpReportDate)),
         ("g", words(Msg::HelpReportGenerate)),
+        ("v", words(Msg::HelpReportView)),
         ("r", words(Msg::HelpRefresh)),
         ("i", words(Msg::HelpReindex)),
         ("t", words(Msg::HelpPin)),
         (words(Msg::HelpKeyShiftArrows), words(Msg::HelpMoveCard)),
         ("l", words(Msg::HelpResetLayout)),
         ("L", words(Msg::HelpLanguage)),
+        ("d", words(Msg::HelpDimension)),
         ("?", words(Msg::HelpToggleHelp)),
         ("q, Esc, Ctrl+C", words(Msg::HelpQuit)),
         (words(Msg::HelpSectionMouse), ""),
@@ -779,6 +923,65 @@ pub fn help_rows(lang: Lang) -> Vec<(&'static str, &'static str)> {
         (words(Msg::HelpKeyLongPress), words(Msg::HelpLongPress)),
         (words(Msg::HelpKeyScrollbar), words(Msg::HelpScrollbar)),
     ]
+}
+
+// 한도·캐시 카드 문구 (카운트다운·시각·숫자는 데이터라 번역하지 않음)
+pub fn limits_hint(lang: Lang, source: &str, age: &str, stale: bool) -> String {
+    match (lang, stale) {
+        (Lang::En, false) => format!("{source} · {age} ago"),
+        (Lang::En, true) => format!("{source} · stale {age}"),
+        (Lang::Ko, false) => format!("{source} · {age} 전"),
+        (Lang::Ko, true) => format!("{source} · 지연 {age}"),
+    }
+}
+
+pub fn limits_reset_in(lang: Lang, countdown: &str) -> String {
+    match lang {
+        Lang::En => format!("in {countdown}"),
+        Lang::Ko => format!("{countdown} 후"),
+    }
+}
+
+pub fn limits_compactions(lang: Lang, count: u64) -> String {
+    match lang {
+        Lang::En => format!("compact {count}"),
+        Lang::Ko => format!("압축 {count}회"),
+    }
+}
+
+pub fn cache_left(lang: Lang, countdown: &str) -> String {
+    match lang {
+        Lang::En => format!("{countdown} left"),
+        Lang::Ko => format!("{countdown} 남음"),
+    }
+}
+
+pub fn cache_expired_ago(lang: Lang, countdown: &str) -> String {
+    match lang {
+        Lang::En => format!("expired {countdown} ago"),
+        Lang::Ko => format!("{countdown} 전 만료"),
+    }
+}
+
+pub fn cache_misses_value(lang: Lang, misses: i64, requests: i64) -> String {
+    match lang {
+        Lang::En => format!("misses {misses}/{requests}"),
+        Lang::Ko => format!("미스 {misses}/{requests}"),
+    }
+}
+
+pub fn cache_last_miss(lang: Lang, clock: &str, ago: &str) -> String {
+    match lang {
+        Lang::En => format!("last miss {clock} ({ago} ago)"),
+        Lang::Ko => format!("최근 미스 {clock} ({ago} 전)"),
+    }
+}
+
+pub fn cache_miss_cause(lang: Lang, cause: &str) -> String {
+    match lang {
+        Lang::En => format!("cause {cause}"),
+        Lang::Ko => format!("원인 {cause}"),
+    }
 }
 
 #[cfg(test)]
@@ -866,6 +1069,8 @@ mod tests {
                 failure_text(lang, &Failure::DbOpenFailed),
                 failure_text(lang, &Failure::DbMissing),
                 failure_text(lang, &Failure::Internal("boom".to_string())),
+                project_table_title(lang, 2, 1.0),
+                attribution_title(lang, text(lang, Msg::DimensionSkill), 3),
             ]
         };
         let english = render(Lang::En);
@@ -938,7 +1143,7 @@ mod tests {
                 "{lang:?}"
             );
             assert!(
-                rows.iter().any(|(keys, _)| *keys == "1-7, Tab, Shift-Tab"),
+                rows.iter().any(|(keys, _)| *keys == "1-8, Tab, Shift-Tab"),
                 "{lang:?}"
             );
         }

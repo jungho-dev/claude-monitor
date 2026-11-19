@@ -300,6 +300,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml",
+ "tower-service",
  "unicode-width",
 ]
 

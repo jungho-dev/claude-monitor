@@ -51,6 +51,9 @@ pub const COLOR_HOOK: Color = Color::Indexed(215);
 pub const COLOR_NOTICE: Color = Color::Indexed(250);
 pub const CHART_REQUESTS: Color = Color::Indexed(74);
 pub const CHART_TOKENS: Color = Color::Indexed(147);
+// OTLP 신규 이벤트 종류 (서브에이전트, 컴팩션): 포커스·강조·상태색과 겹치지 않는 자기 색
+pub const COLOR_SUBAGENT: Color = Color::Indexed(108);
+pub const COLOR_COMPACTION: Color = Color::Indexed(138);
 
 // 5. 스크롤바·분할선 색 -------------------------------------------------------
 // 트랙: 평소·포커스, 호버·드래그 중
@@ -156,6 +159,33 @@ mod tests {
             assert_ne!(*color, COLOR_CRIT);
             assert!(!kinds[..index].contains(color), "{color:?}");
         }
+    }
+
+    #[test]
+    fn otlp_event_kind_colors_are_unique_and_never_reuse_focus_accent_or_state_colors() {
+        let existing = [
+            COLOR_API,
+            COLOR_TOOL,
+            COLOR_HOOK,
+            COLOR_NOTICE,
+            CHART_REQUESTS,
+            CHART_TOKENS,
+        ];
+        for color in [COLOR_SUBAGENT, COLOR_COMPACTION] {
+            for reserved in [
+                FG_ACCENT,
+                BORDER_FOCUS,
+                BORDER_HOVER,
+                COLOR_OK,
+                COLOR_WARN,
+                COLOR_CRIT,
+                PIN_BG,
+            ] {
+                assert_ne!(color, reserved);
+            }
+            assert!(!existing.contains(&color), "{color:?}");
+        }
+        assert_ne!(COLOR_SUBAGENT, COLOR_COMPACTION);
     }
 
     #[test]

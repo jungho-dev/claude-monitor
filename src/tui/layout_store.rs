@@ -2,13 +2,15 @@
 //! TUI 상태 파일(tui.toml): 표시 언어·카드 순서·경계 비율·표 열 폭 저장과 복원, 임시 파일 후 이름 바꾸기 방식의 원자적 쓰기.
 
 use crate::core::config::TUI_STATE_FILE_NAME;
+use crate::store::metrics::AttributionDimension;
 use crate::tui::cards::{CARD_COUNT, CardId, MAX_COLUMN_WIDTH, MAX_TABLE_COLUMNS};
 use crate::tui::i18n::{self, Lang, StateIssue};
 use crate::tui::layout::{CardLayout, SplitGroup};
-use crate::tui::state::{AppState, ToastLevel};
+use crate::tui::state::{ATTRIBUTION_DIMENSIONS, AppState, ToastLevel};
 use crate::tui::state_writer::StateSave;
 use crate::tui::views::feed::FEED_COLUMNS;
 use crate::tui::views::models::{AGENT_COLUMNS, CACHE_BREAK_COLUMNS, MODEL_COLUMNS};
+use crate::tui::views::projects::{ATTRIBUTION_COLUMNS, PROJECT_COLUMNS};
 use crate::tui::views::settings::{
     SETTINGS_AGENT_COLUMNS, SETTINGS_DOCTOR_COLUMNS, SETTINGS_HOOK_COLUMNS, SETTINGS_MCP_COLUMNS,
 };
@@ -27,7 +29,7 @@ const TEMP_SUFFIX: &str = ".tmp";
 const MAX_LINK_DEPTH: usize = 16;
 const STALE_TEMP_AGE: Duration = Duration::from_secs(600);
 // 열 폭을 파일에 쓰는 표 카드 (열 폭 0 = 자동 폭)
-const TABLE_CARDS: [CardId; 10] = [
+const TABLE_CARDS: [CardId; 12] = [
     CardId::EventFeed,
     CardId::ToolTable,
     CardId::HookTable,
@@ -38,15 +40,20 @@ const TABLE_CARDS: [CardId; 10] = [
     CardId::SettingsMcp,
     CardId::SettingsAgents,
     CardId::SettingsDoctor,
+    CardId::ProjectTable,
+    CardId::AttributionTable,
 ];
 
 // 1. 파일 형식 ----------------------------------------------------------------
-// 언어는 최상위 문자열 (알 수 없는 값만 무시), 그룹·카드는 고정 이름 키, 값은 정수 배열 (항목마다 길이·범위를 검사해 맞지 않는 항목만 무시)
+// 언어·귀속 차원은 최상위 문자열 (알 수 없는 값만 무시, 차원은 기본값이면 기록하지 않음)
+// 그룹·카드는 고정 이름 키, 값은 정수 배열 (항목마다 길이·범위를 검사해 맞지 않는 항목만 무시)
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct LayoutFile {
     version: i64,
     #[serde(default)]
     language: Option<toml::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attribution_dimension: Option<toml::Value>,
     #[serde(default)]
     orders: BTreeMap<String, Vec<i64>>,
     #[serde(default)]
@@ -75,6 +82,8 @@ fn table_card_columns(card: CardId) -> Option<(&'static str, usize)> {
         CardId::SettingsMcp => Some(("settings_mcp", SETTINGS_MCP_COLUMNS.len())),
         CardId::SettingsAgents => Some(("settings_agents", SETTINGS_AGENT_COLUMNS.len())),
         CardId::SettingsDoctor => Some(("settings_doctor", SETTINGS_DOCTOR_COLUMNS.len())),
+        CardId::ProjectTable => Some(("project_table", PROJECT_COLUMNS.len())),
+        CardId::AttributionTable => Some(("attribution_table", ATTRIBUTION_COLUMNS.len())),
         _ => None,
     }
 }
@@ -85,12 +94,16 @@ fn build_layout_file(
     layout: &CardLayout,
     column_widths: &[[Option<u16>; MAX_TABLE_COLUMNS]; CARD_COUNT],
     lang: Lang,
+    dimension: AttributionDimension,
 ) -> LayoutFile {
     let mut file = LayoutFile {
         version: LAYOUT_VERSION,
         language: Some(toml::Value::String(lang.code().to_string())),
         ..LayoutFile::default()
     };
+    if dimension != ATTRIBUTION_DIMENSIONS[0] {
+        file.attribution_dimension = toml::Value::try_from(dimension).ok();
+    }
     for group in SplitGroup::ALL {
         if let Some(order) = layout.custom_order(group) {
             let values = order.iter().map(|card| i64::from(*card)).collect();
@@ -330,6 +343,17 @@ impl AppState {
                     Some(Some(lang)) => self.lang = lang,
                     Some(None) => skipped += 1,
                 }
+                // 차원은 탭이 순환하는 목록 안의 값만 복원
+                match file.attribution_dimension.as_ref().map(|value| {
+                    value
+                        .as_str()
+                        .and_then(AttributionDimension::parse)
+                        .filter(|dimension| ATTRIBUTION_DIMENSIONS.contains(dimension))
+                }) {
+                    None => {}
+                    Some(Some(dimension)) => self.attribution_dimension = dimension,
+                    Some(None) => skipped += 1,
+                }
                 if skipped > 0 {
                     self.show_toast(
                         &i18n::state_entries_skipped(self.lang, TUI_STATE_FILE_NAME, skipped),
@@ -343,7 +367,12 @@ impl AppState {
     // 7. 확정 때마다 저장 요청 만들기 -----------------------------------------
     // 확정 이벤트 한 번에 파일 내용 전체를 만들어 저장 요청 하나로 돌려줌 (파일 쓰기는 입력 스레드가 아니라 저장 스레드가 함, 실패는 UiMessage)
     pub fn build_state_save(&self) -> Result<StateSave, String> {
-        let file = build_layout_file(&self.card_layout, &self.column_widths, self.lang);
+        let file = build_layout_file(
+            &self.card_layout,
+            &self.column_widths,
+            self.lang,
+            self.attribution_dimension,
+        );
         toml::to_string(&file)
             .map(|text| StateSave {
                 path: self.state_file.clone(),
@@ -542,6 +571,51 @@ mod tests {
         }
     }
 
+    // 카드가 늘기 전(3칸) 배치 파일: 저장한 순서·비율을 잃지 않고 새 카드를 맨 뒤 칸에 붙여 이어받고, 다음 저장은 4칸 형식
+    #[test]
+    fn a_three_card_file_from_before_the_new_cards_migrates_without_a_skip_toast() {
+        let dir = TempDir::new();
+        let body = "version = 1\n\
+            [orders]\n\
+            models_rows = [2, 0, 1]\n\
+            overview_trend_cols = [1, 0, 2]\n\
+            [ratios]\n\
+            models_rows = [2000, 6000]\n\
+            overview_trend_cols = [3000, 6500]\n";
+        fs::write(dir.0.join(TUI_STATE_FILE_NAME), body).unwrap();
+        let mut state = state_in(&dir);
+        state.load_tui_state();
+
+        assert!(state.toast.is_none(), "{:?}", state.toast);
+        let layout = &state.card_layout;
+        assert_eq!(
+            layout.custom_order(SplitGroup::ModelsRows),
+            Some(vec![2, 0, 1, 3])
+        );
+        assert_eq!(
+            layout.custom_order(SplitGroup::OverviewTrendCols),
+            Some(vec![1, 0, 2, 3])
+        );
+        assert_eq!(
+            layout.custom_ratios(SplitGroup::ModelsRows),
+            Some(vec![2_000, 6_000, 10_000])
+        );
+        assert_eq!(
+            layout.custom_ratios(SplitGroup::OverviewTrendCols),
+            Some(vec![3_000, 6_500, 10_000])
+        );
+
+        // 다음 저장은 4칸 형식으로 올려 쓰고, 다시 읽어도 같음
+        state.save_tui_state();
+        let text = fs::read_to_string(&state.state_file).unwrap();
+        assert!(text.contains("models_rows = [2, 0, 1, 3]"), "{text}");
+        assert!(text.contains("models_rows = [2000, 6000, 10000]"), "{text}");
+        let mut reloaded = state_in(&dir);
+        reloaded.load_tui_state();
+        assert!(reloaded.toast.is_none(), "{:?}", reloaded.toast);
+        assert_eq!(reloaded.card_layout, state.card_layout);
+    }
+
     #[test]
     fn mismatched_entries_are_skipped_while_valid_entries_still_apply() {
         let dir = TempDir::new();
@@ -641,6 +715,51 @@ mod tests {
         loaded.load_tui_state();
         assert_eq!(loaded.lang, Lang::Ko);
         assert!(loaded.toast.is_none(), "{:?}", loaded.toast);
+    }
+
+    #[test]
+    fn attribution_dimension_is_saved_only_when_changed_and_restored_on_load() {
+        // 1. 기본 차원(스킬)은 기록하지 않음
+        let dir = TempDir::new();
+        let mut saved = fresh_state_in(&dir);
+        saved.save_tui_state();
+        let text = fs::read_to_string(dir.0.join(TUI_STATE_FILE_NAME)).unwrap();
+        assert!(!text.contains("attribution_dimension"), "{text}");
+
+        // 2. d 키로 바꾼 차원은 저장 요청이 나가고 다음 시작에 복원
+        saved.tab = crate::tui::state::ActiveTab::Projects;
+        let command = saved.handle_key_event(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('d'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(command, crate::tui::state::UiCommand::SaveState);
+        assert_eq!(saved.attribution_dimension, ATTRIBUTION_DIMENSIONS[1]);
+        saved.save_tui_state();
+        let text = fs::read_to_string(dir.0.join(TUI_STATE_FILE_NAME)).unwrap();
+        assert!(
+            text.contains("attribution_dimension = \"mcp_server\""),
+            "{text}"
+        );
+        let mut loaded = fresh_state_in(&dir);
+        loaded.load_tui_state();
+        assert_eq!(loaded.attribution_dimension, ATTRIBUTION_DIMENSIONS[1]);
+        assert!(loaded.toast.is_none(), "{:?}", loaded.toast);
+
+        // 3. 모르는 값과 탭 목록 밖 차원(query_source)은 무시하고 알림 한 번
+        for value in ["\"bogus\"", "\"query_source\"", "3"] {
+            fs::write(
+                dir.0.join(TUI_STATE_FILE_NAME),
+                format!("version = 1\nattribution_dimension = {value}\n"),
+            )
+            .unwrap();
+            let mut ignored = fresh_state_in(&dir);
+            ignored.load_tui_state();
+            assert_eq!(
+                ignored.attribution_dimension, ATTRIBUTION_DIMENSIONS[0],
+                "{value}"
+            );
+            assert!(ignored.toast.is_some(), "{value}");
+        }
     }
 
     #[test]
@@ -1276,5 +1395,50 @@ mod tests {
         let mut stored = TABLE_CARDS.to_vec();
         stored.sort_by_key(|card| *card as usize);
         assert_eq!(stored, reset_targets);
+    }
+
+    #[test]
+    fn project_cards_round_trip_widths_and_order_under_their_stable_keys() {
+        let dir = TempDir::new();
+        let mut saved = state_in(&dir);
+        saved.column_widths[CardId::ProjectTable as usize][1] = Some(24);
+        saved.column_widths[CardId::AttributionTable as usize][0] = Some(30);
+        saved
+            .card_layout
+            .set_order(SplitGroup::ProjectsRows, [2, 0, 1, 3, 4, 5]);
+        saved.save_tui_state();
+        assert!(saved.toast.is_none(), "저장 실패 알림: {:?}", saved.toast);
+
+        let text = fs::read_to_string(dir.0.join(TUI_STATE_FILE_NAME)).unwrap();
+        for entry in [
+            "project_table = [0, 24, 0, 0, 0, 0, 0, 0, 0, 0, 0]",
+            "attribution_table = [30, 0, 0, 0, 0, 0]",
+            "projects_rows = [2, 0, 1]",
+        ] {
+            assert!(text.contains(entry), "{entry}: {text}");
+        }
+
+        let mut loaded = state_in(&dir);
+        loaded.load_tui_state();
+        assert!(loaded.toast.is_none(), "복원 알림: {:?}", loaded.toast);
+        assert_eq!(loaded.column_widths, saved.column_widths);
+        assert_eq!(loaded.card_layout, saved.card_layout);
+
+        // 길이·범위가 맞지 않는 항목은 항목째 무시
+        let body = "version = 1\n\
+            [column_widths]\n\
+            project_table = [0, 0, 0]\n\
+            attribution_table = [0, 513, 0, 0, 0, 0]\n";
+        fs::write(dir.0.join(TUI_STATE_FILE_NAME), body).unwrap();
+        let mut skipped = state_in(&dir);
+        skipped.load_tui_state();
+        for card in [CardId::ProjectTable, CardId::AttributionTable] {
+            assert!(
+                skipped.column_widths[card as usize]
+                    .iter()
+                    .all(Option::is_none),
+                "{card:?}"
+            );
+        }
     }
 }

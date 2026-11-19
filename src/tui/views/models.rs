@@ -1,6 +1,7 @@
 //! tui/views/models.rs
 //! 모델·에이전트 탭: 모델별·에이전트 종류별 통계 표, 선택 행 상세 카드, 캐시 붕괴 후보 표.
 
+use crate::store::limits::LimitSnapshot;
 use crate::store::query::{AgentStatsRow, ModelStatsRow};
 use crate::tui::cards::CardId;
 use crate::tui::format::{
@@ -12,12 +13,17 @@ use crate::tui::sort::{compare_agent_row, compare_cache_break_row, compare_model
 use crate::tui::state::{AppState, Panel};
 use crate::tui::theme;
 use crate::tui::views::common::{
-    CardTable, ColumnFit, ColumnSpec, TableCell, TextCard, panel_message, render_card_table,
-    render_db_gate, render_notice_card, render_text_card,
+    CardTable, ColumnFit, ColumnSpec, PanelNote, TableCell, TextCard, clip_spans_to_width,
+    interactive_card, panel_message, render_card_table, render_db_gate, render_notice_card,
+    render_text_card,
 };
+use crate::tui::views::overview::{LIMIT_STALE_SECS, format_age, format_countdown};
+use chrono::{DateTime, Local};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::{Padding, Paragraph};
 
 // 상세 항목 이름 칸 폭
 const DETAIL_LABEL_WIDTH: usize = 23;
@@ -28,6 +34,18 @@ const AGENT_DETAIL_LINES: usize = 7;
 const DETAIL_BORDER_ROWS: u16 = 2;
 const MODEL_DETAIL_HEIGHT: u16 = MODEL_DETAIL_LINES as u16 + DETAIL_BORDER_ROWS;
 const AGENT_DETAIL_HEIGHT: u16 = AGENT_DETAIL_LINES as u16 + DETAIL_BORDER_ROWS;
+
+// 캐시 타이머 카드: 줄 수는 남은 시간·적중·최근 미스 셋, 본문이 이 높이 이상일 때만 기본 배치에 포함, 카드 최소 높이
+const CACHE_CARD_HEIGHT: u16 = 3 + DETAIL_BORDER_ROWS;
+const CACHE_CARD_MIN_BODY: u16 = 22;
+const CACHE_CARD_MIN_ROWS: u16 = 3;
+// 모델 탭 카드 그룹에서 캐시 타이머 카드의 번호 (낮은 화면에서 숨기는 카드)
+const CACHE_TIMER_CARD: usize = 3;
+// 캡시 적중 비율 색 기준 (0~1)
+const CACHE_HIT_GOOD: f64 = 0.8;
+const CACHE_HIT_FAIR: f64 = 0.5;
+// 남은 시간이 이 초 미만이면 경고색
+const CACHE_EXPIRY_WARN_SECS: i64 = 60;
 
 // 모델 표 열 (정렬 열 번호와 순서 일치: sort.rs)
 pub const MODEL_COLUMNS: [ColumnSpec; 13] = [
@@ -81,16 +99,41 @@ pub fn render_models_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
     if render_db_gate(frame, state, area) {
         return;
     }
-    let table_cut = (u32::from(area.height) * 40 / 100) as u16;
+    // 캐시 타이머 카드는 낮은 화면에서 숨김: 카드가 어느 칸에 놓였든 그 카드의 칸만 높이 0 (경계를 위로 끌면 드러남)
+    let cache_height = if area.height >= CACHE_CARD_MIN_BODY {
+        CACHE_CARD_HEIGHT
+    } else {
+        0
+    };
+    let upper_height = area.height - cache_height;
+    let table_cut = (u32::from(upper_height) * 40 / 100) as u16;
     // 낮은 화면에서도 캐시 붕괴 표가 머리글과 한 행(4줄)은 갖도록 상세 카드가 먼저 줄어듦
-    let detail_cut = table_cut + MODEL_DETAIL_HEIGHT.min(area.height.saturating_sub(table_cut + 4));
+    let detail_cut =
+        table_cut + MODEL_DETAIL_HEIGHT.min(upper_height.saturating_sub(table_cut + 4));
+    let hidden: &[usize] = if cache_height > 0 {
+        &[]
+    } else {
+        &[CACHE_TIMER_CARD]
+    };
+    let (cuts, slot_mins) = state.card_layout.visible_slot_plan(
+        SplitGroup::ModelsRows,
+        hidden,
+        &[
+            table_cut,
+            detail_cut - table_cut,
+            upper_height - detail_cut,
+            cache_height,
+        ],
+        &[5, 4, 3, CACHE_CARD_MIN_ROWS],
+        area.height,
+    );
     let panes = state.card_layout.split_cards(
         &mut state.hit_areas,
         SplitGroup::ModelsRows,
         SplitAxis::Rows,
         area,
-        &[table_cut, detail_cut],
-        &[5, 4, 3],
+        &cuts,
+        &slot_mins,
     );
 
     // 1. 모델 통계 표와 선택 모델 상세
@@ -239,6 +282,185 @@ pub fn render_models_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
             render_notice_card(frame, state, CardId::CacheBreaks, panes[2], title, note);
         }
     }
+
+    // 3. 캐시 타이머 카드
+    render_cache_timer_card(frame, state, panes[3]);
+}
+
+// 1-1. 캐시 타이머 카드 -------------------------------------------------------
+// 최신 공식 스냅샷의 프롬프트 캐시 상태: 만료까지 남은 시간(다시 그릴 때마다 줄어듦), 적중·미스 수, 최근 미스 시각·원인
+fn render_cache_timer_card(frame: &mut Frame, state: &mut AppState, area: Rect) {
+    // 1. 숨김 높이면 그리지 않음, 준비되지 않은 패널은 안내 카드
+    if area.height < CACHE_CARD_MIN_ROWS {
+        return;
+    }
+    let lang = state.lang;
+    let title = i18n::text(lang, Msg::TitleCacheTimer);
+    let now = state.now_utc().timestamp();
+    let inner_width = usize::from(area.width.saturating_sub(4));
+    let built = match &state.snapshot.limits {
+        Panel::Ready(data) => data
+            .latest
+            .as_ref()
+            .map(|latest| build_cache_lines(lang, latest, now, inner_width)),
+        other => {
+            let note = panel_message(lang, other).unwrap_or_default();
+            render_notice_card(frame, state, CardId::CacheTimer, area, title, note);
+            return;
+        }
+    };
+
+    // 2. 스냅샷 없음: 설정 안내
+    let Some((lines, hint)) = built else {
+        let note = PanelNote {
+            message: i18n::text(lang, Msg::CacheEmpty).to_string(),
+            color: theme::FG_DIM,
+            hint: Some(Msg::LimitsEmptyHint),
+        };
+        render_notice_card(frame, state, CardId::CacheTimer, area, title, note);
+        return;
+    };
+
+    // 3. 카드와 본문
+    let block = interactive_card(
+        state,
+        CardId::CacheTimer,
+        area,
+        title,
+        &hint,
+        theme::BORDER_DIM,
+    )
+    .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+// 1-2. 캐시 타이머 줄 구성 ----------------------------------------------------
+// 줄 1 = 상태 글자·단어·남은 시간·TTL, 줄 2 = 적중률·미스 수, 줄 3 = 최근 미스 시각·원인 (오래된 스냅샷은 흐리게)
+fn build_cache_lines(
+    lang: Lang,
+    latest: &LimitSnapshot,
+    now: i64,
+    width: usize,
+) -> (Vec<Line<'static>>, String) {
+    // 1. 스냅샷 나이와 출처 문구
+    let age = DateTime::parse_from_rfc3339(&latest.ts)
+        .ok()
+        .map(|stamp| (now - stamp.timestamp()).max(0));
+    let stale = age.is_some_and(|secs| secs > LIMIT_STALE_SECS);
+    let tone = |style: Style| if stale { theme::STYLE_DIM } else { style };
+    let source = i18n::text(lang, Msg::LimitsOfficial);
+    let hint = match age {
+        Some(secs) => i18n::limits_hint(lang, source, &format_age(secs), stale),
+        None => source.to_string(),
+    };
+
+    // 2. 줄 1: 만료까지 남은 시간 (남음은 단어와 글자 함께, 남은 시간이 짧으면 경고색)
+    let (glyph, word, style, timing) = match (
+        latest.cache_caching_observed,
+        latest.cache_expires_at,
+        latest.cache_warm,
+    ) {
+        (Some(false), _, _) => ("○", Msg::CacheUnknown, theme::STYLE_DIM, None),
+        (_, Some(expires_at), _) if expires_at > now => {
+            let left = expires_at - now;
+            let style = if left < CACHE_EXPIRY_WARN_SECS {
+                theme::STYLE_WARN
+            } else {
+                theme::STYLE_OK
+            };
+            (
+                "●",
+                Msg::CacheWarm,
+                tone(style),
+                Some(i18n::cache_left(lang, &format_countdown(left))),
+            )
+        }
+        (_, Some(expires_at), _) => (
+            "○",
+            Msg::CacheCold,
+            theme::STYLE_DIM,
+            Some(i18n::cache_expired_ago(
+                lang,
+                &format_countdown(now - expires_at),
+            )),
+        ),
+        (_, None, Some(true)) => ("●", Msg::CacheWarm, tone(theme::STYLE_OK), None),
+        (_, None, Some(false)) => ("○", Msg::CacheCold, theme::STYLE_DIM, None),
+        (_, None, None) => ("○", Msg::CacheUnknown, theme::STYLE_DIM, None),
+    };
+    let mut state_spans = vec![Span::styled(
+        format!("{glyph} {}", i18n::text(lang, word)),
+        style.add_modifier(Modifier::BOLD),
+    )];
+    if let Some(timing) = timing {
+        state_spans.push(Span::styled(format!("  {timing}"), tone(theme::STYLE_TEXT)));
+    }
+    if let Some(ttl) = latest.cache_ttl.as_deref().filter(|ttl| !ttl.is_empty()) {
+        state_spans.push(Span::styled(format!("  TTL {ttl}"), theme::STYLE_DIM));
+    }
+
+    // 3. 줄 2: 적중률 (색과 함께 경고 "!"·위험 "!!" 표식)과 미스 수
+    let mut hit_spans = vec![Span::styled(
+        format!("{} ", i18n::text(lang, Msg::CacheHit)),
+        theme::STYLE_DIM,
+    )];
+    hit_spans.push(match latest.cache_hit_ratio {
+        Some(ratio) => {
+            let (hit_style, hit_mark) = if ratio >= CACHE_HIT_GOOD {
+                (theme::STYLE_OK, "")
+            } else if ratio >= CACHE_HIT_FAIR {
+                (theme::STYLE_WARN, " !")
+            } else {
+                (theme::STYLE_CRIT, " !!")
+            };
+            Span::styled(
+                format!("{:.0}%{hit_mark}", ratio * 100.0),
+                tone(hit_style).add_modifier(Modifier::BOLD),
+            )
+        }
+        None => Span::styled("-", theme::STYLE_DIM),
+    });
+    if let (Some(misses), Some(requests)) = (latest.cache_misses, latest.cache_requests) {
+        hit_spans.push(Span::styled(
+            format!("  {}", i18n::cache_misses_value(lang, misses, requests)),
+            tone(theme::STYLE_TEXT),
+        ));
+    }
+
+    // 4. 줄 3: 최근 미스 시각(지역 시각)과 원인 (원인 이름은 데이터라 번역하지 않음)
+    let mut miss_spans: Vec<Span<'static>> = Vec::new();
+    if let Some(missed_at) = latest.cache_last_miss_at {
+        let clock = DateTime::from_timestamp(missed_at, 0)
+            .map_or("--:--:--".to_string(), |stamp| {
+                stamp.with_timezone(&Local).format("%H:%M:%S").to_string()
+            });
+        miss_spans.push(Span::styled(
+            i18n::cache_last_miss(lang, &clock, &format_countdown(now - missed_at)),
+            tone(theme::STYLE_TEXT),
+        ));
+    } else {
+        miss_spans.push(Span::styled(
+            i18n::text(lang, Msg::CacheNoMiss),
+            theme::STYLE_DIM,
+        ));
+    }
+    if let Some(cause) = latest
+        .cache_last_miss_cause
+        .as_deref()
+        .filter(|cause| !cause.is_empty())
+    {
+        miss_spans.push(Span::styled(
+            format!("  {}", i18n::cache_miss_cause(lang, cause)),
+            tone(theme::STYLE_WARN),
+        ));
+    }
+    let lines = [state_spans, hit_spans, miss_spans]
+        .into_iter()
+        .map(|spans| Line::from(clip_spans_to_width(spans, width)))
+        .collect();
+    (lines, hint)
 }
 
 // 2. 모델 상세 ----------------------------------------------------------------
@@ -540,6 +762,8 @@ mod tests {
     #[test]
     fn model_detail_reports_cache_hit_cost_and_percentiles() {
         let row = ModelStatsRow {
+            cache_creation_5m_tokens: 0,
+            cache_creation_1h_tokens: 0,
             model: "claude-sonnet-5-5".to_string(),
             requests: 900,
             sessions: 3,

@@ -2,15 +2,17 @@
 //! 개요 탭: 서버 상태 카드, KPI 카드, 절약 카드, 분당 추이, 실시간 이벤트 피드와 이벤트 상세.
 
 use crate::core::model::{LiveEvent, PortStatus};
+use crate::store::limits::LimitSnapshot;
 use crate::store::query::MinuteBucket;
+use crate::store::ratelimit::RatelimitSnapshotRow;
 use crate::tui::cards::CardId;
 use crate::tui::format::{
     fit_display, format_compact, format_count, format_duration_ms, pad_left_display,
 };
-use crate::tui::i18n::{self, Msg};
+use crate::tui::i18n::{self, Lang, Msg};
 use crate::tui::layout::{SplitAxis, SplitGroup};
 use crate::tui::sort::{compare_event_row, sort_rows};
-use crate::tui::state::{AppState, DbState, Panel};
+use crate::tui::state::{AppState, DbState, LimitsData, Panel};
 use crate::tui::theme;
 use crate::tui::views::common::{
     CardTable, PanelNote, TableCell, TextCard, clip_spans_to_width, interactive_card,
@@ -20,18 +22,40 @@ use crate::tui::views::common::{
 use crate::tui::views::feed::{
     FEED_COLUMNS, build_event_context_lines, build_event_detail_lines, build_feed_row,
 };
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, Local, NaiveDateTime, Utc};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Gauge, Padding, Paragraph, Sparkline};
+use ratatui::widgets::{Gauge, Padding, Paragraph, Sparkline, Wrap};
 
 const SPARK_MINUTES: usize = 60;
 const CACHE_CARD_INDEX: usize = 2;
 const HEADER_HEIGHT: u16 = 4;
 const KPI_HEIGHT: u16 = 4;
 const TREND_HEIGHT: u16 = 5;
+// 본문이 이 높이 이상이면 추이 줄을 한 줄 키워 한도 카드에 API 키 줄까지 넣음
+const TALL_LAYOUT_MIN_HEIGHT: u16 = 24;
+const TREND_HEIGHT_TALL: u16 = 6;
+// 분당 추이 카드가 읽을 수 있는 최소 폭 (이 밑으로 내려가면 두 추이 카드를 숨김)
+const TREND_MIN_WIDTH: u16 = 12;
+// 한도 카드: 공식 스냅샷이 이 시간(초)보다 오래되면 흐리게, 막대·퍼센트 색 기준(%)
+pub(crate) const LIMIT_STALE_SECS: i64 = 1_800;
+const LIMIT_WARN_PCT: f64 = 80.0;
+const LIMIT_CRIT_PCT: f64 = 95.0;
+// 한도 창 길이(초), 페이스 판정 허용 차(%p), 소진 예상 계산에 필요한 최소 기록 간격·되돌아볼 길이(초)
+const FIVE_HOUR_SECS: i64 = 5 * 3_600;
+const SEVEN_DAY_SECS: i64 = 7 * 86_400;
+const PACE_TOLERANCE_PCT: f64 = 5.0;
+const PROJECTION_MIN_SPAN_SECS: i64 = 300;
+const PROJECTION_LOOKBACK_SECS: i64 = 3 * 3_600;
+// 한도 줄 열 폭: 이름 칸, 퍼센트, 막대 최소·최대
+const LIMIT_LABEL_WIDTH: usize = 3;
+const LIMIT_PCT_WIDTH: usize = 4;
+const BAR_MIN_WIDTH: usize = 4;
+const BAR_MAX_WIDTH: usize = 10;
+// 최소 막대로 리셋·페이스·소진 예상까지 다 담는 줄 폭 (이보다 넓으면 막대가 길어짐)
+const LIMIT_FULL_ROW_WIDTH: usize = 42;
 // 추이 줄까지 넣을 수 있는 최소 본문 높이
 const FULL_LAYOUT_MIN_HEIGHT: u16 = 18;
 // 이 폭 이상 카드만 안쪽 가로 여백 1열
@@ -69,12 +93,17 @@ pub fn render_overview_tab(frame: &mut Frame, area: Rect, state: &mut AppState) 
     let header_cut = HEADER_HEIGHT;
     let kpi_cut = HEADER_HEIGHT + KPI_HEIGHT;
     let (header_area, kpi_area, trend_area, feed_area) = if area.height >= FULL_LAYOUT_MIN_HEIGHT {
+        let trend_height = if area.height >= TALL_LAYOUT_MIN_HEIGHT {
+            TREND_HEIGHT_TALL
+        } else {
+            TREND_HEIGHT
+        };
         let rows = state.card_layout.split_cards(
             &mut state.hit_areas,
             SplitGroup::OverviewRows,
             SplitAxis::Rows,
             area,
-            &[header_cut, kpi_cut, kpi_cut + TREND_HEIGHT],
+            &[header_cut, kpi_cut, kpi_cut + trend_height],
             &[4, 4, 5, 3],
         );
         (rows[0], rows[1], Some(rows[2]), rows[3])
@@ -567,18 +596,51 @@ fn render_kpi_cards(frame: &mut Frame, state: &mut AppState, area: Rect) {
 fn render_savings_and_trends(frame: &mut Frame, state: &mut AppState, area: Rect) {
     let lang = state.lang;
     let word = |msg: Msg| i18n::text(lang, msg);
-    // 1. 카드 분할 (절약 30%를 31~40열로, 나머지 둘은 균등)
+    // 1. 카드 분할 (오른쪽 끝 한도 카드 34~46열, 남는 폭에서 절약 30%를 31~40열로, 나머지 둘은 균등, 좋으면 한도 카드 폭을 먼저 지킴)
     let width = u32::from(area.width);
-    let first_cut = (width * 30 / 100).clamp(31, 40);
-    let second_cut = first_cut + 1 + width.saturating_sub(first_cut + 1) / 2;
-    let panes = state.card_layout.split_cards(
+    let limits_width = (width * 38 / 100).clamp(38, 48).min(width * 45 / 100);
+    let rest = width.saturating_sub(limits_width + 1);
+    let first_cut = (rest * 30 / 100).clamp(28, 40).min(rest / 2);
+    let second_cut = first_cut + 1 + rest.saturating_sub(first_cut + 1) / 2;
+    // 추이 카드가 읽을 수 있는 최소 폭(TREND_MIN_WIDTH) 밑이면 두 추이 카드를 숨기고 한도·절약 카드가 폭을 나눔 (추이는 우선순위가 가장 낮음, 칸 위치와 무관)
+    let requests_width = second_cut.saturating_sub(first_cut + 1);
+    let tokens_width = rest.saturating_sub(second_cut + 1);
+    let trends_hidden = requests_width.min(tokens_width) < u32::from(TREND_MIN_WIDTH);
+    let group = SplitGroup::OverviewTrendCols;
+    let mut layout = state.card_layout;
+    let (cuts, slot_mins) = if trends_hidden {
+        layout.clear_ratios(group);
+        let wide_limits = (width * 50 / 100).clamp(38, 48).min(width * 55 / 100);
+        layout.visible_slot_plan(
+            group,
+            &[1, 2],
+            &[(width - wide_limits - 1) as u16, 0, 0, wide_limits as u16],
+            &[24, 16, 16, 28],
+            area.width,
+        )
+    } else {
+        layout.visible_slot_plan(
+            group,
+            &[],
+            &[
+                first_cut as u16,
+                requests_width as u16,
+                tokens_width as u16,
+                limits_width as u16,
+            ],
+            &[24, 16, 16, 28],
+            area.width,
+        )
+    };
+    let panes = layout.split_cards(
         &mut state.hit_areas,
-        SplitGroup::OverviewTrendCols,
+        group,
         SplitAxis::Columns,
         area,
-        &[first_cut as u16, second_cut as u16],
-        &[24, 16, 16],
+        &cuts,
+        &slot_mins,
     );
+    render_limits_card(frame, state, panes[3]);
 
     // 2. 오늘 절약 시간 대 거부 손실 추정
     let today = match &state.snapshot.today {
@@ -662,6 +724,15 @@ fn render_savings_and_trends(frame: &mut Frame, state: &mut AppState, area: Rect
                 note,
             );
         }
+    }
+
+    // 2-1. 추이 카드를 숨긴 폭에서는 그리지 않고 경계 끌기 영역도 둔다 (숨긴 칸과 겹치는 경계를 잡아 비율이 사라지는 일 방지)
+    if trends_hidden {
+        state
+            .hit_areas
+            .split_hits
+            .retain(|hit| hit.group != SplitGroup::OverviewTrendCols);
+        return;
     }
 
     // 3. 분당 추이가 준비되지 않으면 두 카드가 이웃한 칸일 때 하나의 안내 카드로 (사이 경계는 제거),
@@ -882,7 +953,7 @@ fn render_feed_row(frame: &mut Frame, state: &mut AppState, area: Rect) {
                 LiveEvent::Api(_) => (counts.0 + 1, counts.1, counts.2),
                 LiveEvent::Tool(_) => (counts.0, counts.1 + 1, counts.2),
                 LiveEvent::Hook(_) => (counts.0, counts.1, counts.2 + 1),
-                LiveEvent::Notice { .. } => counts,
+                LiveEvent::Otel(_) | LiveEvent::Notice { .. } => counts,
             });
     render_card_table(
         frame,
@@ -926,6 +997,534 @@ fn render_feed_row(frame: &mut Frame, state: &mut AppState, area: Rect) {
             lines: detail_lines,
         },
     );
+}
+
+// 7. 한도 카드 ----------------------------------------------------------------
+// 좌우 폭에 맞춘 줄 목록과 테두리 우측 상단 문구 (출처·스냅샷 나이), empty = 보여 줄 없이 설정 안내만
+#[derive(Debug, Default)]
+struct LimitsView {
+    lines: Vec<Line<'static>>,
+    hint: String,
+    empty: bool,
+}
+
+// 한도 줄 하나의 입력 (pct 없으면 -, resets_at 에서 span_secs 를 뺀 시각이 창 시작, note = 맨 뒤 부가 문구)
+#[derive(Debug)]
+struct LimitRow {
+    label: Msg,
+    pct: Option<f64>,
+    resets_at: Option<i64>,
+    span_secs: i64,
+    exhaust_at: Option<i64>,
+    note: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pace {
+    Ahead,
+    Steady,
+    Behind,
+}
+
+// 7-1. 카드 그리기 ------------------------------------------------------------
+// 공식 스냅샷이 있으면 막대·카운트다운·페이스·소진 예상, 없으면 로컬 토큰 추정, 둘 다 없으면 statusLine 설정 안내
+fn render_limits_card(frame: &mut Frame, state: &mut AppState, area: Rect) {
+    // 1. 보여 줄 계산 (준비되지 않은 패널은 안내 카드)
+    let lang = state.lang;
+    let title = i18n::text(lang, Msg::TitleLimits);
+    let now = state.now_utc().timestamp();
+    let inner_width = usize::from(area.width.saturating_sub(4));
+    let inner_height = usize::from(area.height.saturating_sub(2));
+    let view = match &state.snapshot.limits {
+        Panel::Ready(data) => build_limits_view(lang, data, now, inner_width, inner_height),
+        other => {
+            let note = panel_message(lang, other).unwrap_or_default();
+            render_notice_card(frame, state, CardId::LimitsCard, area, title, note);
+            return;
+        }
+    };
+
+    // 2. 카드 템두리와 본문 (설정 안내는 가운데 정렬·줄바꿈)
+    let block = interactive_card(
+        state,
+        CardId::LimitsCard,
+        area,
+        title,
+        &view.hint,
+        theme::BORDER_DIM,
+    )
+    .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.is_empty() {
+        return;
+    }
+    if view.empty {
+        let guide = vec![
+            Line::from(Span::styled(
+                i18n::text(lang, Msg::LimitsEmpty),
+                theme::STYLE_DIM,
+            )),
+            Line::from(Span::styled(
+                i18n::text(lang, Msg::LimitsEmptyHint),
+                theme::STYLE_DIM,
+            )),
+        ];
+        frame.render_widget(
+            Paragraph::new(guide)
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true }),
+            inner,
+        );
+        return;
+    }
+    frame.render_widget(Paragraph::new(view.lines).wrap(Wrap { trim: false }), inner);
+}
+
+// 7-2. 보여 줄 구성 -----------------------------------------------------------
+// 5시간·7일·컨텍스트·API 키 순서로 높이만큼 담음, 오래된 스냅샷(30분 초과)은 전부 흘리게
+// 스냅샷이 없으면 로컬 토큰 추정 두 줄(공식 퍼센트 아님)과 설정 안내, 추정도 없으면 empty
+fn build_limits_view(
+    lang: Lang,
+    data: &LimitsData,
+    now: i64,
+    width: usize,
+    height: usize,
+) -> LimitsView {
+    // 1. 공식 스냅샷 없음: 로컬 토큰 추정
+    let Some(latest) = &data.latest else {
+        let estimates = [
+            (Msg::LimitsLabelFiveHour, &data.estimate_5h),
+            (Msg::LimitsLabelSevenDay, &data.estimate_7d),
+        ];
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for (label, estimate) in estimates {
+            let Some(stats) = estimate else {
+                continue;
+            };
+            let tokens = stats.input_tokens + stats.output_tokens;
+            if tokens <= 0 {
+                continue;
+            }
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(
+                        "{} ",
+                        fit_display(i18n::text(lang, label), LIMIT_LABEL_WIDTH)
+                    ),
+                    theme::STYLE_DIM,
+                ),
+                Span::styled(
+                    format!("{} ", i18n::text(lang, Msg::LimitsEstimate)),
+                    theme::STYLE_DIM,
+                ),
+                Span::styled(format_compact(tokens), theme::STYLE_TEXT),
+                Span::styled(
+                    format!(" {}", i18n::text(lang, Msg::LimitsTokensUnit)),
+                    theme::STYLE_DIM,
+                ),
+            ]));
+        }
+        if lines.is_empty() {
+            return LimitsView {
+                empty: true,
+                ..LimitsView::default()
+            };
+        }
+        lines.push(Line::from(Span::styled(
+            i18n::text(lang, Msg::LimitsEmptyHint),
+            theme::STYLE_DIM,
+        )));
+        lines.truncate(height);
+        return LimitsView {
+            lines,
+            hint: i18n::text(lang, Msg::LimitsEstimate).to_string(),
+            empty: false,
+        };
+    };
+
+    // 2. 스냅샷 나이와 출처 문구 (너무 오래되면 흐림으로 보이고 소진 예상은 하지 않음)
+    let age = DateTime::parse_from_rfc3339(&latest.ts)
+        .ok()
+        .map(|stamp| (now - stamp.timestamp()).max(0));
+    let stale = age.is_some_and(|secs| secs > LIMIT_STALE_SECS);
+    let source = i18n::text(lang, Msg::LimitsOfficial);
+    let hint = match age {
+        Some(secs) => i18n::limits_hint(lang, source, &format_age(secs), stale),
+        None => source.to_string(),
+    };
+
+    // 3. 5시간·7일 줄 (같은 창의 스냅샷 기록으로 소진 예상)
+    let five_points = collect_window_points(
+        &data.history,
+        |snapshot| (snapshot.five_hour_pct, snapshot.five_hour_resets_at),
+        latest.five_hour_resets_at,
+    );
+    let seven_points = collect_window_points(
+        &data.history,
+        |snapshot| (snapshot.seven_day_pct, snapshot.seven_day_resets_at),
+        latest.seven_day_resets_at,
+    );
+    let exhaust_of = |points: &[(i64, f64)], resets_at: Option<i64>| {
+        resets_at
+            .filter(|_| !stale)
+            .and_then(|resets_at| project_exhaustion(points, resets_at, now))
+    };
+    let mut rows = vec![
+        LimitRow {
+            label: Msg::LimitsLabelFiveHour,
+            pct: latest.five_hour_pct,
+            resets_at: latest.five_hour_resets_at,
+            span_secs: FIVE_HOUR_SECS,
+            exhaust_at: exhaust_of(&five_points, latest.five_hour_resets_at),
+            note: None,
+        },
+        LimitRow {
+            label: Msg::LimitsLabelSevenDay,
+            pct: latest.seven_day_pct,
+            resets_at: latest.seven_day_resets_at,
+            span_secs: SEVEN_DAY_SECS,
+            exhaust_at: exhaust_of(&seven_points, latest.seven_day_resets_at),
+            note: None,
+        },
+    ];
+
+    // 4. 현재 세션 컨텍스트와 컴팩션 횟수 (기록이 현재 세션의 것일 때만 셈)
+    if latest.context_pct.is_some() {
+        let compactions = data
+            .compaction
+            .as_ref()
+            .filter(|stat| stat.session_id == latest.session_id)
+            .map_or(0, |stat| stat.count);
+        rows.push(LimitRow {
+            label: Msg::LimitsLabelContext,
+            pct: latest.context_pct,
+            resets_at: None,
+            span_secs: 0,
+            exhaust_at: None,
+            note: Some(i18n::limits_compactions(lang, compactions)),
+        });
+    }
+    let mut lines: Vec<Line<'static>> = rows
+        .iter()
+        .map(|row| build_limit_line(lang, row, now, width, stale))
+        .collect();
+
+    // 5. API 키 남은 양 (구간 안 헤더 기록이 있을 때)
+    if let Some(api_line) = data
+        .api_key
+        .as_ref()
+        .and_then(|row| build_api_key_line(lang, row, now, width, stale))
+    {
+        lines.push(api_line);
+    }
+    lines.truncate(height);
+    LimitsView {
+        lines,
+        hint,
+        empty: false,
+    }
+}
+
+// 7-3. 한도 줄 조립 -----------------------------------------------------------
+// 이름, 막대, 퍼센트, 그 뒤 부가 항목(리셋 카운트다운, 페이스, 소진 예상 시각, 부가 문구)
+// 폭이 모자라면 뒤 항목부터 통째로 덜어내고 막대는 4칸까지 줄임, 색은 퍼센트 숫자와 항상 짝 (dim = 모두 흐림)
+fn build_limit_line(
+    lang: Lang,
+    row: &LimitRow,
+    now: i64,
+    width: usize,
+    dim: bool,
+) -> Line<'static> {
+    // 1. 값 문구와 스타일
+    let tone = |style: Style| if dim { theme::STYLE_DIM } else { style };
+    let label = format!(
+        "{} ",
+        fit_display(i18n::text(lang, row.label), LIMIT_LABEL_WIDTH)
+    );
+    let pct_text = pad_left_display(
+        &row.pct.map_or("-".to_string(), |pct| format!("{pct:.0}%")),
+        LIMIT_PCT_WIDTH,
+    );
+    let pct_style = row
+        .pct
+        .map_or(theme::STYLE_DIM, |pct| limit_style(pct, dim));
+    let level_mark = row.pct.map_or("", limit_mark);
+    let live_reset = row.resets_at.filter(|resets_at| *resets_at > now);
+    let mut tails: Vec<(String, Style)> = Vec::new();
+    if row.resets_at.is_some() {
+        tails.push(match live_reset {
+            Some(resets_at) => (
+                i18n::limits_reset_in(lang, &format_countdown(resets_at - now)),
+                tone(theme::STYLE_TEXT),
+            ),
+            None => (
+                i18n::text(lang, Msg::LimitsResetDue).to_string(),
+                theme::STYLE_DIM,
+            ),
+        });
+    }
+    if let (Some(pct), Some(resets_at)) = (row.pct, live_reset) {
+        let (glyph, word, style) = match judge_pace(pct, resets_at, row.span_secs, now) {
+            Pace::Ahead => ("▲", Msg::LimitsPaceAhead, tone(theme::STYLE_WARN)),
+            Pace::Steady => ("●", Msg::LimitsPaceOn, theme::STYLE_DIM),
+            Pace::Behind => ("▼", Msg::LimitsPaceBehind, tone(theme::STYLE_OK)),
+        };
+        tails.push((format!("{glyph} {}", i18n::text(lang, word)), style));
+    }
+    if let Some(exhaust_at) = row.exhaust_at {
+        tails.push((
+            format!("→ {}", format_exhaustion_clock(exhaust_at, now)),
+            tone(theme::STYLE_WARN),
+        ));
+    }
+    if let Some(note) = &row.note {
+        tails.push((note.clone(), theme::STYLE_DIM));
+    }
+
+    // 2. 막대 폭은 모든 줄이 같아 세로로 정렬 (모든 항목이 들어갈 만큼 넓을 때만 늘어남), 항목은 앞에서부터 폭에 들어갈 때만 채택
+    let bar_width = (BAR_MIN_WIDTH + width.saturating_sub(LIMIT_FULL_ROW_WIDTH)).min(BAR_MAX_WIDTH);
+    let mut used =
+        Span::raw(label.as_str()).width() + bar_width + 1 + LIMIT_PCT_WIDTH + level_mark.len();
+    let mut shown: Vec<(String, Style)> = Vec::new();
+    for (text, style) in tails {
+        let needed = 2 + Span::raw(text.as_str()).width();
+        if used + needed > width {
+            break;
+        }
+        used += needed;
+        shown.push((text, style));
+    }
+
+    // 3. 조립 (막대 채움 색은 퍼센트 숫자와 같은 단계)
+    let mut spans = vec![Span::styled(label, theme::STYLE_DIM)];
+    spans.extend(build_bar(row.pct, bar_width, pct_style));
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(
+        pct_text,
+        pct_style.add_modifier(Modifier::BOLD),
+    ));
+    if !level_mark.is_empty() {
+        spans.push(Span::styled(
+            level_mark,
+            pct_style.add_modifier(Modifier::BOLD),
+        ));
+    }
+    for (text, style) in shown {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(text, style));
+    }
+    Line::from(clip_spans_to_width(spans, width))
+}
+
+// 막대: 채운 칸은 퍼센트 색, 빈 칸은 흐린 트랙, 0 보다 크면 최소 한 칸
+fn build_bar(pct: Option<f64>, width: usize, fill_style: Style) -> Vec<Span<'static>> {
+    let ratio = pct.map_or(0.0, |value| value.clamp(0.0, 100.0) / 100.0);
+    let mut filled = ((ratio * width as f64).round() as usize).min(width);
+    if ratio > 0.0 && filled == 0 {
+        filled = 1;
+    }
+    vec![
+        Span::styled("█".repeat(filled), fill_style),
+        Span::styled("░".repeat(width - filled), theme::STYLE_FAINT),
+    ]
+}
+
+// 퍼센트 단계 색: 80 이상 경고, 95 이상 위험(굵게), 그 밖 정상 (dim 이면 흐림)
+fn limit_style(pct: f64, dim: bool) -> Style {
+    if dim {
+        theme::STYLE_DIM
+    } else if pct >= LIMIT_CRIT_PCT {
+        theme::STYLE_CRIT.add_modifier(Modifier::BOLD)
+    } else if pct >= LIMIT_WARN_PCT {
+        theme::STYLE_WARN
+    } else {
+        theme::STYLE_OK
+    }
+}
+
+// 퍼센트 단계 표식: 색을 못 봐도 단계가 보이도록 경고 " !", 위험 " !!" (정상은 없음, 기준은 limit_style 과 같음)
+fn limit_mark(pct: f64) -> &'static str {
+    if pct >= LIMIT_CRIT_PCT {
+        " !!"
+    } else if pct >= LIMIT_WARN_PCT {
+        " !"
+    } else {
+        ""
+    }
+}
+
+// 7-4. API 키 줄 --------------------------------------------------------------
+// 요청·토큰 남은 양/한도와 리셋까지 시간, 두 값이 모두 없으면 줄 없음 (남은 비율이 적을수록 경고·위험 색)
+fn build_api_key_line(
+    lang: Lang,
+    row: &RatelimitSnapshotRow,
+    now: i64,
+    width: usize,
+    dim: bool,
+) -> Option<Line<'static>> {
+    // 1. 요청·토큰 항목 (토큰은 통합 한도가 없으면 입력 토큰 한도)
+    let token_pair = if row.tokens_remaining.is_some() {
+        (row.tokens_remaining, row.tokens_limit)
+    } else {
+        (row.input_tokens_remaining, row.input_tokens_limit)
+    };
+    let mut items: Vec<Vec<Span<'static>>> = vec![vec![Span::styled(
+        format!(
+            "{} ",
+            fit_display(i18n::text(lang, Msg::LimitsLabelApiKey), LIMIT_LABEL_WIDTH)
+        ),
+        theme::STYLE_DIM,
+    )]];
+    let pairs = [
+        (
+            Msg::LimitsRequestsShort,
+            (row.requests_remaining, row.requests_limit),
+        ),
+        (Msg::LimitsTokensUnit, token_pair),
+    ];
+    for (unit, (remaining, limit)) in pairs {
+        let Some(remaining) = remaining else {
+            continue;
+        };
+        let used_pct = limit
+            .filter(|total| *total > 0)
+            .map_or(0.0, |total| 100.0 - remaining as f64 * 100.0 / total as f64);
+        let value = match limit {
+            Some(total) => format!("{}/{}", format_compact(remaining), format_compact(total)),
+            None => format_compact(remaining),
+        };
+        items.push(vec![
+            Span::styled(format!("{} ", i18n::text(lang, unit)), theme::STYLE_DIM),
+            Span::styled(
+                format!("{value}{}", limit_mark(used_pct)),
+                limit_style(used_pct, dim).add_modifier(Modifier::BOLD),
+            ),
+        ]);
+    }
+    if items.len() == 1 {
+        return None;
+    }
+
+    // 2. 요청 한도 리셋까지 (RFC 3339 해석이 되고 아직 안 지났을 때만)
+    let reset_secs = row
+        .requests_reset
+        .as_deref()
+        .and_then(|stamp| DateTime::parse_from_rfc3339(stamp).ok())
+        .map(|stamp| stamp.timestamp() - now)
+        .filter(|secs| *secs > 0);
+    if let Some(secs) = reset_secs {
+        items.push(vec![Span::styled(
+            i18n::limits_reset_in(lang, &format_countdown(secs)),
+            theme::STYLE_DIM,
+        )]);
+    }
+    Some(Line::from(pack_spans_to_width(items, &[2, 1], width)))
+}
+
+// 7-5. 페이스·소진 예상 계산 --------------------------------------------------
+// 창 경과 비율(%)과 사용률(%)의 차가 허용 범위 밖이면 빠름·느림, 안이면 적정
+fn judge_pace(pct: f64, resets_at: i64, span_secs: i64, now: i64) -> Pace {
+    let elapsed_pct =
+        ((now - (resets_at - span_secs)) as f64 * 100.0 / span_secs as f64).clamp(0.0, 100.0);
+    let gap = pct - elapsed_pct;
+    if gap > PACE_TOLERANCE_PCT {
+        Pace::Ahead
+    } else if gap < -PACE_TOLERANCE_PCT {
+        Pace::Behind
+    } else {
+        Pace::Steady
+    }
+}
+
+// 같은 한도 창(리셋 시각이 같음)의 (스냅샷 시각 초, 사용률) 기록, 오래된 순
+fn collect_window_points(
+    history: &[LimitSnapshot],
+    pick: fn(&LimitSnapshot) -> (Option<f64>, Option<i64>),
+    resets_at: Option<i64>,
+) -> Vec<(i64, f64)> {
+    let Some(resets_at) = resets_at else {
+        return Vec::new();
+    };
+    history
+        .iter()
+        .filter_map(|snapshot| {
+            let (pct, snapshot_resets_at) = pick(snapshot);
+            let stamp = DateTime::parse_from_rfc3339(&snapshot.ts).ok()?;
+            (snapshot_resets_at == Some(resets_at)).then_some((stamp.timestamp(), pct?))
+        })
+        .collect()
+}
+
+// 최근 기록의 선형 증가율로 100% 에 닿는 시각 (리셋 전에 닿을 때만, 기록 간격이 너무 짧거나 증가가 없으면 None)
+fn project_exhaustion(points: &[(i64, f64)], resets_at: i64, now: i64) -> Option<i64> {
+    let (last_at, last_pct) = *points.last()?;
+    if last_pct >= 100.0 {
+        return None;
+    }
+    let (first_at, first_pct) = points
+        .iter()
+        .copied()
+        .find(|(stamp, _)| *stamp >= last_at - PROJECTION_LOOKBACK_SECS)?;
+    let span = last_at - first_at;
+    let rise = last_pct - first_pct;
+    if span < PROJECTION_MIN_SPAN_SECS || rise <= 0.0 {
+        return None;
+    }
+    let remaining_secs = ((100.0 - last_pct) * span as f64 / rise) as i64;
+    let exhaust_at = (last_at + remaining_secs).max(now);
+    (exhaust_at < resets_at).then_some(exhaust_at)
+}
+
+// 7-6. 시간 표시 --------------------------------------------------------------
+// 남은 시간: 1일 이상 일+시, 1시간 이상 시+분, 1분 이상 분+초, 그 밖 초 (단위 글자는 언어와 무관)
+pub(crate) fn format_countdown(secs: i64) -> String {
+    let secs = secs.max(0);
+    let (days, hours, minutes, seconds) = (
+        secs / 86_400,
+        secs % 86_400 / 3_600,
+        secs % 3_600 / 60,
+        secs % 60,
+    );
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {minutes:02}m")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+// 경과 시간 한 자리: 초, 분, 시, 일
+pub(crate) fn format_age(secs: i64) -> String {
+    let secs = secs.max(0);
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3_600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3_600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
+// 소진 예상 시각: 오늘이면 시:분, 아니면 월-일 시:분 (지역 시각)
+fn format_exhaustion_clock(exhaust_at: i64, now: i64) -> String {
+    let Some(exhaust) =
+        DateTime::from_timestamp(exhaust_at, 0).map(|stamp| stamp.with_timezone(&Local))
+    else {
+        return "--:--".to_string();
+    };
+    let same_day = DateTime::from_timestamp(now, 0)
+        .is_some_and(|stamp| stamp.with_timezone(&Local).date_naive() == exhaust.date_naive());
+    if same_day {
+        exhaust.format("%H:%M").to_string()
+    } else {
+        exhaust.format("%m-%d %H:%M").to_string()
+    }
 }
 
 #[cfg(test)]
@@ -977,5 +1576,148 @@ mod tests {
             .collect();
         let series = build_minute_series(&buckets, Utc::now(), |bucket| bucket.api_requests);
         assert_eq!(series, [1, 2, 3]);
+    }
+
+    #[test]
+    fn countdown_and_age_pick_the_two_largest_units_and_clamp_negatives() {
+        assert_eq!(format_countdown(-5), "0s");
+        assert_eq!(format_countdown(59), "59s");
+        assert_eq!(format_countdown(60), "1m 00s");
+        assert_eq!(format_countdown(252), "4m 12s");
+        assert_eq!(format_countdown(3_600), "1h 00m");
+        assert_eq!(format_countdown(2 * 3_600 + 14 * 60 + 59), "2h 14m");
+        assert_eq!(format_countdown(86_400 + 4 * 3_600), "1d 4h");
+        assert_eq!(format_age(12), "12s");
+        assert_eq!(format_age(45 * 60), "45m");
+        assert_eq!(format_age(5 * 3_600), "5h");
+        assert_eq!(format_age(3 * 86_400), "3d");
+    }
+
+    #[test]
+    fn pace_compares_used_percent_with_elapsed_window_percent() {
+        let now = 1_000_000;
+        // 5시간 창의 40% 지점 (2시간 경과)
+        let resets_at = now + 3 * 3_600;
+        assert_eq!(
+            judge_pace(46.0, resets_at, FIVE_HOUR_SECS, now),
+            Pace::Ahead
+        );
+        assert_eq!(
+            judge_pace(45.0, resets_at, FIVE_HOUR_SECS, now),
+            Pace::Steady
+        );
+        assert_eq!(
+            judge_pace(35.0, resets_at, FIVE_HOUR_SECS, now),
+            Pace::Steady
+        );
+        assert_eq!(
+            judge_pace(34.0, resets_at, FIVE_HOUR_SECS, now),
+            Pace::Behind
+        );
+    }
+
+    #[test]
+    fn limit_colors_switch_at_80_and_95_and_dim_overrides_them() {
+        assert_eq!(limit_style(79.9, false), theme::STYLE_OK);
+        assert_eq!(limit_style(80.0, false), theme::STYLE_WARN);
+        assert_eq!(limit_style(94.9, false), theme::STYLE_WARN);
+        assert_eq!(
+            limit_style(95.0, false),
+            theme::STYLE_CRIT.add_modifier(Modifier::BOLD)
+        );
+        assert_eq!(limit_style(99.0, true), theme::STYLE_DIM);
+    }
+
+    // 색을 못 봐도 단계를 알 수 있도록 경고 " !"·위험 " !!" 표식이 퍼센트 뒤에 붙고 줄 폭은 넘지 않음
+    #[test]
+    fn limit_lines_carry_a_level_mark_next_to_the_percent_and_stay_within_the_width() {
+        assert_eq!(limit_mark(79.9), "");
+        assert_eq!(limit_mark(80.0), " !");
+        assert_eq!(limit_mark(94.9), " !");
+        assert_eq!(limit_mark(95.0), " !!");
+
+        let row = |pct: f64| LimitRow {
+            label: Msg::LimitsLabelFiveHour,
+            pct: Some(pct),
+            resets_at: Some(1_000_000 + 3_600),
+            span_secs: FIVE_HOUR_SECS,
+            exhaust_at: None,
+            note: None,
+        };
+        for lang in [Lang::En, Lang::Ko] {
+            for width in [28usize, 36, 60] {
+                for (pct, mark) in [(70.0, ""), (85.0, " !"), (97.0, " !!")] {
+                    let line = build_limit_line(lang, &row(pct), 1_000_000, width, false);
+                    let text: String = line
+                        .spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect();
+                    let case = format!("{lang:?} {width} {pct} {text}");
+                    assert!(text.contains(&format!("{pct:.0}%{mark}")), "{case}");
+                    assert_eq!(text.contains('!'), !mark.is_empty(), "{case}");
+                    assert!(line.width() <= width, "{case}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn projection_shows_only_when_the_linear_rate_reaches_100_before_the_reset() {
+        let now = 1_000_000;
+        let hour = 3_600;
+        // 한 시간에 20%p: 70% 에서 30%p 남아 한 시간 반 뒤 (리셋보다 이름)
+        let points = [(now - hour, 50.0), (now, 70.0)];
+        assert_eq!(
+            project_exhaustion(&points, now + 3 * hour, now),
+            Some(now + hour * 3 / 2)
+        );
+        // 리셋이 그보다 이르면 숨김
+        assert_eq!(project_exhaustion(&points, now + hour, now), None);
+        // 증가 없음, 감소, 기록 하나, 기록 간격 5분 미만, 이미 100% 는 숨김
+        let flat = [(now - hour, 70.0), (now, 70.0)];
+        assert_eq!(project_exhaustion(&flat, now + 3 * hour, now), None);
+        let falling = [(now - hour, 80.0), (now, 70.0)];
+        assert_eq!(project_exhaustion(&falling, now + 3 * hour, now), None);
+        assert_eq!(
+            project_exhaustion(&[(now, 70.0)], now + 3 * hour, now),
+            None
+        );
+        let brief = [(now - 120, 50.0), (now, 70.0)];
+        assert_eq!(project_exhaustion(&brief, now + 3 * hour, now), None);
+        let full = [(now - hour, 90.0), (now, 100.0)];
+        assert_eq!(project_exhaustion(&full, now + 3 * hour, now), None);
+        // 되돌아볼 길이 밖의 오래된 기록은 쓰지 않음 (최근 3시간 안 첫 기록부터)
+        let old_first = [(now - 10 * hour, 0.0), (now - hour, 50.0), (now, 70.0)];
+        assert_eq!(
+            project_exhaustion(&old_first, now + 3 * hour, now),
+            Some(now + hour * 3 / 2)
+        );
+    }
+
+    #[test]
+    fn window_points_keep_only_snapshots_of_the_same_reset_window() {
+        let snapshot = |ts: &str, pct: f64, resets_at: i64| LimitSnapshot {
+            ts: ts.to_string(),
+            five_hour_pct: Some(pct),
+            five_hour_resets_at: Some(resets_at),
+            ..LimitSnapshot::default()
+        };
+        let history = [
+            snapshot("2026-11-19T07:00:00Z", 10.0, 100),
+            snapshot("2026-11-19T08:00:00Z", 20.0, 200),
+            snapshot("2026-11-19T09:00:00Z", 30.0, 200),
+            snapshot("not a time", 40.0, 200),
+        ];
+        let points = collect_window_points(
+            &history,
+            |snapshot| (snapshot.five_hour_pct, snapshot.five_hour_resets_at),
+            Some(200),
+        );
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[1].1, 30.0);
+        assert!(points[1].0 > points[0].0);
+        let none = collect_window_points(&history, |snapshot| (snapshot.five_hour_pct, None), None);
+        assert!(none.is_empty());
     }
 }

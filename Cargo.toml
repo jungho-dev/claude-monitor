@@ -14,7 +14,6 @@ keywords = ["claude-code", "otlp", "hooks", "gateway", "tui"]
 categories = ["command-line-utilities", "development-tools"]
 exclude = [
   "/.cargo",
-  "/.cbmignore",
   "/.claude",
   "/.cmd",
   "/.docs",
@@ -52,6 +51,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-util", "fs", "signal"] }
 toml = "1.2.1"
+tower-service = "0.3"
 unicode-width = "0.2.3"
 
 [profile.release]

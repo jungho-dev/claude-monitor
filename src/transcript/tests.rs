@@ -173,6 +173,178 @@ fn appended_lines_resume_with_saved_trigger() {
     assert_eq!(summary.counts.api_requests, 0);
 }
 
+// 3-1. 캐시 쓰기 분리·작업 폴더·브랜치 줄 -------------------------------------
+// X1 분리+Windows 경로+브랜치, X2 분리 없음+끝 슬래시 경로, X3 작업 폴더 없음, X4 에이전트 워크트리 경로 (fixture 의 msg_S* 와 겹치지 않게)
+const SPLIT_TRANSCRIPT: &str = concat!(
+    r#"{"type":"assistant","timestamp":"2026-11-10T12:00:00.000Z","sessionId":"sess-split","cwd":"C:\\work\\demo-app","gitBranch":"feature/cost","message":{"id":"msg_X1","model":"claude-opus-5-5","role":"assistant","content":[{"type":"text","text":"x"}],"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":5000,"cache_creation_input_tokens":1000,"cache_creation":{"ephemeral_5m_input_tokens":700,"ephemeral_1h_input_tokens":300}}}}"#,
+    "\n",
+    r#"{"type":"assistant","timestamp":"2026-11-10T12:01:00.000Z","sessionId":"sess-split","cwd":"/home/dev/other-app/","message":{"id":"msg_X2","model":"claude-opus-5-5","role":"assistant","content":[{"type":"text","text":"x"}],"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":400}}}"#,
+    "\n",
+    r#"{"type":"assistant","timestamp":"2026-11-10T12:02:00.000Z","sessionId":"sess-split","message":{"id":"msg_X3","model":"claude-opus-5-5","role":"assistant","content":[{"type":"text","text":"x"}],"usage":{"input_tokens":5,"output_tokens":6,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+    "\n",
+    r#"{"type":"assistant","timestamp":"2026-11-10T12:03:00.000Z","sessionId":"sess-split","cwd":"C:\\work\\demo-app\\.claude\\worktrees\\agent-1","gitBranch":"worktree-agent-1","message":{"id":"msg_X4","model":"claude-opus-5-5","role":"assistant","content":[{"type":"text","text":"x"}],"usage":{"input_tokens":5,"output_tokens":6,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+    "\n"
+);
+
+// 분리 줄 파일을 작업 공간 projects 아래 encoded-folder 로 쓰고 그 경로 반환
+fn write_split_transcript(projects_dir: &std::path::Path) -> std::path::PathBuf {
+    let folder = projects_dir.join("encoded-folder");
+    fs::create_dir_all(&folder).expect("프로젝트 폴더");
+    let path = folder.join("sess-split.jsonl");
+    fs::write(&path, SPLIT_TRANSCRIPT).expect("분리 기록 쓰기");
+    path
+}
+
+// 요청별 (키, 프로젝트, 브랜치, 5분, 1시간, 쓰기 합계) 조회
+fn load_split_rows(store: &crate::store::Store) -> Vec<(String, String, String, i64, i64, i64)> {
+    store
+        .with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT request_key, project, git_branch, cache_creation_5m_tokens, \
+                 cache_creation_1h_tokens, cache_creation_tokens FROM api_requests \
+                 WHERE request_key LIKE 'msg_X%' ORDER BY request_key",
+            )?;
+            stmt.query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })?
+            .collect()
+        })
+        .expect("분리 행 조회")
+}
+
+#[test]
+fn cache_split_cwd_and_branch_reach_request_rows_and_project_stats() {
+    // 1. 색인 (작업 폴더는 마지막 경로 요소만, 분리 없는 줄은 쓰기 합계만)
+    let workspace = prepare_fixture_workspace("split-rows");
+    write_split_transcript(&workspace.projects_dir);
+    index_transcripts_once(&workspace.config, &workspace.store).expect("색인");
+    let rows = load_split_rows(&workspace.store);
+    let text = |value: &str| value.to_string();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                text("msg_X1"),
+                text("demo-app"),
+                text("feature/cost"),
+                700,
+                300,
+                1000
+            ),
+            (text("msg_X2"), text("other-app"), text(""), 0, 0, 400),
+            (text("msg_X3"), text(""), text(""), 0, 0, 0),
+            (
+                text("msg_X4"),
+                text("demo-app"),
+                text("worktree-agent-1"),
+                0,
+                0,
+                0
+            ),
+        ]
+    );
+
+    // 2. 프로젝트 통계 (작업 폴더 없는 요청은 세션 폴더명, 분리 없는 쓰기는 5분)
+    let stats = workspace
+        .store
+        .query_project_stats(SINCE, UNTIL)
+        .expect("프로젝트 통계");
+    let find = |project: &str, branch: &str| {
+        stats
+            .iter()
+            .find(|row| row.project == project && row.git_branch == branch)
+            .unwrap_or_else(|| panic!("{project}/{branch}"))
+    };
+    let demo = find("demo-app", "feature/cost");
+    assert_eq!(
+        (
+            demo.requests,
+            demo.cache_creation_5m_tokens,
+            demo.cache_creation_1h_tokens
+        ),
+        (1, 700, 300)
+    );
+    let other = find("other-app", "");
+    assert_eq!(
+        (
+            other.cache_creation_5m_tokens,
+            other.cache_creation_1h_tokens
+        ),
+        (400, 0)
+    );
+    assert_eq!(find("encoded-folder", "").requests, 1);
+}
+
+#[test]
+fn schema_upgrade_rescans_indexed_files_to_fill_new_columns() {
+    // 1. 색인 후 신규 열을 떨구어 이전 스키마 DB 흉내
+    let workspace = prepare_fixture_workspace("split-upgrade");
+    write_split_transcript(&workspace.projects_dir);
+    index_transcripts_once(&workspace.config, &workspace.store).expect("최초 색인");
+    let db_path = workspace.root.join("data").join("cm.sqlite");
+    workspace
+        .store
+        .with_conn(|conn| {
+            conn.execute_batch(
+                "ALTER TABLE api_requests DROP COLUMN cache_creation_5m_tokens; \
+                 ALTER TABLE api_requests DROP COLUMN cache_creation_1h_tokens; \
+                 ALTER TABLE api_requests DROP COLUMN git_branch; \
+                 ALTER TABLE api_requests DROP COLUMN project;",
+            )
+        })
+        .expect("이전 스키마 흉내");
+
+    // 2. 재열기가 열을 다시 만들고 커서를 비움 (새 행 0건, 파일은 다시 읽음)
+    let upgraded = crate::store::Store::open_store(&db_path).expect("업그레이드 열기");
+    assert!(
+        load_split_rows(&upgraded)
+            .iter()
+            .all(|row| row.1.is_empty() && row.3 == 0)
+    );
+    let summary = index_transcripts_once(&workspace.config, &upgraded).expect("재색인");
+    assert_eq!(summary.counts.api_requests, 0);
+    assert!(summary.files_changed >= 1);
+
+    // 3. 기존 행이 새 열 값으로 채워짐
+    let rows = load_split_rows(&upgraded);
+    assert_eq!(rows[0].1, "demo-app");
+    assert_eq!((rows[0].3, rows[0].4), (700, 300));
+    assert_eq!(rows[1].1, "other-app");
+    drop(upgraded);
+}
+
+// 3-1. 대기 표식이 남으면 다음 실행이 커서를 한 번 더 비움 --------------------
+#[test]
+fn pending_backfill_marker_makes_next_run_reread_once() {
+    // 1. 커서가 채워진 상태 (이전 바이너리가 새 열 없이 다시 색인한 뒤)
+    let workspace = prepare_fixture_workspace("backfill-marker");
+    index_transcripts_once(&workspace.config, &workspace.store).expect("최초 색인");
+    let quiet = index_transcripts_once(&workspace.config, &workspace.store).expect("조용한 실행");
+    assert_eq!(quiet.files_changed, 0);
+
+    // 2. 열 추가 마이그레이션이 남긴 표식: 다음 실행은 전체를 다시 읽음
+    workspace
+        .store
+        .with_conn(|conn| {
+            conn.execute("INSERT INTO index_backfill_pending (marker) VALUES (1)", [])
+        })
+        .expect("표식 심기");
+    let reread = index_transcripts_once(&workspace.config, &workspace.store).expect("다시 읽기");
+    assert_eq!(reread.files_changed, 2);
+    assert_eq!(reread.counts.api_requests, 0);
+
+    // 3. 한 번만: 그 다음 실행은 다시 조용
+    let after = index_transcripts_once(&workspace.config, &workspace.store).expect("이후 실행");
+    assert_eq!(after.files_changed, 0);
+}
+
 // 4. 훅 거부 판독 -------------------------------------------------------------
 #[test]
 fn denial_text_keeps_only_labels() {

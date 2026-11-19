@@ -7,6 +7,7 @@ mod tests;
 use crate::core::config::PowerConfig;
 use crate::core::context::AppContext;
 use crate::core::model::LiveEvent;
+use crate::store::Store;
 use chrono::{DateTime, Local, SecondsFormat, Utc};
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -118,6 +119,8 @@ struct GapLedger {
     gaps: VecDeque<StandbyGap>,
     next_id: u64,
     notified: VecDeque<(String, i64)>,
+    // 저장소의 최대 번호를 읽어 next_id 를 맞촘는지 (복원 실패 시 false)
+    synced: bool,
 }
 
 impl PowerState {
@@ -137,6 +140,32 @@ impl PowerState {
             ledger.gaps.pop_front();
         }
         gap
+    }
+
+    /// 저장소의 최근 구간으로 보관분 교체, 번호는 저장된 최대값에서 이어감.
+    pub fn restore_gaps(&self, store: &Store) -> anyhow::Result<usize> {
+        let saved = store.load_standby_gaps(MAX_KEPT_GAPS)?;
+        let restored = saved.len();
+        let mut ledger = self
+            .ledger
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let last_id = saved.last().map_or(0, |gap| gap.id);
+        ledger.next_id = ledger.next_id.max(last_id);
+        ledger.gaps = saved.into();
+        ledger.synced = true;
+        Ok(restored)
+    }
+
+    /// 시작 복원이 실패해 번호가 1 부터인 상태면 첫 기록 전에 저장소에서 다시 읽음
+    /// (번호가 저장된 구간과 겹쳐 덮어쓰는 것을 막음). 맞춰졌으면 true.
+    pub fn sync_gap_ids(&self, store: &Store) -> bool {
+        let synced = self
+            .ledger
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .synced;
+        synced || self.restore_gaps(store).is_ok()
     }
 
     pub fn list_gaps(&self) -> Vec<StandbyGap> {
@@ -262,6 +291,19 @@ impl PowerState {
 // 6. 감시 스레드 --------------------------------------------------------------
 /// `cm-power` 스레드 기동 (절전 유예 요청은 스레드 단위).
 pub fn spawn_power_monitor(ctx: Arc<AppContext>) -> io::Result<()> {
+    // 직전 실행의 구간 복원 (실패해도 빈 목록으로 감시 시작)
+    match ctx.power.restore_gaps(&ctx.store) {
+        Ok(restored) if restored > 0 => {
+            let _ = writeln!(io::stderr(), "[cm] 대기 구간 {restored}건 복원");
+        }
+        Ok(_) => {}
+        Err(err) => {
+            let _ = writeln!(
+                io::stderr(),
+                "[cm] 대기 구간 복원 실패 (빈 목록으로 시작): {err:#}"
+            );
+        }
+    }
     thread::Builder::new()
         .name("cm-power".to_string())
         .spawn(move || {
@@ -293,7 +335,26 @@ pub fn spawn_power_monitor(ctx: Arc<AppContext>) -> io::Result<()> {
 
                 // 2. 대기 구간 기록·알림 (주기 시각보다 먼저 기록)
                 if let Some(detected) = outcome.gap {
+                    // 시작 복원 실패분은 번호를 정하기 전에 다시 복원 (실패하면 다음 구간에서 재시도)
+                    if !power.sync_gap_ids(&ctx.store) {
+                        let _ = writeln!(
+                            io::stderr(),
+                            "[cm] 대기 구간 번호 복원 재시도 실패 (저장 번호가 겹칠 수 있음)"
+                        );
+                    }
                     let gap = power.record_gap(detected);
+
+                    // 저장은 별도 스레드 (DB 경합이 주기를 막지 않게)
+                    let saver = Arc::clone(&ctx);
+                    if let Err(err) = thread::Builder::new()
+                        .name("cm-power-save".to_string())
+                        .spawn(move || {
+                            persist_gap(&saver, &gap);
+                        })
+                    {
+                        let _ =
+                            writeln!(io::stderr(), "[cm] 대기 구간 저장 스레드 생성 실패: {err}");
+                    }
                     let held = if power.holding.load(Ordering::Relaxed) {
                         "중"
                     } else {
@@ -329,6 +390,22 @@ pub fn spawn_power_monitor(ctx: Arc<AppContext>) -> io::Result<()> {
             }
         })
         .map(|_| ())
+}
+
+// 6-1. 구간 저장 --------------------------------------------------------------
+/// 구간 한 건 저장 (실패는 알림만 남기고 감시 계속).
+pub fn persist_gap(ctx: &AppContext, gap: &StandbyGap) -> bool {
+    let Err(err) = ctx.store.save_standby_gap(gap) else {
+        return true;
+    };
+    let text = format!("대기 구간 #{} 저장 실패 (감시 계속): {err:#}", gap.id);
+    let _ = writeln!(io::stderr(), "[cm] {text}");
+    let _ = ctx.live_tx.send(LiveEvent::Notice {
+        ts: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        level: "warn".to_string(),
+        text,
+    });
+    false
 }
 
 // 7. 감시 종료 표식 -----------------------------------------------------------

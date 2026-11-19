@@ -308,7 +308,8 @@ impl AppState {
             return UiCommand::None;
         }
 
-        // 5. 열 경계 잡기: 머리글 정렬보다 우선, 끌지 않고 떼 직후 다시 누르면 자동 폭 복원
+        // 5. 열 경계 잡기: 머리글 정렬보다 우선, 경계 칸을 끌지 않고 떼 직후 다시 누르면 자동 폭 복원
+        // 경계 옆 머리글 칸은 끌면 열 폭, 끌지 않고 떼면 그 열 정렬 (떼는 순간 end_drags 가 처리)
         let column_hit = self
             .hit_areas
             .column_hits
@@ -317,11 +318,18 @@ impl AppState {
             .copied();
         if let Some(hit) = column_hit {
             self.focused_card = Some((self.tab, hit.card));
-            let double_click = self.last_column_click.is_some_and(|(card, column, at)| {
-                card == hit.card
-                    && column == hit.column
-                    && now.saturating_duration_since(at) < DOUBLE_CLICK_WINDOW
-            });
+            let click_sort = self
+                .hit_areas
+                .header_cells
+                .iter()
+                .find(|header| header.rect.contains(position))
+                .map(|header| header.column);
+            let double_click = click_sort.is_none()
+                && self.last_column_click.is_some_and(|(card, column, at)| {
+                    card == hit.card
+                        && column == hit.column
+                        && now.saturating_duration_since(at) < DOUBLE_CLICK_WINDOW
+                });
             self.last_column_click = None;
             if double_click {
                 self.column_widths[hit.card as usize] = [None; MAX_TABLE_COLUMNS];
@@ -337,12 +345,15 @@ impl AppState {
                 start_x: position.x,
                 start_width: hit.width,
                 moved: false,
+                click_sort,
             });
             self.column_hover = Some((hit.card, hit.column));
-            self.show_toast(
-                i18n::text(self.lang, Msg::ToastColumnDrag),
-                ToastLevel::Info,
-            );
+            if click_sort.is_none() {
+                self.show_toast(
+                    i18n::text(self.lang, Msg::ToastColumnDrag),
+                    ToastLevel::Info,
+                );
+            }
             return UiCommand::None;
         }
 
@@ -438,7 +449,8 @@ impl AppState {
 
     // 8. 끌기 종료 ------------------------------------------------------------
     // 놓음과 놓침(버튼 없는 움직임, 새 누름, 탭 전환, 크기 변경)이 같은 방식으로 경계·열·썸 끌기를 끝냄
-    // click_at 이 있으면 끌지 않고 뗀 열 경계 클릭을 더블클릭 후보로 기록, 반환 = 끌어 움직인 것이 있어 저장이 필요한지
+    // click_at 이 있으면 끌지 않고 뗀 클릭을 처리: 경계 옆 머리글 칸은 그 열 정렬, 경계 칸은 더블클릭 후보로 기록
+    // 반환 = 끌어 움직인 것이 있어 저장이 필요한지
     pub fn end_drags(&mut self, click_at: Option<Instant>) -> bool {
         let split_moved = self.split_drag.take().is_some_and(|drag| drag.moved);
         self.scroll_drag = None;
@@ -448,7 +460,13 @@ impl AppState {
             if drag.moved {
                 self.last_column_click = None;
             } else if let Some(at) = click_at {
-                self.last_column_click = Some((drag.card, drag.column, at));
+                match drag.click_sort {
+                    Some(column) => {
+                        self.last_column_click = None;
+                        self.change_card_sort(drag.card, SortChange::SelectColumn(column));
+                    }
+                    None => self.last_column_click = Some((drag.card, drag.column, at)),
+                }
             }
         }
         split_moved || column_moved
@@ -943,7 +961,7 @@ mod tests {
             state.tab = tab;
             draw(&mut state, 170, 60);
             let hit = header_hit(&state, card, column);
-            click(&mut state, hit.rect.x, hit.rect.y);
+            click(&mut state, hit.rect.x + hit.rect.width / 2, hit.rect.y);
             let spec = crate::tui::sort::sort_spec(card).unwrap();
             let number_first = spec.kinds[column] == SortKind::Number;
             let first = card_sort(&state, card);
@@ -951,14 +969,14 @@ mod tests {
             assert_eq!(first.descending, number_first, "{card:?}");
 
             draw(&mut state, 170, 60);
-            click(&mut state, hit.rect.x, hit.rect.y);
+            click(&mut state, hit.rect.x + hit.rect.width / 2, hit.rect.y);
             let second = card_sort(&state, card);
             assert_eq!(second.column, column, "{card:?}");
             assert_eq!(second.descending, !number_first, "{card:?}");
 
             // 세 번째 클릭은 카드 기본 정렬로 복원
             draw(&mut state, 170, 60);
-            click(&mut state, hit.rect.x, hit.rect.y);
+            click(&mut state, hit.rect.x + hit.rect.width / 2, hit.rect.y);
             assert_eq!(card_sort(&state, card), spec.default, "{card:?}");
         }
     }
@@ -983,7 +1001,11 @@ mod tests {
 
         // 호출 내림차순 (숫자 열 첫 클릭): Read, Bash, Edit 이라 Read 는 첫 행
         let calls = header_hit(&state, CardId::ToolTable, 1);
-        click(&mut state, calls.rect.x, calls.rect.y);
+        click(
+            &mut state,
+            calls.rect.x + calls.rect.width / 2,
+            calls.rect.y,
+        );
         assert_eq!(state.card_views[table].selected, 0);
         let buffer = draw(&mut state, 100, 30);
         assert_eq!(
@@ -996,12 +1018,20 @@ mod tests {
         assert!(text.contains("Read"));
 
         // 호출 오름차순: Edit, Bash, Read 이라 Read 는 마지막 행
-        click(&mut state, calls.rect.x, calls.rect.y);
+        click(
+            &mut state,
+            calls.rect.x + calls.rect.width / 2,
+            calls.rect.y,
+        );
         assert_eq!(state.card_views[table].selected, 2);
 
         // 세 번째 클릭으로 기본 정렬(합계 내림차순)에 돌아와도 Read 선택 유지
         draw(&mut state, 100, 30);
-        click(&mut state, calls.rect.x, calls.rect.y);
+        click(
+            &mut state,
+            calls.rect.x + calls.rect.width / 2,
+            calls.rect.y,
+        );
         assert_eq!(card_sort(&state, CardId::ToolTable).column, 5);
         assert_eq!(state.card_views[table].selected, 1);
     }
@@ -1221,17 +1251,22 @@ mod tests {
         let yesterday = chrono::NaiveDate::from_ymd_opt(2026, 11, 14).unwrap();
         let earlier = chrono::NaiveDate::from_ymd_opt(2026, 11, 13).unwrap();
 
+        // 기본 날짜는 오늘이라 다음 버튼은 이동하지 않음
+        assert_eq!(state.report_date, today);
         let next = find_button(&state, UiAction::ReportNext);
-        assert_eq!(
-            click(&mut state, next.x, next.y),
-            UiCommand::LoadReport(today)
-        );
-        // 오늘이면 다음 버튼은 더 이동하지 않음
         assert_eq!(click(&mut state, next.x, next.y), UiCommand::None);
 
         let prev = find_button(&state, UiAction::ReportPrev);
         assert_eq!(
             click(&mut state, prev.x, prev.y),
+            UiCommand::LoadReport(yesterday)
+        );
+        assert_eq!(
+            click(&mut state, prev.x, prev.y),
+            UiCommand::LoadReport(earlier)
+        );
+        assert_eq!(
+            click(&mut state, next.x, next.y),
             UiCommand::LoadReport(yesterday)
         );
         assert_eq!(
@@ -1416,9 +1451,9 @@ mod tests {
         let default_sort = card_sort(&state, CardId::HookTable);
 
         // 경계를 누르면 드래그 시작, 오른쪽으로 4칸 이동
-        click(&mut state, route.grab.x, route.grab.y);
+        click(&mut state, route.line.x, route.line.y);
         assert!(state.column_drag.is_some());
-        drag_to(&mut state, route.grab.x + 4, route.grab.y);
+        drag_to(&mut state, route.line.x + 4, route.line.y);
         draw(&mut state, 200, 30);
 
         // 왼쪽 열이 넓어지고 상세(남는 폭) 열이 그만큼 좋아짐, 숫자 열은 그대로
@@ -1433,7 +1468,7 @@ mod tests {
         assert_eq!(column_hit(&state, CardId::HookTable, 4).width, count_before);
 
         // 드래그는 정렬을 바꾸지 않고, 놓으면 끝남 (움직였으니 더블클릭 후보 없음)
-        release_at(&mut state, route.grab.x + 4, route.grab.y);
+        release_at(&mut state, route.line.x + 4, route.line.y);
         assert_eq!(card_sort(&state, CardId::HookTable), default_sort);
         assert!(state.column_drag.is_none());
         assert!(state.last_column_click.is_none());
@@ -1444,8 +1479,8 @@ mod tests {
 
         // 왼쪽으로 되돌리면 다시 좁아짐
         let moved = column_hit(&state, CardId::HookTable, 0);
-        click(&mut state, moved.grab.x, moved.grab.y);
-        drag_to(&mut state, moved.grab.x - 2, moved.grab.y);
+        click(&mut state, moved.line.x, moved.line.y);
+        drag_to(&mut state, moved.line.x - 2, moved.line.y);
         draw(&mut state, 200, 30);
         assert_eq!(
             column_hit(&state, CardId::HookTable, 0).width,
@@ -1461,8 +1496,8 @@ mod tests {
         let count = column_hit(&state, CardId::HookTable, 4);
 
         // 글자 열: 최소 3칸에서 멈춤
-        click(&mut state, route.grab.x, route.grab.y);
-        drag_to(&mut state, 0, route.grab.y);
+        click(&mut state, route.line.x, route.line.y);
+        drag_to(&mut state, 0, route.line.y);
         draw(&mut state, 200, 30);
         assert_eq!(column_hit(&state, CardId::HookTable, 0).width, 3);
         let shrunk = state
@@ -1471,14 +1506,14 @@ mod tests {
             .iter()
             .find(|hit| hit.card == CardId::HookTable && hit.column == 0);
         assert_eq!(shrunk.map(|hit| hit.rect.width), Some(3));
-        release_at(&mut state, 0, route.grab.y);
+        release_at(&mut state, 0, route.line.y);
 
         // 숫자 열: 내용 폭 미만으로는 내려가지 않고, 늘리는 것은 허용
-        click(&mut state, count.grab.x, count.grab.y);
-        drag_to(&mut state, count.grab.x - 30, count.grab.y);
+        click(&mut state, count.line.x, count.line.y);
+        drag_to(&mut state, count.line.x - 30, count.line.y);
         draw(&mut state, 200, 30);
         assert_eq!(column_hit(&state, CardId::HookTable, 4).width, count.width);
-        drag_to(&mut state, count.grab.x + 3, count.grab.y);
+        drag_to(&mut state, count.line.x + 3, count.line.y);
         draw(&mut state, 200, 30);
         assert_eq!(
             column_hit(&state, CardId::HookTable, 4).width,
@@ -1487,30 +1522,55 @@ mod tests {
     }
 
     #[test]
-    fn header_click_near_a_boundary_sorts_but_the_boundary_itself_does_not() {
+    fn header_cells_beside_a_boundary_drag_the_width_or_sort_on_a_plain_click() {
         let mut state = hooks_state();
         draw(&mut state, 200, 30);
         let route = column_hit(&state, CardId::HookTable, 0);
         let header = header_hit(&state, CardId::HookTable, 0);
+        let next = header_hit(&state, CardId::HookTable, 1);
         let default_sort = card_sort(&state, CardId::HookTable);
-        assert_eq!(header.rect.right(), route.grab.x);
+        assert_eq!(header.rect.right(), route.line.x);
+        assert_eq!(next.rect.x, route.line.x + 1);
 
-        // 경계 칸: 정렬 불변
-        click(&mut state, route.grab.x, route.grab.y);
-        release_at(&mut state, route.grab.x, route.grab.y);
+        // 잡는 칸 = 왼쪽 머리글 끝 칸, 경계 칸, 오른쪽 머리글 첫 칸
+        assert_eq!(route.grab, Rect::new(route.line.x - 1, route.line.y, 3, 1));
+
+        // 경계 칸: 누르고 떼도 정렬 불변, 더블클릭 후보만 남음
+        click(&mut state, route.line.x, route.line.y);
+        release_at(&mut state, route.line.x, route.line.y);
         assert_eq!(card_sort(&state, CardId::HookTable), default_sort);
+        assert!(state.last_column_click.is_some());
 
-        // 경계 바로 왼쪽 칸(머리글 영역 끝): 정렬
-        click(&mut state, route.grab.x - 1, header.rect.y);
+        // 경계 바로 왼쪽 칸: 누르면 끌기 대기, 끌지 않고 떼면 그 열 정렬 (폭 불변, 더블클릭 후보 지움)
+        click(&mut state, route.line.x - 1, header.rect.y);
+        assert!(state.column_drag.is_some());
+        assert_eq!(card_sort(&state, CardId::HookTable), default_sort);
+        release_at(&mut state, route.line.x - 1, header.rect.y);
         let sorted = card_sort(&state, CardId::HookTable);
         assert_eq!((sorted.column, sorted.descending), (0, false));
         assert!(state.column_drag.is_none());
+        assert!(state.last_column_click.is_none());
+        assert!(
+            state.column_widths[CardId::HookTable as usize]
+                .iter()
+                .all(Option::is_none)
+        );
 
-        // 경계 바로 오른쪽 칸(다음 열 머리글 시작): 그 열 정렬
-        let next = header_hit(&state, CardId::HookTable, 1);
-        assert_eq!(next.rect.x, route.grab.x + 1);
+        // 경계 바로 오른쪽 칸: 끌지 않고 떼면 그 열 정렬
         click(&mut state, next.rect.x, next.rect.y);
+        release_at(&mut state, next.rect.x, next.rect.y);
         assert_eq!(card_sort(&state, CardId::HookTable).column, 1);
+
+        // 같은 칸에서 끌면 정렬 없이 왼쪽 열 폭이 바뀜
+        let before = card_sort(&state, CardId::HookTable);
+        click(&mut state, next.rect.x, next.rect.y);
+        drag_to(&mut state, next.rect.x + 2, next.rect.y);
+        release_at(&mut state, next.rect.x + 2, next.rect.y);
+        assert_eq!(card_sort(&state, CardId::HookTable), before);
+        assert_eq!(
+            state.column_widths[CardId::HookTable as usize][0],
+            Some(route.width + 2)
+        );
     }
 
     #[test]
@@ -1521,9 +1581,9 @@ mod tests {
         let auto_detail = column_hit(&state, CardId::HookTable, 3).width;
         let drag_route_by_five = |state: &mut AppState| {
             let hit = column_hit(state, CardId::HookTable, 0);
-            click(state, hit.grab.x, hit.grab.y);
-            drag_to(state, hit.grab.x + 5, hit.grab.y);
-            release_at(state, hit.grab.x + 5, hit.grab.y);
+            click(state, hit.line.x, hit.line.y);
+            drag_to(state, hit.line.x + 5, hit.line.y);
+            release_at(state, hit.line.x + 5, hit.line.y);
             draw(state, 200, 30);
         };
 
@@ -1533,7 +1593,7 @@ mod tests {
             column_hit(&state, CardId::HookTable, 0).width,
             route.width + 5
         );
-        let grab = column_hit(&state, CardId::HookTable, 0).grab;
+        let grab = column_hit(&state, CardId::HookTable, 0).line;
         click(&mut state, grab.x, grab.y);
         release_at(&mut state, grab.x, grab.y);
         assert!(state.last_column_click.is_some());
@@ -1562,37 +1622,43 @@ mod tests {
     }
 
     #[test]
-    fn column_boundary_shows_a_grip_only_on_hover_or_drag() {
+    fn column_boundary_shows_a_faint_mark_at_rest_and_a_full_grip_on_hover_or_drag() {
         let mut state = hooks_state();
         let calm = draw(&mut state, 200, 30);
         let route = column_hit(&state, CardId::HookTable, 0);
+        assert!(route.line.height >= 2);
 
-        // 평소: 모든 열 경계 칸이 빈 칸 (손잡이가 남기는 찌꺼기 없음)
-        let assert_blank = |buffer: &Buffer, state: &AppState| {
+        // 평소: 경계 칸은 머리글 행에만 흐린 │, 본문 행은 빈 칸 (손잡이가 남기는 찌꺼기 없음)
+        let assert_calm = |buffer: &Buffer, state: &AppState| {
             assert!(!state.hit_areas.column_hits.is_empty());
             for hit in &state.hit_areas.column_hits {
-                for y in hit.line.y..hit.line.bottom() {
+                let mark = buffer.cell((hit.line.x, hit.line.y)).unwrap();
+                assert_eq!(mark.symbol(), "│", "{hit:?}");
+                assert_eq!(mark.fg, theme::FG_FAINT, "{hit:?}");
+                for y in hit.line.y + 1..hit.line.bottom() {
                     let cell = buffer.cell((hit.line.x, y)).unwrap();
                     assert_eq!(cell.symbol(), " ", "{hit:?} {y}");
                 }
             }
         };
-        assert_blank(&calm, &state);
+        assert_calm(&calm, &state);
 
-        // 호버: 머리글 칸 하나만 회색 손잡이
-        state.handle_mouse_event(mouse(MouseEventKind::Moved, route.grab.x, route.grab.y));
-        assert_eq!(state.column_hover, Some((CardId::HookTable, 0)));
-        assert_eq!(state.split_hover, None);
-        let hovered = draw(&mut state, 200, 30);
-        let grip = hovered.cell((route.grab.x, route.grab.y)).unwrap();
-        assert_eq!(grip.symbol(), "┃");
-        assert_eq!(grip.fg, theme::SPLIT_GRIP_HOT);
-        let below = hovered.cell((route.grab.x, route.grab.y + 1)).unwrap();
-        assert_eq!(below.symbol(), " ");
+        // 호버 (경계 옆 머리글 칸 포함): 머리글과 본문 행 전체가 회색 ┃
+        for x in [route.grab.x, route.line.x, route.grab.right() - 1] {
+            state.handle_mouse_event(mouse(MouseEventKind::Moved, x, route.line.y));
+            assert_eq!(state.column_hover, Some((CardId::HookTable, 0)), "{x}");
+            assert_eq!(state.split_hover, None);
+            let hovered = draw(&mut state, 200, 30);
+            for y in route.line.y..route.line.bottom() {
+                let grip = hovered.cell((route.line.x, y)).unwrap();
+                assert_eq!(grip.symbol(), "┃", "{x} {y}");
+                assert_eq!(grip.fg, theme::SPLIT_GRIP_HOT, "{x} {y}");
+            }
+        }
 
         // 드래그: 표 높이 전체가 드래그색
-        click(&mut state, route.grab.x, route.grab.y);
-        drag_to(&mut state, route.grab.x + 2, route.grab.y);
+        click(&mut state, route.line.x, route.line.y);
+        drag_to(&mut state, route.line.x + 2, route.line.y);
         let dragged = draw(&mut state, 200, 30);
         let moved = column_hit(&state, CardId::HookTable, 0);
         for y in moved.line.y..moved.line.bottom() {
@@ -1601,12 +1667,12 @@ mod tests {
             assert_eq!(cell.fg, theme::SPLIT_GRIP_DRAG, "{y}");
         }
 
-        // 놓고 벗어나면 다시 아무것도 그리지 않음
-        release_at(&mut state, route.grab.x + 2, route.grab.y);
+        // 놓고 벗어나면 평소 표시로 돌아감
+        release_at(&mut state, route.line.x + 2, route.line.y);
         state.handle_mouse_event(mouse(MouseEventKind::Moved, 1, 0));
         assert_eq!(state.column_hover, None);
         let idle = draw(&mut state, 200, 30);
-        assert_blank(&idle, &state);
+        assert_calm(&idle, &state);
     }
 
     #[test]
@@ -2246,8 +2312,8 @@ mod tests {
         let mut state = hooks_state();
         draw(&mut state, 200, 30);
         let route = column_hit(&state, CardId::HookTable, 0);
-        click(&mut state, route.grab.x, route.grab.y);
-        drag_to(&mut state, route.grab.x + 3, route.grab.y);
+        click(&mut state, route.line.x, route.line.y);
+        drag_to(&mut state, route.line.x + 3, route.line.y);
         assert!(state.column_drag.is_some_and(|drag| drag.moved));
         let dragged = state.column_widths[CardId::HookTable as usize][0];
         assert!(dragged.is_some());
@@ -2265,8 +2331,8 @@ mod tests {
         assert_eq!(
             state.handle_mouse_event(mouse(
                 MouseEventKind::Up(MouseButton::Left),
-                route.grab.x + 3,
-                route.grab.y
+                route.line.x + 3,
+                route.line.y
             )),
             UiCommand::None
         );
@@ -2300,7 +2366,7 @@ mod tests {
         let mut state = hooks_state();
         draw(&mut state, 200, 30);
         let route = column_hit(&state, CardId::HookTable, 0);
-        click(&mut state, route.grab.x, route.grab.y);
+        click(&mut state, route.line.x, route.line.y);
         assert!(state.column_drag.is_some_and(|drag| !drag.moved));
         assert_eq!(state.handle_resize(), UiCommand::None);
         assert!(state.column_drag.is_none());
@@ -2372,28 +2438,28 @@ mod tests {
         let mut state = hooks_state();
         draw(&mut state, 200, 30);
         let route = column_hit(&state, CardId::HookTable, 0);
-        click(&mut state, route.grab.x, route.grab.y);
-        drag_to(&mut state, route.grab.x + 3, route.grab.y);
+        click(&mut state, route.line.x, route.line.y);
+        drag_to(&mut state, route.line.x + 3, route.line.y);
         let up = mouse(
             MouseEventKind::Up(MouseButton::Left),
-            route.grab.x + 3,
-            route.grab.y,
+            route.line.x + 3,
+            route.line.y,
         );
         assert_eq!(state.handle_mouse_event(up), UiCommand::SaveState);
 
         draw(&mut state, 200, 30);
         let moved = column_hit(&state, CardId::HookTable, 0);
-        click(&mut state, moved.grab.x, moved.grab.y);
+        click(&mut state, moved.line.x, moved.line.y);
         assert_eq!(
             state.handle_mouse_event(mouse(
                 MouseEventKind::Up(MouseButton::Left),
-                moved.grab.x,
-                moved.grab.y
+                moved.line.x,
+                moved.line.y
             )),
             UiCommand::None
         );
         assert_eq!(
-            click(&mut state, moved.grab.x, moved.grab.y),
+            click(&mut state, moved.line.x, moved.line.y),
             UiCommand::SaveState
         );
         assert!(
@@ -2409,7 +2475,7 @@ mod tests {
         let base = Instant::now();
         draw(&mut state, 200, 30);
         let route = column_hit(&state, CardId::HookTable, 0);
-        let grab = (route.grab.x, route.grab.y);
+        let grab = (route.line.x, route.line.y);
 
         // 끌어 움직인 뒤 Up 없이 버튼 없는 움직임: 끌기 종료, 폭 유지, 저장 요청 (더블클릭 후보는 없음)
         press_at(&mut state, grab, base);
@@ -2437,7 +2503,7 @@ mod tests {
         // 끌지 않고 잡기만 했으면 저장 없이 끝나고 더블클릭 후보만 남음
         draw(&mut state, 200, 30);
         let moved = column_hit(&state, CardId::HookTable, 0);
-        press_at(&mut state, (moved.grab.x, moved.grab.y), after(base, 500));
+        press_at(&mut state, (moved.line.x, moved.line.y), after(base, 500));
         assert_eq!(
             moved_at(&mut state, 0, 0, after(base, 520)),
             UiCommand::None
@@ -2502,7 +2568,7 @@ mod tests {
         let base = Instant::now();
         draw(&mut state, 200, 30);
         let route = column_hit(&state, CardId::HookTable, 0);
-        let grab = (route.grab.x, route.grab.y);
+        let grab = (route.line.x, route.line.y);
         press_at(&mut state, grab, base);
         drag_at(&mut state, grab.0 + 3, grab.1, after(base, 50));
         let dragged = state.column_widths[CardId::HookTable as usize][0];
@@ -2525,8 +2591,8 @@ mod tests {
         // 다른 실행 요청이 있는 누름(설정 탭)은 그 요청을 돌려주고 저장은 save_pending 으로 남김
         draw(&mut state, 200, 30);
         let route = column_hit(&state, CardId::HookTable, 0);
-        press_at(&mut state, (route.grab.x, route.grab.y), after(base, 200));
-        drag_at(&mut state, route.grab.x + 2, route.grab.y, after(base, 250));
+        press_at(&mut state, (route.line.x, route.line.y), after(base, 200));
+        drag_at(&mut state, route.line.x + 2, route.line.y, after(base, 250));
         let settings = state
             .hit_areas
             .tab_rects
@@ -2548,8 +2614,8 @@ mod tests {
         let base = Instant::now();
         draw(&mut state, 200, 30);
         let route = column_hit(&state, CardId::HookTable, 0);
-        press_at(&mut state, (route.grab.x, route.grab.y), base);
-        drag_at(&mut state, route.grab.x + 3, route.grab.y, after(base, 50));
+        press_at(&mut state, (route.line.x, route.line.y), base);
+        drag_at(&mut state, route.line.x + 3, route.line.y, after(base, 50));
         let dragged = state.column_widths[CardId::HookTable as usize][0];
         assert!(dragged.is_some());
 
@@ -2561,7 +2627,7 @@ mod tests {
         state.switch_tab(ActiveTab::Hooks);
         draw(&mut state, 200, 30);
         let route = column_hit(&state, CardId::HookTable, 0);
-        press_at(&mut state, (route.grab.x, route.grab.y), after(base, 400));
+        press_at(&mut state, (route.line.x, route.line.y), after(base, 400));
         assert_eq!(state.switch_tab(ActiveTab::Overview), UiCommand::None);
         assert!(state.column_drag.is_none());
         assert!(!state.save_pending);
@@ -2569,8 +2635,8 @@ mod tests {
         state.switch_tab(ActiveTab::Hooks);
         draw(&mut state, 200, 30);
         let route = column_hit(&state, CardId::HookTable, 0);
-        press_at(&mut state, (route.grab.x, route.grab.y), after(base, 600));
-        drag_at(&mut state, route.grab.x + 2, route.grab.y, after(base, 650));
+        press_at(&mut state, (route.line.x, route.line.y), after(base, 600));
+        drag_at(&mut state, route.line.x + 2, route.line.y, after(base, 650));
         assert_eq!(
             state.switch_tab(ActiveTab::Settings),
             UiCommand::LoadSettings

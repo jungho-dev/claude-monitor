@@ -349,6 +349,126 @@ async fn stats_routes_return_seeded_aggregates() {
     let _ = server.await;
 }
 
+// 6-2. 프로젝트·브랜치 통계 ---------------------------------------------------
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn projects_route_returns_project_branch_aggregates() {
+    // 1. 서버 기동과 시드 (최근 10분, 작업 폴더 두 개와 브랜치 두 개)
+    let config = build_test_config("admin-projects");
+    let port = config.ports.admin;
+    let _cleanup = TempDirGuard(config.data_dir.clone());
+    let ctx = build_test_context(config);
+    let seeded_ts =
+        (Utc::now() - ChronoDuration::minutes(10)).to_rfc3339_opts(SecondsFormat::Millis, true);
+    let seeded_rows: Vec<ApiRequestRow> = [
+        ("r1", "alpha", "main", "sess-1"),
+        ("r2", "alpha", "main", "sess-2"),
+        ("r3", "alpha", "feature/x", "sess-2"),
+        ("r4", "beta", "", "sess-3"),
+    ]
+    .iter()
+    .map(|(key, project, branch, session)| ApiRequestRow {
+        source: DataSource::Transcript,
+        request_key: key.to_string(),
+        ts: seeded_ts.clone(),
+        session_id: session.to_string(),
+        agent: "main".to_string(),
+        model: "claude-opus-5-5".to_string(),
+        input_tokens: 100,
+        output_tokens: 50,
+        cache_creation_tokens: 1000,
+        cache_creation_5m_tokens: 700,
+        cache_creation_1h_tokens: 300,
+        project: project.to_string(),
+        git_branch: branch.to_string(),
+        ..ApiRequestRow::default()
+    })
+    .collect();
+    ctx.store
+        .insert_batch(&IngestBatch {
+            api_requests: seeded_rows,
+            ..IngestBatch::default()
+        })
+        .expect("시드 적재");
+    let server = tokio::spawn(run_admin_server(ctx.clone()));
+    wait_until_listening(port).await;
+
+    // 2. 묶음·토큰·비용 순서 (alpha/main 요청 2건이 첫 행)
+    let (status, _, text) = send_raw("GET", port, "/api/projects?hours=1", &[], b"").await;
+    assert_eq!(status, 200, "{text}");
+    let rows: serde_json::Value = serde_json::from_str(&text).expect("프로젝트 통계 JSON");
+    assert_eq!(rows.as_array().map(Vec::len), Some(3));
+    assert_eq!(rows[0]["project"], "alpha");
+    assert_eq!(rows[0]["git_branch"], "main");
+    assert_eq!(rows[0]["requests"], 2);
+    assert_eq!(rows[0]["sessions"], 2);
+    assert_eq!(rows[0]["cache_creation_5m_tokens"], 1400);
+    assert_eq!(rows[0]["cache_creation_1h_tokens"], 600);
+    assert!(
+        rows[0]["cost_usd_estimate"]
+            .as_f64()
+            .is_some_and(|cost| cost > 0.0)
+    );
+    assert_eq!(rows[1]["requests"], 1);
+
+    // 3. 형식 오류·토큰 검사
+    let (status, _, _) = send_raw("GET", port, "/api/projects?hours=abc", &[], b"").await;
+    assert_eq!(status, 400);
+    let (status, _, _) = send_raw("POST", port, "/api/projects", &[], b"").await;
+    assert_eq!(status, 401);
+    server.abort();
+    let _ = server.await;
+}
+
+// 6-3. 한도 스냅샷과 레이트리밋 헤더 ------------------------------------------
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn limits_and_ratelimit_routes_return_latest_and_history() {
+    // 1. 서버 기동과 시드 (statusline 스냅샷 1건, 게이트웨이 헤더 1건)
+    let config = build_test_config("admin-limits");
+    let port = config.ports.admin;
+    let _cleanup = TempDirGuard(config.data_dir.clone());
+    let ctx = build_test_context(config);
+    let seeded_ts =
+        (Utc::now() - ChronoDuration::minutes(10)).to_rfc3339_opts(SecondsFormat::Millis, true);
+    ctx.store
+        .insert_limit_snapshot(&crate::store::limits::LimitSnapshot {
+            ts: seeded_ts.clone(),
+            session_id: "sess-1".to_string(),
+            five_hour_pct: Some(42.0),
+            seven_day_pct: Some(18.0),
+            ..Default::default()
+        })
+        .expect("한도 시드");
+    ctx.store
+        .insert_ratelimit_snapshot(&crate::store::ratelimit::RatelimitSnapshotRow {
+            ts: seeded_ts,
+            status: Some(429),
+            extra_json: r#"{"anthropic-ratelimit-unified-status":"rejected"}"#.to_string(),
+            ..Default::default()
+        })
+        .expect("헤더 시드");
+    let server = tokio::spawn(run_admin_server(ctx.clone()));
+    wait_until_listening(port).await;
+
+    // 2. 한도: 최신값과 구간 이력
+    let (status, _, text) = send_raw("GET", port, "/api/limits?hours=1", &[], b"").await;
+    assert_eq!(status, 200, "{text}");
+    let limits: serde_json::Value = serde_json::from_str(&text).expect("한도 JSON");
+    assert_eq!(limits["latest"]["five_hour_pct"], 42.0);
+    assert_eq!(limits["history"].as_array().map(Vec::len), Some(1));
+
+    // 3. 레이트리밋: extra_json 은 문자열이 아니라 객체
+    let (status, _, text) = send_raw("GET", port, "/api/ratelimit?hours=1", &[], b"").await;
+    assert_eq!(status, 200, "{text}");
+    let rows: serde_json::Value = serde_json::from_str(&text).expect("헤더 JSON");
+    assert_eq!(rows[0]["status"], 429);
+    assert_eq!(
+        rows[0]["extra_json"]["anthropic-ratelimit-unified-status"],
+        "rejected"
+    );
+    server.abort();
+    let _ = server.await;
+}
+
 // 7. 바인드 기록 기준 수신 여부 -----------------------------------------------
 #[test]
 fn port_rows_follow_bound_record_over_connect_probe() {

@@ -1,9 +1,11 @@
 //! net/gateway/tap.rs
-//! 응답 본문 계측: 첫 바이트·첫 토큰 시각, SSE 사용량 추출, 종료·중단 시 기록 (본문 미보관).
+//! 응답 본문 계측: 첫 바이트·첫 토큰 시각, SSE 사용량 추출(gzip·deflate 는 사본 해제), rate-limit 스냅샷, 종료·중단 시 기록 (본문 미보관).
 
+use super::decode::{ChunkDecoder, EncodingPlan, plan_decoding};
 use crate::core::context::AppContext;
 use crate::core::model::{ApiRequestRow, IngestBatch, LiveEvent, SessionRow};
 use crate::net::common::{BoxError, ResponseBody};
+use crate::store::ratelimit::RatelimitSnapshotRow;
 use bytes::Bytes;
 use hyper::body::{Body, Frame, SizeHint};
 use serde::Deserialize;
@@ -24,6 +26,8 @@ pub struct UsageTally {
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
     pub cache_creation_tokens: i64,
+    pub cache_creation_5m_tokens: i64,
+    pub cache_creation_1h_tokens: i64,
 }
 
 // 2. 응답 JSON 탐침 형태 ------------------------------------------------------
@@ -45,6 +49,13 @@ struct UsageProbe {
     output_tokens: Option<i64>,
     cache_read_input_tokens: Option<i64>,
     cache_creation_input_tokens: Option<i64>,
+    cache_creation: Option<CacheCreationProbe>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CacheCreationProbe {
+    ephemeral_5m_input_tokens: Option<i64>,
+    ephemeral_1h_input_tokens: Option<i64>,
 }
 
 // 3. 사용량 병합 --------------------------------------------------------------
@@ -60,6 +71,14 @@ fn merge_usage(tally: &mut UsageTally, usage: &UsageProbe) {
     }
     if let Some(tokens) = usage.cache_creation_input_tokens {
         tally.cache_creation_tokens = tokens;
+    }
+    if let Some(split) = &usage.cache_creation {
+        if let Some(tokens) = split.ephemeral_5m_input_tokens {
+            tally.cache_creation_5m_tokens = tokens;
+        }
+        if let Some(tokens) = split.ephemeral_1h_input_tokens {
+            tally.cache_creation_1h_tokens = tokens;
+        }
     }
 }
 
@@ -150,6 +169,8 @@ pub struct ResponseTap {
     finished_ms: Option<i64>,
     sse: Option<SseUsageParser>,
     json_tail: Option<Vec<u8>>,
+    decoder: Option<Box<ChunkDecoder>>,
+    ratelimit: Option<RatelimitSnapshotRow>,
 }
 
 // 6. 추적 시작 ----------------------------------------------------------------
@@ -171,15 +192,19 @@ pub fn start_response_tap(
         finished_ms: None,
         sse: None,
         json_tail: None,
+        decoder: None,
+        ratelimit: None,
     }
 }
 
 impl ResponseTap {
-    // 6-1. 응답 머리 반영
-    pub fn set_response_meta(&mut self, status: u16, content_type: &str, encoded: bool) {
+    // 6-1. 응답 머리 반영 (content_encoding 은 소문자 원문, 미지원 인코딩은 사용량 미판독)
+    pub fn set_response_meta(&mut self, status: u16, content_type: &str, content_encoding: &str) {
         self.row.status = Some(i64::from(status));
-        if encoded {
-            return;
+        match plan_decoding(content_encoding) {
+            EncodingPlan::Plain => {}
+            EncodingPlan::Decode(decoder) => self.decoder = Some(decoder),
+            EncodingPlan::Unsupported => return,
         }
         if content_type.contains("text/event-stream") {
             self.sse = Some(SseUsageParser::default());
@@ -191,23 +216,33 @@ impl ResponseTap {
         }
     }
 
-    // 6-2. 본문 조각 관측
+    // 6-2. rate-limit 스냅샷 보관 (기록은 드롭 시 모델 확정 후)
+    pub fn set_ratelimit_snapshot(&mut self, snapshot: Option<RatelimitSnapshotRow>) {
+        self.ratelimit = snapshot;
+    }
+
+    // 6-3. 본문 조각 관측 (압축 응답은 해제한 사본으로 판독, 시각은 원본 조각 도착 기준)
     pub fn observe_chunk(&mut self, chunk: &[u8]) {
         let elapsed = elapsed_millis(self.started);
         if self.first_byte_ms.is_none() {
             self.first_byte_ms = Some(elapsed);
         }
+        let decoded = self
+            .decoder
+            .as_mut()
+            .map(|decoder| decoder.decode_chunk(chunk));
+        let payload = decoded.as_deref().unwrap_or(chunk);
         if let Some(parser) = self.sse.as_mut() {
-            parser.feed(chunk);
+            parser.feed(payload);
             if parser.saw_first_delta && self.first_token_ms.is_none() {
                 self.first_token_ms = Some(elapsed);
             }
         }
         if let Some(tail) = self.json_tail.as_mut() {
-            if tail.len() + chunk.len() > MAX_JSON_TAIL_BYTES {
+            if tail.len() + payload.len() > MAX_JSON_TAIL_BYTES {
                 self.json_tail = None;
             } else {
-                tail.extend_from_slice(chunk);
+                tail.extend_from_slice(payload);
             }
         }
     }
@@ -254,12 +289,18 @@ impl Drop for ResponseTap {
         row.output_tokens = tally.output_tokens;
         row.cache_read_tokens = tally.cache_read_tokens;
         row.cache_creation_tokens = tally.cache_creation_tokens;
+        row.cache_creation_5m_tokens = tally.cache_creation_5m_tokens;
+        row.cache_creation_1h_tokens = tally.cache_creation_1h_tokens;
         row.duration_ms = Some(
             self.finished_ms
                 .unwrap_or_else(|| elapsed_millis(self.started)),
         );
         row.first_byte_ms = self.first_byte_ms;
         row.first_token_ms = self.first_token_ms;
+        let ratelimit = self.ratelimit.take().map(|mut snapshot| {
+            snapshot.model = row.model.clone();
+            snapshot
+        });
 
         // 4. 실시간 이벤트
         let _ = self.ctx.live_tx.send(LiveEvent::Api(row.clone()));
@@ -279,6 +320,11 @@ impl Drop for ResponseTap {
         let insert = move || {
             if let Err(err) = ctx.store.insert_batch(&batch) {
                 eprintln!("[cm] 게이트웨이 행 저장 실패: {err:#}");
+            }
+            if let Some(snapshot) = &ratelimit
+                && let Err(err) = ctx.store.insert_ratelimit_snapshot(snapshot)
+            {
+                eprintln!("[cm] rate-limit 스냅샷 저장 실패: {err:#}");
             }
         };
         match tokio::runtime::Handle::try_current() {
