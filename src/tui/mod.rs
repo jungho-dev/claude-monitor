@@ -12,6 +12,7 @@ pub mod poller;
 pub mod sort;
 pub mod state;
 pub mod state_writer;
+pub mod tab_move;
 #[cfg(test)]
 pub mod test_support;
 pub mod theme;

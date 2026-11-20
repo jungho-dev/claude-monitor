@@ -8,6 +8,7 @@ use crate::tui::i18n::{self, Msg};
 use crate::tui::layout::{SplitAxis, SplitDrag};
 use crate::tui::sort::SortChange;
 use crate::tui::state::{AppState, ToastLevel, UiCommand};
+use crate::tui::tab_move::TabDrag;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Position;
 use std::time::{Duration, Instant};
@@ -65,6 +66,8 @@ impl AppState {
             MouseEventKind::Drag(MouseButton::Left) => {
                 if self.card_move.is_some() {
                     self.preview_card_move(position);
+                } else if self.tab_drag.is_some() {
+                    self.preview_tab_move(position);
                 } else if let Some(press) = self.card_press {
                     // 누른 칸을 벗어나 시간이 차기 전에 끌면 취소 (같은 칸의 흔들림은 유지)
                     if position != press.cell {
@@ -379,7 +382,7 @@ impl AppState {
             return self.perform_action(action);
         }
 
-        // 8. 탭 전환
+        // 8. 탭 전환, 누른 채 끄면 탭 순서 이동 (놓을 때 end_drags 가 확정)
         let tab = self
             .hit_areas
             .tab_rects
@@ -387,7 +390,12 @@ impl AppState {
             .find(|(_, rect)| rect.contains(position))
             .map(|(tab, _)| *tab);
         if let Some(tab) = tab {
-            return self.switch_tab(tab);
+            let command = self.switch_tab(tab);
+            self.tab_drag = Some(TabDrag {
+                tab,
+                baseline: self.tab_order,
+            });
+            return command;
         }
 
         // 9. 표 머리글 클릭 정렬 (숫자·시간 내림 -> 오름, 문자 오름 -> 내림, 세 번째 기본, 선택 행은 같은 항목을 따라감)
@@ -469,7 +477,8 @@ impl AppState {
                 }
             }
         }
-        split_moved || column_moved
+        let tab_moved = self.finish_tab_drag();
+        split_moved || column_moved || tab_moved
     }
 
     // 끌기 확정 저장과 다른 실행 요청을 합침, 다른 요청이 있으면 저장은 save_pending 에 남겨 이벤트 루프가 따로 보냄
@@ -1323,7 +1332,7 @@ mod tests {
         let window = find_button(&state, UiAction::CycleWindow);
         assert_eq!(
             click(&mut state, window.x + 1, window.y),
-            UiCommand::SetWindow(crate::tui::state::WindowKind::Day)
+            UiCommand::SetWindow(crate::tui::state::WindowKind::Hour)
         );
 
         let pin = find_button(&state, UiAction::TogglePin);

@@ -392,8 +392,12 @@ fn build_window_bounds(now: DateTime<Utc>, window: WindowKind) -> WindowBounds {
         Some(midnight) => midnight.with_timezone(&Utc),
         None => now - ChronoDuration::hours(24),
     };
+    let since = match window.window_span() {
+        Some(span) => now - span,
+        None => today_start,
+    };
     WindowBounds {
-        since: (now - window.window_span()).to_rfc3339_opts(SecondsFormat::Millis, true),
+        since: since.to_rfc3339_opts(SecondsFormat::Millis, true),
         until: (now + ChronoDuration::minutes(1)).to_rfc3339_opts(SecondsFormat::Millis, true),
         minute_since: (now - ChronoDuration::minutes(MINUTE_SPAN_MINUTES))
             .to_rfc3339_opts(SecondsFormat::Millis, true),
@@ -809,6 +813,10 @@ mod tests {
         let stored_ts = "2026-11-14T15:00:00.500Z";
         assert!(stored_ts >= bounds.since.as_str());
         assert!(stored_ts >= bounds.minute_since.as_str());
+
+        // 오늘 구간은 로컬 자정부터
+        let today = build_window_bounds(now, WindowKind::Today);
+        assert_eq!(today.since, today.today_since);
     }
 
     #[test]

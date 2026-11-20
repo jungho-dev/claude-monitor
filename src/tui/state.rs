@@ -26,6 +26,7 @@ use crate::tui::sort::{
     compare_event_row, compare_hook_row, compare_model_row, compare_project_row, compare_tool_row,
     default_card_sorts, sort_rows, sort_spec,
 };
+use crate::tui::tab_move::TabDrag;
 use crate::tui::views::projects::attribution_rows;
 use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveDate, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -93,6 +94,20 @@ impl ActiveTab {
         i18n::text(lang, msg)
     }
 
+    // 상태 파일의 탭 순서 값 (표시 언어와 무관한 고정 이름)
+    pub fn tab_key(self) -> &'static str {
+        match self {
+            Self::Overview => "overview",
+            Self::Tools => "tools",
+            Self::Hooks => "hooks",
+            Self::Models => "models",
+            Self::Agents => "agents",
+            Self::Settings => "settings",
+            Self::Report => "report",
+            Self::Projects => "projects",
+        }
+    }
+
     // 클릭한 카드가 없을 때 키 입력을 받는 탭의 주 카드
     pub fn main_card(self) -> CardId {
         match self {
@@ -151,6 +166,7 @@ impl ActiveTab {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum WindowKind {
     #[default]
+    Today,
     Hour,
     Day,
     Week,
@@ -159,6 +175,7 @@ pub enum WindowKind {
 impl WindowKind {
     pub fn window_label(self, lang: Lang) -> &'static str {
         let msg = match self {
+            Self::Today => Msg::WindowToday,
             Self::Hour => Msg::WindowHour,
             Self::Day => Msg::WindowDay,
             Self::Week => Msg::WindowWeek,
@@ -166,11 +183,13 @@ impl WindowKind {
         i18n::text(lang, msg)
     }
 
-    pub fn window_span(self) -> ChronoDuration {
+    // None = 고정 길이 없이 로컬 자정부터 (오늘)
+    pub fn window_span(self) -> Option<ChronoDuration> {
         match self {
-            Self::Hour => ChronoDuration::hours(1),
-            Self::Day => ChronoDuration::hours(24),
-            Self::Week => ChronoDuration::days(7),
+            Self::Today => None,
+            Self::Hour => Some(ChronoDuration::hours(1)),
+            Self::Day => Some(ChronoDuration::hours(24)),
+            Self::Week => Some(ChronoDuration::days(7)),
         }
     }
 }
@@ -301,6 +320,9 @@ pub struct AppState {
     pub lang: Lang,
     pub today: NaiveDate,
     pub tab: ActiveTab,
+    // 탭 바 표시 순서 (번호 키·Tab 순환이 따름, tui.toml 로 저장·복원), 탭을 눌러 끄는 중
+    pub tab_order: [ActiveTab; TAB_COUNT],
+    pub tab_drag: Option<TabDrag>,
     pub window: WindowKind,
     pub snapshot: DashboardSnapshot,
     // 카드별 정렬 (정렬 가능한 표 카드만 의미 있음)
@@ -358,7 +380,9 @@ impl AppState {
             lang: Lang::default(),
             today,
             tab: ActiveTab::Overview,
-            window: WindowKind::Hour,
+            tab_order: ActiveTab::ALL,
+            tab_drag: None,
+            window: WindowKind::default(),
             snapshot: DashboardSnapshot::default(),
             card_sorts: default_card_sorts(),
             card_views: [CardView::default(); CARD_COUNT],
@@ -486,28 +510,40 @@ impl AppState {
             return UiCommand::None;
         }
 
-        // 3. 카드 이동 중·길게 누름 대기 중에는 Esc 취소만 받음
-        if self.card_move.is_some() || self.card_press.is_some() {
+        // 3. 카드·탭 이동 중·길게 누름 대기 중에는 Esc 취소만 받음 (순서를 바꾸지 않은 탭 누름은 끝내고 키 처리)
+        if let Some(drag) = self.tab_drag
+            && drag.baseline == self.tab_order
+        {
+            self.tab_drag = None;
+        }
+        if self.card_move.is_some() || self.card_press.is_some() || self.tab_drag.is_some() {
             if key.code == KeyCode::Esc {
                 self.cancel_card_move();
+                self.cancel_tab_drag();
             }
             return UiCommand::None;
         }
 
-        // 4. 키별 전이
-        let slot = self.tab as usize;
+        // 4. 키별 전이 (번호 키·Tab 순환은 탭 바 표시 순서를 따름)
+        let slot = self
+            .tab_order
+            .iter()
+            .position(|tab| *tab == self.tab)
+            .unwrap_or(0);
         let card = self.focused_card_id();
         match key.code {
             KeyCode::Char('q' | 'Q') | KeyCode::Esc => self.perform_action(UiAction::Quit),
             KeyCode::Char('?') => self.perform_action(UiAction::ShowHelp),
-            KeyCode::BackTab => self.switch_tab(ActiveTab::ALL[(slot + TAB_COUNT - 1) % TAB_COUNT]),
+            KeyCode::BackTab => self.switch_tab(self.tab_order[(slot + TAB_COUNT - 1) % TAB_COUNT]),
             KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.switch_tab(ActiveTab::ALL[(slot + TAB_COUNT - 1) % TAB_COUNT])
+                self.switch_tab(self.tab_order[(slot + TAB_COUNT - 1) % TAB_COUNT])
             }
-            KeyCode::Tab => self.switch_tab(ActiveTab::ALL[(slot + 1) % TAB_COUNT]),
+            KeyCode::Tab => self.switch_tab(self.tab_order[(slot + 1) % TAB_COUNT]),
             KeyCode::Char(digit @ '1'..='8') => {
-                self.switch_tab(ActiveTab::ALL[digit as usize - '1' as usize])
+                self.switch_tab(self.tab_order[digit as usize - '1' as usize])
             }
+            KeyCode::Char('<') => self.move_current_tab(-1),
+            KeyCode::Char('>') => self.move_current_tab(1),
             // Shift+방향키는 포커스 카드 위치 이동 (리포트 날짜 이동 등 일반 방향키보다 먼저)
             KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
                 if key.modifiers.contains(KeyModifiers::SHIFT) =>
@@ -577,9 +613,10 @@ impl AppState {
             UiAction::Reindex => UiCommand::Reindex,
             UiAction::CycleWindow => {
                 self.window = match self.window {
+                    WindowKind::Today => WindowKind::Hour,
                     WindowKind::Hour => WindowKind::Day,
                     WindowKind::Day => WindowKind::Week,
-                    WindowKind::Week => WindowKind::Hour,
+                    WindowKind::Week => WindowKind::Today,
                 };
                 UiCommand::SetWindow(self.window)
             }
@@ -1196,14 +1233,17 @@ mod tests {
     #[test]
     fn window_key_cycles_and_stale_snapshot_is_dropped() {
         let mut state = sample_state();
+        assert_eq!(state.window, WindowKind::Today);
         assert_eq!(
             state.handle_key_event(press(KeyCode::Char('w'))),
-            UiCommand::SetWindow(WindowKind::Day)
+            UiCommand::SetWindow(WindowKind::Hour)
         );
+        state.handle_key_event(press(KeyCode::Char('w')));
+        assert_eq!(state.window, WindowKind::Day);
         state.handle_key_event(press(KeyCode::Char('w')));
         assert_eq!(state.window, WindowKind::Week);
         state.handle_key_event(press(KeyCode::Char('w')));
-        assert_eq!(state.window, WindowKind::Hour);
+        assert_eq!(state.window, WindowKind::Today);
 
         state.window = WindowKind::Day;
         let stale = DashboardSnapshot {
@@ -2036,6 +2076,8 @@ mod tests {
         let state = AppState::new(sample_config(), today);
         assert_eq!(state.lang, Lang::En);
         assert_eq!(ActiveTab::Overview.tab_label(state.lang), "Overview");
+        assert_eq!(state.window, WindowKind::Today);
+        assert_eq!(state.window.window_label(state.lang), "Today");
         assert_eq!(WindowKind::Hour.window_label(state.lang), "1h");
     }
 

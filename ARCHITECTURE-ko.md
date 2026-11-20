@@ -94,6 +94,7 @@ claude-monitor/
 │       ├── cards.rs : 카드 식별자·종류, 카드별 스크롤·선택, 클릭 동작, 마우스 적중 영역, 스크롤바 썸 계산
 │       ├── layout.rs : 카드 경계 드래그 크기 조절, 그룹별 비율·카드 순서, 카드 영역 분할, 드래그 영역
 │       ├── card_move.rs : 카드 이동 상태 기계(impl AppState): 제목 400 ms 길게 누름, 미리보기, 확정, 취소, Shift+방향키 한 칸 이동, 시각은 Instant 인자(AppState::tick)로 받아 테스트가 시계를 주입
+│       ├── tab_move.rs : 탭 순서 이동(impl AppState): 그려진 탭 폭으로 끌기 미리보기, end_drags 로 확정, Esc 취소, < > 한 칸 이동
 │       ├── layout_store.rs : 홈 설정 폴더의 상태 파일 tui.toml: 시작 시 불러오기, 상태 문자열과 저장 요청 만들기, 원자적 쓰기(임시 파일 후 이름 바꾸기, 심볼릭 링크 사슬은 최대 16단계까지 먼저 풀어 모든 링크 유지), 시작 시 오래된 임시 파일만 삭제(10분 넘게 수정되지 않은 것, 실행 중 프로세스 것은 제외), 맞지 않는 항목은 알림 한 번과 함께 건너뜀, 읽을 수 없는 파일은 `.bak`으로 복사
 │       ├── state_writer.rs : 상태 저장 스레드: 경로별 최신 요청하나로 합치는 저장 요청 채널, Drop 시 남은 요청 쓰기와 스레드 합류(최대 5초만 기다리고 터미널 가드가 stderr에 경고), 실패는 UiMessage::StateSaveFailed로 돌려보냄
 │       ├── i18n.rs : 항목마다 영어·한국어 문구를 둔 문구 카탈로그(기본 영어), 값이 들어가는 문구의 형식 함수, 도움말 줄
@@ -333,8 +334,10 @@ sequenceDiagram
     - 누름, 미리보기, 확정은 마우스 이벤트로 진행되며, 칸 크기는 칸에 남고 카드만 칸 사이를 옮겨 감
     - `Esc`, 탭 전환, 크기 변경은 이동을 취소하고 누르기 전 순서로 복원
     - 순서가 바뀐 확정, `Shift+방향키`, 프로젝트 탭의 `d`는 `UiCommand::SaveState`를 반환
+    - 탭을 누르면 누르기 전 순서를 담은 `TabDrag`가 시작되고, 끌기마다 끄는 탭을 그려진 탭 폭과 간격으로 계산한 가로 범위가 포인터를 품는 첫 칸으로 옮기되 지금 칸이 여전히 품으면 그대로 두어 폭이 다른 탭끼리 앞뒤로 흔들리지 않음
+    - `AppState::end_drags`가 놓음, 놓침, 새 누름, 크기 변경 때 바뀐 탭 순서를 확정하고 `Esc`는 누르기 전 순서로 복원하며, `<`, `>`는 현재 탭을 이웃과 맞바꾸고 둘 다 `UiCommand::SaveState`를 반환
 3. **상태 파일**
-    - `~/.config/claude-monitor/tui.toml`(`config.toml` 옆, `data_dir`를 옮겨도 그대로이며 홈을 찾지 못할 때만 `<data_dir>`, 이름은 `core/config.rs`의 `TUI_STATE_FILE_NAME`)에 `version = 1`, `language`, `attribution_dimension`(`d`로 고른 프로젝트 탭 차원이며 기본값인 스킬이 아닐 때만 기록하고, 순환 목록 밖의 값은 알림 한 번과 함께 건너뜀), `[orders]`, `[ratios]`, `[column_widths]`를 고정 그룹·표 이름 키(`event_feed`, `tool_table`, `hook_table`, `model_table`, `cache_breaks`, `agent_table`, `settings_hooks`, `settings_mcp`, `settings_agents`, `settings_doctor`, `project_table`, `attribution_table`)로 저장하며, 기본 배치와 다른 항목만 기록하고 길이가 맞지 않거나 512를 넘는 폭이 든 목록은 건너뜀
+    - `~/.config/claude-monitor/tui.toml`(`config.toml` 옆, `data_dir`를 옮겨도 그대로이며 홈을 찾지 못할 때만 `<data_dir>`, 이름은 `core/config.rs`의 `TUI_STATE_FILE_NAME`)에 `version = 1`, `language`, `attribution_dimension`(`d`로 고른 프로젝트 탭 차원이며 기본값인 스킬이 아닐 때만 기록하고, 순환 목록 밖의 값은 알림 한 번과 함께 건너뜀), `tab_order`(고정 탭 이름이며 기본 순서와 다를 때만 기록하고, 여덟 탭을 한 번씩 담지 않은 목록은 알림 한 번과 함께 건너뜀), `[orders]`, `[ratios]`, `[column_widths]`를 고정 그룹·표 이름 키(`event_feed`, `tool_table`, `hook_table`, `model_table`, `cache_breaks`, `agent_table`, `settings_hooks`, `settings_mcp`, `settings_agents`, `settings_doctor`, `project_table`, `attribution_table`)로 저장하며, 기본 배치와 다른 항목만 기록하고 길이가 맞지 않거나 512를 넘는 폭이 든 목록은 건너뜀
     - 같은 폴더의 임시 파일에 쓴 뒤 대상 위로 이름을 바꾸므로 쓰기가 중단돼도 기존 파일은 온전하고 입력 스레드에서는 실행되지 않음
     - `tui.toml`이 심볼릭 링크이면 저장이 링크 사슬을 끝까지(최대 16단계, 더 깊으면 저장 실패) 따라가 실제 파일 폴더에 임시 파일을 만들고 동기화한 뒤 링크가 아닌 실제 파일 위로 이름을 바꾸며, 시작할 때 남은 임시 파일 정리는 두 폴더를 모두 살피되 오래된 것(10분 넘게 수정되지 않았고 실행 중인 프로세스 id가 아닌 것)만 지워 다른 인스턴스의 진행 중 임시 파일은 남음
     - 읽을 수 없거나 다른 버전인 파일은 시작할 때 첫 저장이 덮어쓰기 전에 `tui.toml.bak`으로 복사

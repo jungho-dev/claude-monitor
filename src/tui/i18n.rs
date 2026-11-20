@@ -64,6 +64,7 @@ define_messages! {
     TabAgents => ("Agents", "에이전트"),
     TabSettings => ("Settings", "설정"),
     TabReport => ("Report", "리포트"),
+    WindowToday => ("Today", "오늘"),
     WindowHour => ("1h", "1시간"),
     WindowDay => ("24h", "24시간"),
     WindowWeek => ("7d", "7일"),
@@ -109,9 +110,10 @@ define_messages! {
     HelpTruncated => ("… (enlarge window to show all)", "… (창을 키우면 전체 표시)"),
     HelpSectionKeyboard => ("Keyboard", "키보드"),
     HelpSectionMouse => ("Mouse", "마우스"),
-    HelpSwitchTab => ("Switch tab (Overview to Projects)", "탭 이동 (개요 ~ 프로젝트 여덟 탭)"),
+    HelpSwitchTab => ("Switch tab (number = tab bar position)", "탭 이동 (번호 = 탭 바 표시 순서)"),
+    HelpMoveTab => ("Move current tab left / right", "현재 탭 순서 왼쪽·오른쪽 이동"),
     HelpMoveRows => ("Move rows / scroll focused card", "선택 카드의 행 이동·스크롤"),
-    HelpWindow => ("Cycle window (1h, 24h, 7d)", "집계 구간 전환 (1시간, 24시간, 7일)"),
+    HelpWindow => ("Cycle window (today, 1h, 24h, 7d)", "집계 구간 전환 (오늘, 1시간, 24시간, 7일)"),
     HelpSort => ("Next sort column / flip order, reset", "다음 정렬 열 / 방향 전환 → 기본 순환"),
     HelpReportDate => ("Change report date", "리포트 날짜 이동"),
     HelpReportGenerate => ("Generate report (needs serve)", "리포트 생성 (serve 실행 필요)"),
@@ -136,6 +138,8 @@ define_messages! {
     HelpWheel => ("Scroll card under pointer / resize cards", "마우스 아래 카드 스크롤 / 카드 크기 조절"),
     HelpKeyLongPress => ("Long-press title+drag", "제목 길게 누름+드래그"),
     HelpLongPress => ("Move card (Esc cancels)", "카드 위치 이동 (Esc 취소)"),
+    HelpKeyDragTab => ("Drag tab", "탭 드래그"),
+    HelpDragTab => ("Reorder tabs (Esc cancels)", "탭 순서 변경 (Esc 취소)"),
     HelpKeyScrollbar => ("Scrollbar", "스크롤바"),
     HelpScrollbar => ("Drag thumb, click track to page", "썸 드래그 이동, 트랙 클릭 한 화면 이동"),
 
@@ -362,6 +366,7 @@ define_messages! {
     ToastUnpinned => ("Window unpinned", "창 최상단 고정 해제"),
     ToastLayoutReset => ("Card size, order, widths reset", "카드 크기·순서·열 폭 기본 배치 복원"),
     ToastCardMoved => ("Card moved (l resets layout)", "카드 위치 변경 (l 기본 배치)"),
+    ToastTabMoved => ("Tab order changed", "탭 순서 변경"),
     ToastSplitDrag => ("Dragging card edge: release to keep, l resets layout", "카드 경계 드래그: 놓으면 고정, l 기본 배치"),
     ToastColumnsAuto => ("Column widths reset to auto", "열 폭 자동 복원"),
     ToastColumnDrag => ("Dragging column edge: resize, double-click for auto", "열 경계 드래그: 열 폭 조절, 더블클릭 자동 폭"),
@@ -899,6 +904,7 @@ pub fn help_rows(lang: Lang) -> Vec<(&'static str, &'static str)> {
     vec![
         (words(Msg::HelpSectionKeyboard), ""),
         ("1-8, Tab, Shift-Tab", words(Msg::HelpSwitchTab)),
+        ("<  >", words(Msg::HelpMoveTab)),
         ("↑ ↓ PgUp PgDn Home End", words(Msg::HelpMoveRows)),
         ("w", words(Msg::HelpWindow)),
         ("s / S", words(Msg::HelpSort)),
@@ -921,6 +927,7 @@ pub fn help_rows(lang: Lang) -> Vec<(&'static str, &'static str)> {
         (words(Msg::HelpKeyDragColumn), words(Msg::HelpDragColumn)),
         (words(Msg::HelpKeyWheel), words(Msg::HelpWheel)),
         (words(Msg::HelpKeyLongPress), words(Msg::HelpLongPress)),
+        (words(Msg::HelpKeyDragTab), words(Msg::HelpDragTab)),
         (words(Msg::HelpKeyScrollbar), words(Msg::HelpScrollbar)),
     ]
 }

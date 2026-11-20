@@ -320,9 +320,10 @@ cargo uninstall claude-monitor
     - Screen text is English by default and switches to Korean with `L` (see Display language); the report text follows `[report] language` in `config.toml`.
     - At start the dashboard opens an existing database once with a write connection so an older schema is upgraded before the read-only reads begin; this runs on the poller thread before the first collection, a failure shows an error toast, and it never creates a database.
 2. **Keys**
-    - `1`-`8`, `Tab`, `Shift-Tab`: switch tab
+    - `1`-`8`, `Tab`, `Shift-Tab`: switch tab; the number is the position in the tab bar (see Tab order)
+    - `<`, `>`: move the current tab one slot left or right (see Tab order)
     - `Up`, `Down`, `PgUp`, `PgDn`, `Home`, `End`: scroll
-    - `w`: cycle the window through 1 hour, 24 hours, and 7 days
+    - `w`: cycle the window through today (from local midnight, the default), 1 hour, 24 hours, and 7 days
     - `s`, `S`: next sort column (numeric and time columns start descending, text columns ascending) and the sort cycle of the current column (first direction, opposite direction, card default) of the focused table card
     - `Left`, `Right`: report date (report week in the weekly view), report tab only
     - `v`: switch the report tab between the daily and the weekly view
@@ -342,6 +343,7 @@ cargo uninstall claude-monitor
     - Drag a boundary between cards to resize them, and drag a boundary between two header cells to resize a column (every table card, the event feed and the settings cards included); a double click on a column boundary or `l` restores the automatic layout, and the layout is saved in the state file (see State file).
     - A column boundary shows a faint mark at rest and the full grip on hover; it can be grabbed on its own cell or one cell to either side, and a plain click without a drag on a header cell next to a boundary sorts that column when the button is released.
     - Press and hold a card title for 400 ms, then drag, to move the card (see Card order).
+    - Press a tab and drag it along the tab bar to reorder the tabs (see Tab order).
     - A button release lost outside the window ends every drag the way a release does: the first move without a button or the next press commits a moved card boundary, column width, or scrollbar drag (and saves the layout), and a tab switch commits it instead of dropping it.
     - The bottom bar holds clickable buttons for reindex, window, refresh, top-most, layout reset, language, help, and quit; the report tab adds previous and next date and generate buttons.
 4. **Views**
@@ -372,13 +374,19 @@ cargo uninstall claude-monitor
     - Releasing before 400 ms is an ordinary click, and dragging before 400 ms starts neither a move nor a resize.
     - `Shift+arrow` moves the focused card one slot without a drag: `Up` and `Down` in a stacked group, `Left` and `Right` in a side-by-side group, and the other arrows do nothing.
     - `l` resets the card sizes, the card order, and the dragged column widths of the current tab.
-7. **Display language**
+7. **Tab order**
+    - Press a tab and drag it along the tab bar: the press switches to that tab, the drag previews the new order live, and the release commits and saves it.
+    - A plain click without a drag only switches the tab and changes no order.
+    - `Esc` during the drag restores the order from before the press; a release lost outside the window commits the shown order on the next move or press.
+    - `<` and `>` move the current tab one slot without a drag and stop at either end.
+    - The tab numbers follow the shown order, so `1`-`8`, `Tab`, and `Shift-Tab` always follow the tab bar; `l` does not reset the tab order.
+8. **Display language**
     - English is the default; `L` (Shift+l) switches between English and Korean at runtime and saves the choice.
     - The footer chip `[L] EN` or `[L] KO` shows the current language and is clickable; it sits after the other left chips and before help and quit, and it is the last left chip to drop, so it is still visible at the minimum size (60x16) while the other left chips disappear from the right.
     - Tab names, labels, the help overlay, and notices follow the language; data values such as paths, model and tool names, and log text are not translated, and the report text follows `[report] language` instead.
-8. **State file**
-    - `~/.config/claude-monitor/tui.toml`, next to `config.toml` (it stays there even when the data directory moves), holds `version = 1`, `language`, `attribution_dimension` (the projects tab dimension chosen with `d`, written only when it is not the default skill), the card orders, the split ratios, and the table column widths, keyed by stable names such as `settings_rows`, `event_feed`, `tool_table`, and `settings_hooks`.
-    - It is written atomically (a temporary file, then a rename) when a change is committed: the end of a card move or a boundary or column drag, `Shift+arrow`, `l`, `L`, and `d` on the projects tab.
+9. **State file**
+    - `~/.config/claude-monitor/tui.toml`, next to `config.toml` (it stays there even when the data directory moves), holds `version = 1`, `language`, `attribution_dimension` (the projects tab dimension chosen with `d`, written only when it is not the default skill), `tab_order` (stable tab names such as `overview` and `tools`, written only when it differs from the default order), the card orders, the split ratios, and the table column widths, keyed by stable names such as `settings_rows`, `event_feed`, `tool_table`, and `settings_hooks`.
+    - It is written atomically (a temporary file, then a rename) when a change is committed: the end of a card move, a tab move, or a boundary or column drag, `Shift+arrow`, `<`, `>`, `l`, `L`, and `d` on the projects tab.
     - The write runs on a dedicated writer thread that the input thread feeds through a channel: a burst of commits collapses into the latest state, the terminal guard flushes the last commit and joins the thread on every exit path but waits at most 5 seconds, after which it prints a warning on stderr and exits, and a failed write comes back as an error toast.
     - When `tui.toml` is a symbolic link (for example into a synced folder), the dashboard follows the whole link chain (up to 16 links), writes the temporary file next to the real file, and renames it over the real file, so every link in the chain stays in place; a chain deeper than 16 links fails the save with an error.
     - At start only stale temporary files are removed (not modified for 10 minutes and not owned by the running process), so the live temporary file of another running instance survives.

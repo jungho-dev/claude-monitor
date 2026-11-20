@@ -190,7 +190,8 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, state: &mut AppState) {
     }
 
     // 2. 탭 그리기
-    for (index, tab) in ActiveTab::ALL.iter().enumerate() {
+    let tab_order = state.tab_order;
+    for (index, tab) in tab_order.iter().enumerate() {
         let (key_style, name_style, background) = if state.tab == *tab {
             (
                 Style::default()
@@ -408,8 +409,11 @@ fn render_footer_hints(frame: &mut Frame, row: Rect, state: &AppState) {
         msgs.iter().map(|msg| i18n::text(lang, *msg)).collect()
     };
     let mut context_hints: Vec<&str> = Vec::new();
-    if state.card_move.is_some() {
-        // 카드 이동 중에는 놓기·취소 안내가 맨 앞, 다른 맥락 안내는 생략
+    let tab_moving = state
+        .tab_drag
+        .is_some_and(|drag| drag.baseline != state.tab_order);
+    if state.card_move.is_some() || tab_moving {
+        // 카드·탭 이동 중에는 놓기·취소 안내가 맨 앞, 다른 맥락 안내는 생략
         context_hints.extend(hint_texts(&[Msg::HintRelease, Msg::HintCancel]));
     } else {
         if state.split_hover.is_some() || state.split_drag.is_some() {
@@ -662,7 +666,7 @@ mod tests {
         let mut state = sample_state_with_snapshot();
         let text = render_to_text(&mut state, 130, 40).join("\n");
         assert!(text.contains("[i] 재색인"));
-        assert!(text.contains("[w] 구간 1시간"));
+        assert!(text.contains("[w] 구간 오늘"));
         assert!(text.contains("[t] 최상단 OFF"));
         assert!(text.contains("[L] KO"));
         assert!(text.contains("[q] 종료"));
@@ -1905,7 +1909,7 @@ mod tests {
             "Live events (4)",
             "Event detail",
             "[i] Reindex",
-            "[w] Window 1h",
+            "[w] Window Today",
             "[r] Refresh",
             "[t] Pin OFF",
             "[l] Reset layout",

@@ -6,7 +6,7 @@ use crate::store::metrics::AttributionDimension;
 use crate::tui::cards::{CARD_COUNT, CardId, MAX_COLUMN_WIDTH, MAX_TABLE_COLUMNS};
 use crate::tui::i18n::{self, Lang, StateIssue};
 use crate::tui::layout::{CardLayout, SplitGroup};
-use crate::tui::state::{ATTRIBUTION_DIMENSIONS, AppState, ToastLevel};
+use crate::tui::state::{ATTRIBUTION_DIMENSIONS, ActiveTab, AppState, TAB_COUNT, ToastLevel};
 use crate::tui::state_writer::StateSave;
 use crate::tui::views::feed::FEED_COLUMNS;
 use crate::tui::views::models::{AGENT_COLUMNS, CACHE_BREAK_COLUMNS, MODEL_COLUMNS};
@@ -46,6 +46,7 @@ const TABLE_CARDS: [CardId; 12] = [
 
 // 1. 파일 형식 ----------------------------------------------------------------
 // 언어·귀속 차원은 최상위 문자열 (알 수 없는 값만 무시, 차원은 기본값이면 기록하지 않음)
+// 탭 순서는 최상위 고정 이름 배열 (기본 순서면 기록하지 않고, 여덟 탭을 한 번씩 담지 않으면 무시)
 // 그룹·카드는 고정 이름 키, 값은 정수 배열 (항목마다 길이·범위를 검사해 맞지 않는 항목만 무시)
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct LayoutFile {
@@ -54,6 +55,8 @@ struct LayoutFile {
     language: Option<toml::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     attribution_dimension: Option<toml::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tab_order: Option<toml::Value>,
     #[serde(default)]
     orders: BTreeMap<String, Vec<i64>>,
     #[serde(default)]
@@ -95,6 +98,7 @@ fn build_layout_file(
     column_widths: &[[Option<u16>; MAX_TABLE_COLUMNS]; CARD_COUNT],
     lang: Lang,
     dimension: AttributionDimension,
+    tab_order: &[ActiveTab; TAB_COUNT],
 ) -> LayoutFile {
     let mut file = LayoutFile {
         version: LAYOUT_VERSION,
@@ -103,6 +107,13 @@ fn build_layout_file(
     };
     if dimension != ATTRIBUTION_DIMENSIONS[0] {
         file.attribution_dimension = toml::Value::try_from(dimension).ok();
+    }
+    if *tab_order != ActiveTab::ALL {
+        let keys = tab_order
+            .iter()
+            .map(|tab| toml::Value::String(tab.tab_key().to_string()))
+            .collect();
+        file.tab_order = Some(toml::Value::Array(keys));
     }
     for group in SplitGroup::ALL {
         if let Some(order) = layout.custom_order(group) {
@@ -354,6 +365,23 @@ impl AppState {
                     Some(Some(dimension)) => self.attribution_dimension = dimension,
                     Some(None) => skipped += 1,
                 }
+                // 탭 순서는 여덟 탭의 고정 이름을 빠짐·겹침 없이 담은 배열만 복원
+                match file.tab_order.as_ref().map(|value| {
+                    let tabs: Option<Vec<ActiveTab>> = value
+                        .as_array()?
+                        .iter()
+                        .map(|key| {
+                            let key = key.as_str()?;
+                            ActiveTab::ALL.into_iter().find(|tab| tab.tab_key() == key)
+                        })
+                        .collect();
+                    tabs.and_then(|tabs| <[ActiveTab; TAB_COUNT]>::try_from(tabs).ok())
+                        .filter(|order| ActiveTab::ALL.iter().all(|tab| order.contains(tab)))
+                }) {
+                    None => {}
+                    Some(Some(order)) => self.tab_order = order,
+                    Some(None) => skipped += 1,
+                }
                 if skipped > 0 {
                     self.show_toast(
                         &i18n::state_entries_skipped(self.lang, TUI_STATE_FILE_NAME, skipped),
@@ -372,6 +400,7 @@ impl AppState {
             &self.column_widths,
             self.lang,
             self.attribution_dimension,
+            &self.tab_order,
         );
         toml::to_string(&file)
             .map(|text| StateSave {
@@ -537,6 +566,47 @@ mod tests {
         loaded.load_tui_state();
         assert!(loaded.toast.is_none());
         assert_eq!(loaded.card_layout, CardLayout::default());
+    }
+
+    #[test]
+    fn tab_order_round_trips_by_stable_names_and_only_a_full_permutation_is_restored() {
+        // 1. 기본 순서는 기록하지 않고, 바꾼 순서는 최상위 이름 배열로 표보다 앞에 기록
+        let dir = TempDir::new();
+        let mut state = state_in(&dir);
+        state.save_tui_state();
+        let text = fs::read_to_string(dir.0.join(TUI_STATE_FILE_NAME)).unwrap();
+        assert!(!text.contains("tab_order"), "{text}");
+
+        state.tab_order.swap(0, 7);
+        customize(&mut state);
+        state.save_tui_state();
+        let text = fs::read_to_string(dir.0.join(TUI_STATE_FILE_NAME)).unwrap();
+        let expected = "tab_order = [\"projects\", \"tools\", \"hooks\", \"models\", \"agents\", \"settings\", \"report\", \"overview\"]";
+        assert!(text.contains(expected), "{text}");
+        assert!(text.find("tab_order") < text.find("[orders]"), "{text}");
+
+        let mut loaded = state_in(&dir);
+        loaded.load_tui_state();
+        assert!(loaded.toast.is_none(), "{:?}", loaded.toast);
+        assert_eq!(loaded.tab_order, state.tab_order);
+
+        // 2. 겹치거나 빠지거나 모르는 이름이면 기본 순서 유지, 건너뛴 항목 알림 한 번
+        for broken in [
+            "[\"tools\", \"tools\", \"hooks\", \"models\", \"agents\", \"settings\", \"report\", \"projects\"]",
+            "[\"tools\", \"overview\"]",
+            "[\"tools\", \"overview\", \"hooks\", \"models\", \"agents\", \"settings\", \"report\", \"gate\"]",
+            "\"tools\"",
+        ] {
+            fs::write(
+                dir.0.join(TUI_STATE_FILE_NAME),
+                format!("version = 1\ntab_order = {broken}\n"),
+            )
+            .unwrap();
+            let mut loaded = state_in(&dir);
+            loaded.load_tui_state();
+            assert_eq!(loaded.tab_order, ActiveTab::ALL, "{broken}");
+            assert!(loaded.toast.is_some(), "{broken}");
+        }
     }
 
     #[test]
