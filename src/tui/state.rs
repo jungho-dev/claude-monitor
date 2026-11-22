@@ -10,7 +10,7 @@ use crate::store::metrics::{AttributionDimension, MetricAttributionRow};
 use crate::store::otel_events::CompactionStat;
 use crate::store::query::{
     AgentStatsRow, CacheBreakRow, HookStatRow, MinuteBucket, ModelStatsRow, OverviewStats,
-    ProjectStatsRow, ToolLatencyRow,
+    ProjectStatsRow, SkillStatsRow, ToolLatencyRow,
 };
 use crate::store::ratelimit::RatelimitSnapshotRow;
 use crate::tui::cards::{
@@ -23,20 +23,21 @@ use crate::tui::layout::{CardLayout, SplitDrag, SplitGroup};
 use crate::tui::poller::{AdminAction, AdminOutcome, live_event_key};
 use crate::tui::sort::{
     SortChange, SortState, compare_agent_row, compare_attribution_row, compare_cache_break_row,
-    compare_event_row, compare_hook_row, compare_model_row, compare_project_row, compare_tool_row,
-    default_card_sorts, sort_rows, sort_spec,
+    compare_event_row, compare_hook_row, compare_model_row, compare_project_row, compare_skill_row,
+    compare_tool_row, default_card_sorts, sort_rows, sort_spec,
 };
 use crate::tui::tab_move::TabDrag;
 use crate::tui::views::projects::attribution_rows;
+use crate::tui::views::skills::skill_rows;
 use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveDate, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-pub const TAB_COUNT: usize = 8;
+pub const TAB_COUNT: usize = 9;
 pub const TOAST_LIFETIME: Duration = Duration::from_secs(4);
 // 정렬해도 같은 행을 따라가는 선택 가능 표 카드
-const SELECTABLE_SORT_CARDS: [CardId; 8] = [
+const SELECTABLE_SORT_CARDS: [CardId; 9] = [
     CardId::EventFeed,
     CardId::ToolTable,
     CardId::HookTable,
@@ -45,6 +46,7 @@ const SELECTABLE_SORT_CARDS: [CardId; 8] = [
     CardId::CacheBreaks,
     CardId::ProjectTable,
     CardId::AttributionTable,
+    CardId::SkillTable,
 ];
 // 프로젝트 탭 귀속 표의 차원 순환 순서 (d 키)
 pub const ATTRIBUTION_DIMENSIONS: [AttributionDimension; 5] = [
@@ -66,6 +68,7 @@ pub enum ActiveTab {
     Settings,
     Report,
     Projects,
+    Skills,
 }
 
 impl ActiveTab {
@@ -78,7 +81,11 @@ impl ActiveTab {
         Self::Settings,
         Self::Report,
         Self::Projects,
+        Self::Skills,
     ];
+
+    // 나중에 더한 탭: 이전 상태 파일의 탭 순서에 없으면 맨 뒤에 붙여 복원
+    pub const LATER_TABS: [Self; 1] = [Self::Skills];
 
     pub fn tab_label(self, lang: Lang) -> &'static str {
         let msg = match self {
@@ -90,6 +97,7 @@ impl ActiveTab {
             Self::Settings => Msg::TabSettings,
             Self::Report => Msg::TabReport,
             Self::Projects => Msg::TabProjects,
+            Self::Skills => Msg::TabSkills,
         };
         i18n::text(lang, msg)
     }
@@ -105,6 +113,7 @@ impl ActiveTab {
             Self::Settings => "settings",
             Self::Report => "report",
             Self::Projects => "projects",
+            Self::Skills => "skills",
         }
     }
 
@@ -119,6 +128,7 @@ impl ActiveTab {
             Self::Settings => CardId::SettingsHooks,
             Self::Report => CardId::ReportBody,
             Self::Projects => CardId::ProjectTable,
+            Self::Skills => CardId::SkillTable,
         }
     }
 
@@ -138,6 +148,7 @@ impl ActiveTab {
             ],
             Self::Report => &[],
             Self::Projects => &[CardId::ProjectTable, CardId::AttributionTable],
+            Self::Skills => &[CardId::SkillTable],
         }
     }
 
@@ -158,6 +169,7 @@ impl ActiveTab {
             Self::Settings => &[SplitGroup::SettingsRows],
             Self::Report => &[SplitGroup::ReportCols],
             Self::Projects => &[SplitGroup::ProjectsRows],
+            Self::Skills => &[SplitGroup::SkillsRows],
         }
     }
 }
@@ -230,6 +242,8 @@ pub struct DashboardSnapshot {
     pub minutes: Panel<Vec<MinuteBucket>>,
     pub events: Panel<Vec<LiveEvent>>,
     pub projects: Panel<Vec<ProjectStatsRow>>,
+    // Skill 도구 호출 통계 (설치 목록과의 병합은 화면에서)
+    pub skills: Panel<Vec<SkillStatsRow>>,
     // 차원별 귀속 행 (ATTRIBUTION_DIMENSIONS 순서)
     pub attribution: Panel<Vec<(AttributionDimension, Vec<MetricAttributionRow>)>>,
     pub limits: Panel<LimitsData>,
@@ -301,6 +315,8 @@ pub enum UiCommand {
     RefreshNow,
     SetWindow(WindowKind),
     LoadSettings,
+    // 집계 갱신과 설치 목록 재적재를 함께 (스킬 탭 r 키)
+    RefreshWithSettings,
     LoadReport(NaiveDate),
     GenerateReport(NaiveDate),
     Reindex,
@@ -418,7 +434,7 @@ impl AppState {
         }
     }
 
-    // 8-2. 탭 전환 (설정은 첫 진입 시, 리포트는 진입마다 적재 요청, 끌어 움직인 경계·열 폭은 버리지 않고 저장)
+    // 8-2. 탭 전환 (설정·에이전트·스킬은 첫 진입 시 설치 목록 적재, 리포트는 진입마다 적재 요청, 끌어 움직인 경계·열 폭은 버리지 않고 저장)
     pub fn switch_tab(&mut self, tab: ActiveTab) -> UiCommand {
         self.cancel_card_move();
         let saved = self.end_drags(None);
@@ -428,7 +444,9 @@ impl AppState {
         self.column_hover = None;
         self.scroll_hover = None;
         let command = match tab {
-            ActiveTab::Settings if !self.settings_requested => {
+            ActiveTab::Settings | ActiveTab::Agents | ActiveTab::Skills
+                if !self.settings_requested =>
+            {
                 self.settings_requested = true;
                 UiCommand::LoadSettings
             }
@@ -539,7 +557,7 @@ impl AppState {
                 self.switch_tab(self.tab_order[(slot + TAB_COUNT - 1) % TAB_COUNT])
             }
             KeyCode::Tab => self.switch_tab(self.tab_order[(slot + 1) % TAB_COUNT]),
-            KeyCode::Char(digit @ '1'..='8') => {
+            KeyCode::Char(digit @ '1'..='9') => {
                 self.switch_tab(self.tab_order[digit as usize - '1' as usize])
             }
             KeyCode::Char('<') => self.move_current_tab(-1),
@@ -622,6 +640,8 @@ impl AppState {
             }
             UiAction::RefreshView => match self.tab {
                 ActiveTab::Settings => UiCommand::LoadSettings,
+                // 스킬 탭은 집계와 설치 목록을 함께 다시 읽음
+                ActiveTab::Skills => UiCommand::RefreshWithSettings,
                 ActiveTab::Report if self.report_weekly => {
                     UiCommand::LoadWeeklyReport(self.report_week)
                 }
@@ -960,6 +980,11 @@ impl AppState {
                 sort_rows(&mut sorted, sort, compare_attribution_row);
                 Some(sorted.iter().map(|row| row.name.clone()).collect())
             }
+            CardId::SkillTable => {
+                let mut sorted = skill_rows(&self.snapshot, &self.inventory)?;
+                sort_rows(&mut sorted, sort, compare_skill_row);
+                Some(sorted.into_iter().map(|row| row.name).collect())
+            }
             _ => None,
         }
     }
@@ -1047,7 +1072,7 @@ mod tests {
         state.handle_key_event(press(KeyCode::BackTab));
         assert_eq!(state.tab, ActiveTab::Overview);
         state.handle_key_event(press(KeyCode::BackTab));
-        assert_eq!(state.tab, ActiveTab::Projects);
+        assert_eq!(state.tab, ActiveTab::Skills);
 
         state.handle_key_event(press(KeyCode::Tab));
         assert_eq!(state.tab, ActiveTab::Overview);
@@ -1055,7 +1080,7 @@ mod tests {
         let shift_tab =
             KeyEvent::new_with_kind(KeyCode::Tab, KeyModifiers::SHIFT, KeyEventKind::Press);
         state.handle_key_event(shift_tab);
-        assert_eq!(state.tab, ActiveTab::Projects);
+        assert_eq!(state.tab, ActiveTab::Skills);
     }
 
     #[test]
@@ -1409,14 +1434,17 @@ mod tests {
             state.handle_key_event(press(KeyCode::Char(digit)));
             assert_eq!(state.tab, tab, "{digit}");
         }
-        assert_eq!(TAB_COUNT, 8);
+        assert_eq!(TAB_COUNT, 9);
         assert_eq!(ActiveTab::Models.main_card(), CardId::ModelTable);
         assert_eq!(ActiveTab::Agents.main_card(), CardId::AgentTable);
         state.handle_key_event(press(KeyCode::Char('8')));
         assert_eq!(state.tab, ActiveTab::Projects);
         assert_eq!(ActiveTab::Projects.main_card(), CardId::ProjectTable);
         state.handle_key_event(press(KeyCode::Char('9')));
-        assert_eq!(state.tab, ActiveTab::Projects);
+        assert_eq!(state.tab, ActiveTab::Skills);
+        assert_eq!(ActiveTab::Skills.main_card(), CardId::SkillTable);
+        state.handle_key_event(press(KeyCode::Char('0')));
+        assert_eq!(state.tab, ActiveTab::Skills);
     }
 
     #[test]

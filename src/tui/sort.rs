@@ -11,10 +11,11 @@ use crate::tui::cards::{CARD_COUNT, CardId};
 use crate::tui::format::{short_model, short_tool};
 use crate::tui::poller::live_event_timestamp;
 use crate::tui::views::feed::feed_event_name;
+use crate::tui::views::skills::SkillRow;
 use std::cmp::Ordering;
 
 // 정렬 가능한 카드
-pub const SORTABLE_CARDS: [CardId; 12] = [
+pub const SORTABLE_CARDS: [CardId; 13] = [
     CardId::EventFeed,
     CardId::ToolTable,
     CardId::HookTable,
@@ -27,6 +28,7 @@ pub const SORTABLE_CARDS: [CardId; 12] = [
     CardId::SettingsDoctor,
     CardId::ProjectTable,
     CardId::AttributionTable,
+    CardId::SkillTable,
 ];
 
 // 1. 정렬 상태 ----------------------------------------------------------------
@@ -281,6 +283,23 @@ pub fn sort_spec(card: CardId) -> Option<SortSpec> {
                 descending: true,
             },
         },
+        CardId::SkillTable => SortSpec {
+            kinds: &[
+                SortKind::Text,
+                SortKind::Number,
+                SortKind::Number,
+                SortKind::Number,
+                SortKind::Number,
+                SortKind::Text,
+                SortKind::Number,
+                SortKind::Number,
+                SortKind::Number,
+            ],
+            default: SortState {
+                column: 2,
+                descending: true,
+            },
+        },
         _ => return None,
     };
     Some(spec)
@@ -453,6 +472,25 @@ pub fn compare_attribution_row(
         3 => left.output_tokens.cmp(&right.output_tokens),
         4 => left.cache_read_tokens.cmp(&right.cache_read_tokens),
         5 => left.cache_creation_tokens.cmp(&right.cache_creation_tokens),
+        _ => Ordering::Equal,
+    }
+}
+
+// 스킬 열: 이름, 설치, 호출, 오류, 세션, 주 호출, 비용(OTel), 설명 길이, 최근
+pub fn compare_skill_row(left: &SkillRow, right: &SkillRow, column: usize) -> Ordering {
+    match column {
+        0 => compare_display_text(&left.name, &right.name),
+        1 => left.installed.cmp(&right.installed),
+        2 => left.calls.cmp(&right.calls),
+        3 => left.errors.cmp(&right.errors),
+        4 => left.sessions.cmp(&right.sessions),
+        5 => compare_display_text(&left.top_caller, &right.top_caller),
+        6 => left
+            .cost_usd
+            .unwrap_or(-1.0)
+            .total_cmp(&right.cost_usd.unwrap_or(-1.0)),
+        7 => left.description_chars.cmp(&right.description_chars),
+        8 => left.last_ts.cmp(&right.last_ts),
         _ => Ordering::Equal,
     }
 }

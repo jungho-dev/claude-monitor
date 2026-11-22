@@ -1,7 +1,7 @@
 //! transcript/tests.rs
 //! 합성 기록 색인 단위 시험 (최초 읽기, 재실행, 이어 읽기, 훅 거부 판독).
 
-use super::lines::parse_denial_text;
+use super::lines::{TranscriptLine, parse_denial_text};
 use super::test_support::prepare_fixture_workspace;
 use super::{index_transcripts_once, run_indexer_loop};
 use crate::core::context::{AppContext, LIVE_CHANNEL_CAPACITY, LiveCounters};
@@ -473,4 +473,38 @@ fn shrunk_file_below_read_offset_is_reindexed_from_start() {
         })
         .expect("msg_S");
     assert_eq!(stored, 1);
+}
+
+// 9. Skill 도구 입력 ----------------------------------------------------------
+#[test]
+fn tool_input_keeps_only_a_normalized_skill_name_and_skips_other_inputs() {
+    let skill_of = |input: &str| {
+        let text = format!(
+            "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Skill\",\"input\":{input}}}]}}}}"
+        );
+        let line: TranscriptLine = serde_json::from_str(&text).expect("줄 읽기");
+        let message = line.message.expect("메시지");
+        message.content[0]
+            .input
+            .as_ref()
+            .map(|peek| peek.skill.clone())
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        skill_of("{\"skill\":\"/frontend-tui\",\"args\":{\"deep\":[1,2]}}"),
+        "frontend-tui"
+    );
+    assert_eq!(
+        skill_of("{\"args\":\"x\",\"skill\":\"plugin:review\"}"),
+        "plugin:review"
+    );
+    // 식별자가 아니거나 너무 길거나 문자열이 아니면 빈 값, 객체가 아닌 입력도 줄 전체는 읽힘
+    assert_eq!(skill_of("{\"skill\":\"rm -rf /\"}"), "");
+    assert_eq!(
+        skill_of(&format!("{{\"skill\":\"{}\"}}", "a".repeat(81))),
+        ""
+    );
+    assert_eq!(skill_of("{\"skill\":42}"), "");
+    assert_eq!(skill_of("\"plain\""), "");
+    assert_eq!(skill_of("[1,{\"skill\":\"x\"}]"), "");
 }

@@ -81,14 +81,22 @@ const PROJECT_REQUESTS_SQL: &str = concat!(
     "SELECT COALESCE(NULLIF(r.project, ''), s.project, ''), r.git_branch, r.session_id, r.model, \
      r.input_tokens, r.output_tokens, r.cache_read_tokens, ",
     write_5m_sql!(),
-    ", r.cache_creation_1h_tokens, r.ts FROM api_requests r \
+    ", r.cache_creation_1h_tokens, r.ts, r.agent FROM api_requests r \
      LEFT JOIN sessions s ON s.session_id = r.session_id \
      WHERE r.source = 'transcript' AND r.ts >= ?1 AND r.ts < ?2"
 );
 
 // 통계 도구 호출 원본 (ts 인덱스 구간)
-pub(crate) const STATS_TOOL_CALLS_SQL: &str = "SELECT agent, is_error, ts FROM tool_calls \
+pub(crate) const STATS_TOOL_CALLS_SQL: &str = "SELECT agent, is_error, ts, tool_name FROM tool_calls \
     WHERE source = 'transcript' AND ts >= ?1 AND ts < ?2";
+
+// 스킬 호출 원본 (ts 인덱스 구간, detail 은 스킬 이름)
+pub(crate) const SKILL_CALLS_SQL: &str = "SELECT detail, agent, session_id, ts, is_error \
+    FROM tool_calls WHERE source = 'transcript' AND tool_name = 'Skill' AND ts >= ?1 AND ts < ?2";
+
+// 상세 카드 상위 목록·최근 목록 길이
+const SHARE_LIMIT: usize = 5;
+const RECENT_LIMIT: usize = 5;
 
 // 1. 개요 집계 ----------------------------------------------------------------
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -215,6 +223,52 @@ pub struct ModelStatsRow {
     pub wait_p90_ms: Option<i64>,
     pub cost_usd_estimate: f64,
     pub last_ts: String,
+    #[serde(default)]
+    pub first_ts: String,
+    // 비용 순 상위 에이전트 종류
+    #[serde(default)]
+    pub agents: Vec<UsageShare>,
+}
+
+// 8-1-1. 사용 분포 항목 -------------------------------------------------------
+// 상세 카드의 상위 목록 한 줄 (도구·스킬은 count 가 호출 수, 비용 0)
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UsageShare {
+    pub name: String,
+    pub count: u64,
+    pub errors: u64,
+    pub output_tokens: i64,
+    pub cost_usd_estimate: f64,
+    pub last_ts: String,
+}
+
+// 8-1-2. 에이전트 실행 요약 ---------------------------------------------------
+// 메인은 세션 id, 서브에이전트는 '종류#id' 가 실행 키
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentRunSummary {
+    pub run: String,
+    pub model: String,
+    pub requests: u64,
+    pub output_tokens: i64,
+    pub cost_usd_estimate: f64,
+    pub first_ts: String,
+    pub last_ts: String,
+}
+
+// 8-1-3. 스킬 통계 행 ---------------------------------------------------------
+// Skill 도구 호출 기준 (슬래시 명령 직접 호출은 기록에 도구 호출이 없어 제외)
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SkillStatsRow {
+    pub skill: String,
+    pub calls: u64,
+    pub errors: u64,
+    pub sessions: u64,
+    pub first_ts: String,
+    pub last_ts: String,
+    // 호출 수 순 호출 에이전트 종류
+    pub agents: Vec<UsageShare>,
+    // 최근 호출 (name 은 에이전트 종류, last_ts 는 호출 시각)
+    pub recent: Vec<UsageShare>,
 }
 
 // 8-2. 에이전트 통계 행 -------------------------------------------------------
@@ -239,6 +293,17 @@ pub struct AgentStatsRow {
     pub tool_errors: u64,
     pub top_model: String,
     pub last_ts: String,
+    #[serde(default)]
+    pub first_ts: String,
+    // 비용 순 사용 모델
+    #[serde(default)]
+    pub models: Vec<UsageShare>,
+    // 호출 수 순 도구
+    #[serde(default)]
+    pub top_tools: Vec<UsageShare>,
+    // 마지막 활동 순 최근 실행
+    #[serde(default)]
+    pub recent_runs: Vec<AgentRunSummary>,
 }
 
 // 8-2-1. 프로젝트·브랜치 통계 행 ----------------------------------------------
@@ -256,6 +321,15 @@ pub struct ProjectStatsRow {
     pub cache_creation_1h_tokens: i64,
     pub cost_usd_estimate: f64,
     pub last_ts: String,
+    #[serde(default)]
+    pub first_ts: String,
+    // 비용 순 모델·에이전트 종류·세션
+    #[serde(default)]
+    pub models: Vec<UsageShare>,
+    #[serde(default)]
+    pub agents: Vec<UsageShare>,
+    #[serde(default)]
+    pub top_sessions: Vec<UsageShare>,
 }
 
 // 8-3. 모델 통계 누적 ---------------------------------------------------------
@@ -272,7 +346,9 @@ struct ModelStatsTotals {
     cache_creation_1h_tokens: i64,
     cost_usd_estimate: f64,
     waits: Vec<i64>,
+    first_ts: String,
     last_ts: String,
+    agents: BTreeMap<String, UsageShare>,
 }
 
 // 8-4. 에이전트 통계 누적 -----------------------------------------------------
@@ -292,7 +368,11 @@ struct AgentStatsTotals {
     model_requests: BTreeMap<String, u64>,
     tool_calls: u64,
     tool_errors: u64,
+    first_ts: String,
     last_ts: String,
+    models: BTreeMap<String, UsageShare>,
+    tools: BTreeMap<String, UsageShare>,
+    runs: BTreeMap<String, AgentRunSummary>,
 }
 
 // 9. 캐시 붕괴 후보 원본 ------------------------------------------------------
@@ -317,7 +397,66 @@ struct ProjectStatsTotals {
     cache_creation_5m_tokens: i64,
     cache_creation_1h_tokens: i64,
     cost_usd_estimate: f64,
+    first_ts: String,
     last_ts: String,
+    models: BTreeMap<String, UsageShare>,
+    agents: BTreeMap<String, UsageShare>,
+    sessions_usage: BTreeMap<String, UsageShare>,
+}
+
+// 9-2. 스킬 통계 누적 ---------------------------------------------------------
+#[derive(Default)]
+struct SkillStatsTotals {
+    calls: u64,
+    errors: u64,
+    sessions: BTreeSet<String>,
+    first_ts: String,
+    agents: BTreeMap<String, UsageShare>,
+    recent: Vec<UsageShare>,
+}
+
+// 9-3. 분포·구간 누적 도우미 --------------------------------------------------
+// 한 건을 분포에 더함
+fn add_share(
+    shares: &mut BTreeMap<String, UsageShare>,
+    name: &str,
+    output_tokens: i64,
+    cost: f64,
+    is_error: bool,
+    ts: &str,
+) {
+    let entry = shares.entry(name.to_string()).or_default();
+    entry.count += 1;
+    entry.errors += u64::from(is_error);
+    entry.output_tokens += output_tokens;
+    entry.cost_usd_estimate += cost;
+    if ts > entry.last_ts.as_str() {
+        entry.last_ts = ts.to_string();
+    }
+}
+
+// 비용·건수 순 상위 항목만 남김
+fn top_shares(shares: BTreeMap<String, UsageShare>, limit: usize) -> Vec<UsageShare> {
+    let mut ranked: Vec<UsageShare> = shares
+        .into_iter()
+        .map(|(name, share)| UsageShare { name, ..share })
+        .collect();
+    ranked.sort_by(|left, right| {
+        right
+            .cost_usd_estimate
+            .total_cmp(&left.cost_usd_estimate)
+            .then_with(|| right.count.cmp(&left.count))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    ranked.truncate(limit);
+    ranked
+}
+
+// 가장 이른 시각 갱신
+fn keep_first_ts(first_ts: &mut String, ts: &str) {
+    if first_ts.is_empty() || ts < first_ts.as_str() {
+        *first_ts = ts.to_string();
+    }
 }
 
 // 10. 백분위 요약 -------------------------------------------------------------
@@ -1051,7 +1190,7 @@ impl Store {
             // 2. 도구 호출
             let mut tool_stmt = conn.prepare_cached(
                 "SELECT source, tool_use_id, ts, session_id, agent, tool_name, duration_ms, \
-                 is_error, error_kind FROM tool_calls ORDER BY ts DESC LIMIT ?1",
+                 is_error, error_kind, detail FROM tool_calls ORDER BY ts DESC LIMIT ?1",
             )?;
             let mut rows = tool_stmt.query(params![cap])?;
             while let Some(row) = rows.next()? {
@@ -1066,6 +1205,7 @@ impl Store {
                     duration_ms: row.get(6)?,
                     is_error: row.get(7)?,
                     error_kind: row.get(8)?,
+                    detail: row.get(9)?,
                 };
                 stamped.push((tool_row.ts.clone(), LiveEvent::Tool(tool_row)));
             }
@@ -1154,11 +1294,19 @@ impl Store {
                     cache_creation_1h_tokens,
                 );
                 let entry = grouped.entry(model).or_default();
+                let agent_type = agent_full.split('#').next().unwrap_or("");
+                add_share(
+                    &mut entry.agents,
+                    agent_type,
+                    output_tokens,
+                    cost,
+                    false,
+                    &request_ts,
+                );
+                keep_first_ts(&mut entry.first_ts, &request_ts);
                 entry.requests += 1;
                 entry.sessions.insert(session_id);
-                entry
-                    .agent_types
-                    .insert(agent_full.split('#').next().unwrap_or("").to_string());
+                entry.agent_types.insert(agent_type.to_string());
                 entry.input_tokens += input_tokens;
                 entry.output_tokens += output_tokens;
                 entry.cache_read_tokens += cache_read_tokens;
@@ -1200,6 +1348,8 @@ impl Store {
                     wait_p50_ms,
                     wait_p90_ms,
                     last_ts: totals.last_ts,
+                    first_ts: totals.first_ts,
+                    agents: top_shares(totals.agents, SHARE_LIMIT),
                 });
             }
 
@@ -1243,7 +1393,33 @@ impl Store {
                 } else {
                     agent_full
                 };
+                let cost = estimate_cost_usd(
+                    &model,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_creation_5m_tokens,
+                    cache_creation_1h_tokens,
+                );
                 let entry = grouped.entry(agent).or_default();
+                let run = entry.runs.entry(run_key.clone()).or_default();
+                run.requests += 1;
+                run.output_tokens += output_tokens;
+                run.cost_usd_estimate += cost;
+                keep_first_ts(&mut run.first_ts, &request_ts);
+                if request_ts >= run.last_ts {
+                    run.last_ts = request_ts.clone();
+                    run.model = model.clone();
+                }
+                add_share(
+                    &mut entry.models,
+                    &model,
+                    output_tokens,
+                    cost,
+                    false,
+                    &request_ts,
+                );
+                keep_first_ts(&mut entry.first_ts, &request_ts);
                 entry.run_keys.insert(run_key);
                 entry.sessions.insert(session_id);
                 entry.requests += 1;
@@ -1253,14 +1429,7 @@ impl Store {
                 entry.cache_creation_tokens += cache_creation_tokens;
                 entry.cache_creation_5m_tokens += cache_creation_5m_tokens;
                 entry.cache_creation_1h_tokens += cache_creation_1h_tokens;
-                entry.cost_usd_estimate += estimate_cost_usd(
-                    &model,
-                    input_tokens,
-                    output_tokens,
-                    cache_read_tokens,
-                    cache_creation_5m_tokens,
-                    cache_creation_1h_tokens,
-                );
+                entry.cost_usd_estimate += cost;
                 if let Some(elapsed) = row.get::<_, Option<i64>>(7)? {
                     entry.waits.push(elapsed);
                 }
@@ -1277,8 +1446,11 @@ impl Store {
                 let agent_full: String = row.get(0)?;
                 let is_error: bool = row.get(1)?;
                 let call_ts: String = row.get(2)?;
+                let tool_name: String = row.get(3)?;
                 let agent = agent_full.split('#').next().unwrap_or("").to_string();
                 let entry = grouped.entry(agent).or_default();
+                add_share(&mut entry.tools, &tool_name, 0, 0.0, is_error, &call_ts);
+                keep_first_ts(&mut entry.first_ts, &call_ts);
                 entry.tool_calls += 1;
                 if is_error {
                     entry.tool_errors += 1;
@@ -1323,6 +1495,10 @@ impl Store {
                     tool_errors: totals.tool_errors,
                     top_model,
                     last_ts: totals.last_ts,
+                    first_ts: totals.first_ts,
+                    models: top_shares(totals.models, SHARE_LIMIT),
+                    top_tools: top_shares(totals.tools, SHARE_LIMIT),
+                    recent_runs: recent_runs(totals.runs),
                 });
             }
 
@@ -1362,15 +1538,8 @@ impl Store {
                 let cache_creation_5m_tokens: i64 = row.get(7)?;
                 let cache_creation_1h_tokens: i64 = row.get(8)?;
                 let request_ts: String = row.get(9)?;
-                let entry = grouped.entry((project, git_branch)).or_default();
-                entry.requests += 1;
-                entry.sessions.insert(session_id);
-                entry.input_tokens += input_tokens;
-                entry.output_tokens += output_tokens;
-                entry.cache_read_tokens += cache_read_tokens;
-                entry.cache_creation_5m_tokens += cache_creation_5m_tokens;
-                entry.cache_creation_1h_tokens += cache_creation_1h_tokens;
-                entry.cost_usd_estimate += estimate_cost_usd(
+                let agent_full: String = row.get(10)?;
+                let cost = estimate_cost_usd(
                     &model,
                     input_tokens,
                     output_tokens,
@@ -1378,6 +1547,41 @@ impl Store {
                     cache_creation_5m_tokens,
                     cache_creation_1h_tokens,
                 );
+                let entry = grouped.entry((project, git_branch)).or_default();
+                let agent_type = agent_full.split('#').next().unwrap_or("");
+                add_share(
+                    &mut entry.models,
+                    &model,
+                    output_tokens,
+                    cost,
+                    false,
+                    &request_ts,
+                );
+                add_share(
+                    &mut entry.agents,
+                    agent_type,
+                    output_tokens,
+                    cost,
+                    false,
+                    &request_ts,
+                );
+                add_share(
+                    &mut entry.sessions_usage,
+                    &session_id,
+                    output_tokens,
+                    cost,
+                    false,
+                    &request_ts,
+                );
+                keep_first_ts(&mut entry.first_ts, &request_ts);
+                entry.requests += 1;
+                entry.sessions.insert(session_id);
+                entry.input_tokens += input_tokens;
+                entry.output_tokens += output_tokens;
+                entry.cache_read_tokens += cache_read_tokens;
+                entry.cache_creation_5m_tokens += cache_creation_5m_tokens;
+                entry.cache_creation_1h_tokens += cache_creation_1h_tokens;
+                entry.cost_usd_estimate += cost;
                 if request_ts > entry.last_ts {
                     entry.last_ts = request_ts;
                 }
@@ -1398,6 +1602,10 @@ impl Store {
                     cache_creation_1h_tokens: totals.cache_creation_1h_tokens,
                     cost_usd_estimate: totals.cost_usd_estimate,
                     last_ts: totals.last_ts,
+                    first_ts: totals.first_ts,
+                    models: top_shares(totals.models, SHARE_LIMIT),
+                    agents: top_shares(totals.agents, SHARE_LIMIT),
+                    top_sessions: top_shares(totals.sessions_usage, SHARE_LIMIT),
                 });
             }
 
@@ -1413,6 +1621,91 @@ impl Store {
             Ok(stats)
         })
     }
+
+    // 12-13. 스킬별 호출 통계 (호출 수·이름 순, 이름이 빈 행은 백필 전 기록)
+    pub fn query_skill_stats(
+        &self,
+        since: &str,
+        until: &str,
+    ) -> anyhow::Result<Vec<SkillStatsRow>> {
+        self.with_conn(|conn| {
+            // 1. 호출 누적
+            let mut stmt = conn.prepare_cached(SKILL_CALLS_SQL)?;
+            let mut grouped: BTreeMap<String, SkillStatsTotals> = BTreeMap::new();
+            let mut rows = stmt.query(params![since, until])?;
+            while let Some(row) = rows.next()? {
+                let skill: String = row.get(0)?;
+                let agent_full: String = row.get(1)?;
+                let session_id: String = row.get(2)?;
+                let call_ts: String = row.get(3)?;
+                let is_error: bool = row.get(4)?;
+                let agent_type = agent_full.split('#').next().unwrap_or("");
+                let entry = grouped.entry(skill).or_default();
+                entry.calls += 1;
+                entry.errors += u64::from(is_error);
+                entry.sessions.insert(session_id);
+                keep_first_ts(&mut entry.first_ts, &call_ts);
+                add_share(&mut entry.agents, agent_type, 0, 0.0, is_error, &call_ts);
+                entry.recent.push(UsageShare {
+                    name: agent_type.to_string(),
+                    count: 1,
+                    errors: u64::from(is_error),
+                    last_ts: call_ts,
+                    ..UsageShare::default()
+                });
+            }
+
+            // 2. 행 구성
+            let mut stats: Vec<SkillStatsRow> = grouped
+                .into_iter()
+                .map(|(skill, mut totals)| {
+                    totals
+                        .recent
+                        .sort_by(|left, right| right.last_ts.cmp(&left.last_ts));
+                    totals.recent.truncate(RECENT_LIMIT);
+                    SkillStatsRow {
+                        skill,
+                        calls: totals.calls,
+                        errors: totals.errors,
+                        sessions: totals.sessions.len() as u64,
+                        last_ts: totals
+                            .recent
+                            .first()
+                            .map(|call| call.last_ts.clone())
+                            .unwrap_or_default(),
+                        first_ts: totals.first_ts,
+                        agents: top_shares(totals.agents, SHARE_LIMIT),
+                        recent: totals.recent,
+                    }
+                })
+                .collect();
+
+            // 3. 호출 수·이름 순 정렬
+            stats.sort_by(|left, right| {
+                right
+                    .calls
+                    .cmp(&left.calls)
+                    .then_with(|| left.skill.cmp(&right.skill))
+            });
+            Ok(stats)
+        })
+    }
+}
+
+// 12-14. 마지막 활동 순 최근 실행
+fn recent_runs(runs: BTreeMap<String, AgentRunSummary>) -> Vec<AgentRunSummary> {
+    let mut ordered: Vec<AgentRunSummary> = runs
+        .into_iter()
+        .map(|(run, summary)| AgentRunSummary { run, ..summary })
+        .collect();
+    ordered.sort_by(|left, right| {
+        right
+            .last_ts
+            .cmp(&left.last_ts)
+            .then_with(|| left.run.cmp(&right.run))
+    });
+    ordered.truncate(RECENT_LIMIT);
+    ordered
 }
 
 // 13. 출처·판정 문자열 복원 ---------------------------------------------------
@@ -2212,6 +2505,126 @@ mod tests {
                 single.project
             );
         }
+        drop(store);
+        remove_temp_dir(&dir);
+    }
+
+    // Skill 도구 호출 행 (detail = 스킬 이름)
+    fn skill_row(key: &str, ts: &str, session_id: &str, agent: &str, skill: &str) -> ToolCallRow {
+        ToolCallRow {
+            source: DataSource::Transcript,
+            tool_use_id: key.to_string(),
+            ts: ts.to_string(),
+            session_id: session_id.to_string(),
+            agent: agent.to_string(),
+            tool_name: "Skill".to_string(),
+            detail: skill.to_string(),
+            ..ToolCallRow::default()
+        }
+    }
+
+    #[test]
+    fn skill_stats_group_transcript_skill_calls_and_backfill_only_fills_empty_names() {
+        let dir = unique_temp_dir("skill-stats");
+        let store = Store::open_store(&dir.join("cm.sqlite")).expect("DB 열기");
+
+        // 1. 시드: s1 은 이전 바이너리가 이름 없이 적재한 행, Bash·OTLP·구간 밖 행은 제외 대상
+        let mut errored = skill_row(
+            "s2",
+            "2026-11-10T12:05:00.000Z",
+            "sess-a",
+            "main",
+            "frontend-tui",
+        );
+        errored.is_error = true;
+        let first = IngestBatch {
+            tool_calls: vec![
+                skill_row("s1", "2026-11-10T12:00:00.000Z", "sess-a", "main", ""),
+                errored,
+                skill_row(
+                    "s3",
+                    "2026-11-10T12:10:00.000Z",
+                    "sess-b",
+                    "worker#abc",
+                    "frontend-tui",
+                ),
+                skill_row(
+                    "s4",
+                    "2026-11-10T12:20:00.000Z",
+                    "sess-b",
+                    "main",
+                    "core-response",
+                ),
+                stats_tool_row(
+                    "b1",
+                    "2026-11-10T12:30:00.000Z",
+                    "main",
+                    false,
+                    DataSource::Transcript,
+                ),
+                ToolCallRow {
+                    source: DataSource::Otlp,
+                    ..skill_row(
+                        "o1",
+                        "2026-11-10T12:40:00.000Z",
+                        "sess-a",
+                        "main",
+                        "frontend-tui",
+                    )
+                },
+                skill_row(
+                    "s5",
+                    "2026-11-12T00:00:00.000Z",
+                    "sess-a",
+                    "main",
+                    "frontend-tui",
+                ),
+            ],
+            ..IngestBatch::default()
+        };
+        store.insert_batch(&first).expect("시드 적재");
+
+        // 2. 다시 읽기: 비어 있던 s1 만 채우고 이미 있는 s2 이름은 유지, 신규 건수 0
+        let replay = IngestBatch {
+            tool_calls: vec![
+                skill_row(
+                    "s1",
+                    "2026-11-10T12:00:00.000Z",
+                    "sess-a",
+                    "main",
+                    "frontend-tui",
+                ),
+                skill_row(
+                    "s2",
+                    "2026-11-10T12:05:00.000Z",
+                    "sess-a",
+                    "main",
+                    "utils-table",
+                ),
+            ],
+            ..IngestBatch::default()
+        };
+        let counts = store.insert_batch(&replay).expect("다시 적재");
+        assert_eq!(counts.tool_calls, 0);
+
+        // 3. 구간 집계: 호출 수 내림차순, 호출자는 # 앞 종류 이름
+        let stats = store
+            .query_skill_stats("2026-11-10T00:00:00.000Z", "2026-11-11T00:00:00.000Z")
+            .expect("스킬 통계");
+        let names: Vec<&str> = stats.iter().map(|row| row.skill.as_str()).collect();
+        assert_eq!(names, ["frontend-tui", "core-response"]);
+        let tui = &stats[0];
+        assert_eq!((tui.calls, tui.errors, tui.sessions), (3, 1, 2));
+        assert_eq!(tui.first_ts, "2026-11-10T12:00:00.000Z");
+        assert_eq!(tui.last_ts, "2026-11-10T12:10:00.000Z");
+        let callers: Vec<(&str, u64, u64)> = tui
+            .agents
+            .iter()
+            .map(|share| (share.name.as_str(), share.count, share.errors))
+            .collect();
+        assert_eq!(callers, [("main", 2, 1), ("worker", 1, 0)]);
+        assert_eq!(tui.recent.len(), 3);
+        assert_eq!(tui.recent[0].name, "worker");
         drop(store);
         remove_temp_dir(&dir);
     }

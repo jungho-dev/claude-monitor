@@ -14,6 +14,7 @@ use crate::tui::views::projects::{ATTRIBUTION_COLUMNS, PROJECT_COLUMNS};
 use crate::tui::views::settings::{
     SETTINGS_AGENT_COLUMNS, SETTINGS_DOCTOR_COLUMNS, SETTINGS_HOOK_COLUMNS, SETTINGS_MCP_COLUMNS,
 };
+use crate::tui::views::skills::SKILL_COLUMNS;
 use crate::tui::views::tables::{HOOK_COLUMNS, TOOL_COLUMNS};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -29,7 +30,7 @@ const TEMP_SUFFIX: &str = ".tmp";
 const MAX_LINK_DEPTH: usize = 16;
 const STALE_TEMP_AGE: Duration = Duration::from_secs(600);
 // 열 폭을 파일에 쓰는 표 카드 (열 폭 0 = 자동 폭)
-const TABLE_CARDS: [CardId; 12] = [
+const TABLE_CARDS: [CardId; 13] = [
     CardId::EventFeed,
     CardId::ToolTable,
     CardId::HookTable,
@@ -42,11 +43,12 @@ const TABLE_CARDS: [CardId; 12] = [
     CardId::SettingsDoctor,
     CardId::ProjectTable,
     CardId::AttributionTable,
+    CardId::SkillTable,
 ];
 
 // 1. 파일 형식 ----------------------------------------------------------------
 // 언어·귀속 차원은 최상위 문자열 (알 수 없는 값만 무시, 차원은 기본값이면 기록하지 않음)
-// 탭 순서는 최상위 고정 이름 배열 (기본 순서면 기록하지 않고, 여덟 탭을 한 번씩 담지 않으면 무시)
+// 탭 순서는 최상위 고정 이름 배열 (기본 순서면 기록하지 않고, 탭을 한 번씩 담지 않으면 무시, 나중에 더한 탭만 빠지면 뒤에 붙임)
 // 그룹·카드는 고정 이름 키, 값은 정수 배열 (항목마다 길이·범위를 검사해 맞지 않는 항목만 무시)
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct LayoutFile {
@@ -87,6 +89,7 @@ fn table_card_columns(card: CardId) -> Option<(&'static str, usize)> {
         CardId::SettingsDoctor => Some(("settings_doctor", SETTINGS_DOCTOR_COLUMNS.len())),
         CardId::ProjectTable => Some(("project_table", PROJECT_COLUMNS.len())),
         CardId::AttributionTable => Some(("attribution_table", ATTRIBUTION_COLUMNS.len())),
+        CardId::SkillTable => Some(("skill_table", SKILL_COLUMNS.len())),
         _ => None,
     }
 }
@@ -365,17 +368,23 @@ impl AppState {
                     Some(Some(dimension)) => self.attribution_dimension = dimension,
                     Some(None) => skipped += 1,
                 }
-                // 탭 순서는 여덟 탭의 고정 이름을 빠짐·겹침 없이 담은 배열만 복원
+                // 탭 순서는 고정 이름을 겹침 없이 담은 배열만 복원 (나중에 더한 탭만 빠진 이전 파일은 뒤에 붙임)
                 match file.tab_order.as_ref().map(|value| {
-                    let tabs: Option<Vec<ActiveTab>> = value
+                    let mut tabs: Vec<ActiveTab> = value
                         .as_array()?
                         .iter()
                         .map(|key| {
                             let key = key.as_str()?;
                             ActiveTab::ALL.into_iter().find(|tab| tab.tab_key() == key)
                         })
-                        .collect();
-                    tabs.and_then(|tabs| <[ActiveTab; TAB_COUNT]>::try_from(tabs).ok())
+                        .collect::<Option<_>>()?;
+                    for later in ActiveTab::LATER_TABS {
+                        if !tabs.contains(&later) {
+                            tabs.push(later);
+                        }
+                    }
+                    <[ActiveTab; TAB_COUNT]>::try_from(tabs)
+                        .ok()
                         .filter(|order| ActiveTab::ALL.iter().all(|tab| order.contains(tab)))
                 }) {
                     None => {}
@@ -581,7 +590,7 @@ mod tests {
         customize(&mut state);
         state.save_tui_state();
         let text = fs::read_to_string(dir.0.join(TUI_STATE_FILE_NAME)).unwrap();
-        let expected = "tab_order = [\"projects\", \"tools\", \"hooks\", \"models\", \"agents\", \"settings\", \"report\", \"overview\"]";
+        let expected = "tab_order = [\"projects\", \"tools\", \"hooks\", \"models\", \"agents\", \"settings\", \"report\", \"overview\", \"skills\"]";
         assert!(text.contains(expected), "{text}");
         assert!(text.find("tab_order") < text.find("[orders]"), "{text}");
 
@@ -589,6 +598,17 @@ mod tests {
         loaded.load_tui_state();
         assert!(loaded.toast.is_none(), "{:?}", loaded.toast);
         assert_eq!(loaded.tab_order, state.tab_order);
+
+        // 1-1. 스킬 탭 이전에 저장한 8개 순서는 그대로 두고 새 탭을 끝에 붙임 (알림 없음)
+        fs::write(
+            dir.0.join(TUI_STATE_FILE_NAME),
+            "version = 1\ntab_order = [\"projects\", \"tools\", \"hooks\", \"models\", \"agents\", \"settings\", \"report\", \"overview\"]\n",
+        )
+        .unwrap();
+        let mut legacy = state_in(&dir);
+        legacy.load_tui_state();
+        assert!(legacy.toast.is_none(), "{:?}", legacy.toast);
+        assert_eq!(legacy.tab_order, state.tab_order);
 
         // 2. 겹치거나 빠지거나 모르는 이름이면 기본 순서 유지, 건너뛴 항목 알림 한 번
         for broken in [

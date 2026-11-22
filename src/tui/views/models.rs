@@ -1,8 +1,9 @@
 //! tui/views/models.rs
 //! 모델·에이전트 탭: 모델별·에이전트 종류별 통계 표, 선택 행 상세 카드, 캐시 붕괴 후보 표.
 
+use crate::inventory::Inventory;
 use crate::store::limits::LimitSnapshot;
-use crate::store::query::{AgentStatsRow, ModelStatsRow};
+use crate::store::query::{AgentRunSummary, AgentStatsRow, ModelStatsRow};
 use crate::tui::cards::CardId;
 use crate::tui::format::{
     fit_display, format_clock_time, format_compact, format_count, format_duration_ms, short_model,
@@ -17,6 +18,10 @@ use crate::tui::views::common::{
     interactive_card, panel_message, render_card_table, render_db_gate, render_notice_card,
     render_text_card,
 };
+use crate::tui::views::detail::{
+    DETAIL_LABEL_WIDTH, ShareBasis, WindowTotals, cache_split, first_last, pair_line, per_request,
+    section_line, share_lines, window_share,
+};
 use crate::tui::views::overview::{LIMIT_STALE_SECS, format_age, format_countdown};
 use chrono::{DateTime, Local};
 use ratatui::Frame;
@@ -25,15 +30,16 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Padding, Paragraph};
 
-// 상세 항목 이름 칸 폭
-const DETAIL_LABEL_WIDTH: usize = 23;
-
-// 상세 카드 줄 수와 높이 (높이 = 줄 수 + 위아래 테두리 2줄)
-const MODEL_DETAIL_LINES: usize = 6;
-const AGENT_DETAIL_LINES: usize = 7;
+// 상세 카드 기본 높이 (높이 = 보이는 줄 수 + 위아래 테두리 2줄, 넘치는 분포 목록은 스크롤)
+// 모델 = 항목 9줄 + 에이전트 구역 제목과 두 줄, 에이전트 = 본문의 절반 남짓 (최소는 항목 7줄)
 const DETAIL_BORDER_ROWS: u16 = 2;
-const MODEL_DETAIL_HEIGHT: u16 = MODEL_DETAIL_LINES as u16 + DETAIL_BORDER_ROWS;
-const AGENT_DETAIL_HEIGHT: u16 = AGENT_DETAIL_LINES as u16 + DETAIL_BORDER_ROWS;
+const MODEL_DETAIL_HEIGHT: u16 = 12 + DETAIL_BORDER_ROWS;
+const AGENT_DETAIL_MIN_HEIGHT: u16 = 7 + DETAIL_BORDER_ROWS;
+const AGENT_DETAIL_SHARE_PERCENT: u32 = 55;
+// 에이전트 표가 지키는 최소 높이 (머리글과 두어 행)
+const AGENT_TABLE_MIN: u16 = 5;
+// 최근 실행 줄의 실행 id 앞부분 길이
+const RUN_ID_PREFIX: usize = 8;
 
 // 캐시 타이머 카드: 줄 수는 남은 시간·적중·최근 미스 셋, 본문이 이 높이 이상일 때만 기본 배치에 포함, 카드 최소 높이
 const CACHE_CARD_HEIGHT: u16 = 3 + DETAIL_BORDER_ROWS;
@@ -149,9 +155,15 @@ pub fn render_models_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
         }
         _ => None,
     };
+    let model_totals = models
+        .as_ref()
+        .map_or(WindowTotals::default(), |sorted| WindowTotals {
+            requests: sorted.iter().map(|row| row.requests).sum(),
+            cost: sorted.iter().map(|row| row.cost_usd_estimate).sum(),
+        });
     match &models {
         Some(sorted) => {
-            let cost_total: f64 = sorted.iter().map(|row| row.cost_usd_estimate).sum();
+            let cost_total = model_totals.cost;
             let rows: Vec<Vec<TableCell>> = sorted
                 .iter()
                 .map(|row| {
@@ -207,7 +219,7 @@ pub fn render_models_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
     }
     let selected = state.card_views[CardId::ModelTable as usize].selected;
     let selected_model = models.as_ref().and_then(|sorted| sorted.get(selected));
-    let (detail_title, detail_lines) = build_model_detail(state.lang, selected_model);
+    let (detail_title, detail_lines) = build_model_detail(state.lang, selected_model, model_totals);
     render_text_card(
         frame,
         state,
@@ -464,8 +476,12 @@ fn build_cache_lines(
 }
 
 // 2. 모델 상세 ----------------------------------------------------------------
-// 제목과 항목 줄 (캐시 적중과 추정 비용 포함)
-fn build_model_detail(lang: Lang, row: Option<&ModelStatsRow>) -> (String, Vec<Line<'static>>) {
+// 제목과 항목 줄 (캐시 적중·생성 분리, 추정 비용, 요청당 비용, 구간 점유), 이어서 에이전트별 비용 구역
+fn build_model_detail(
+    lang: Lang,
+    row: Option<&ModelStatsRow>,
+    window: WindowTotals,
+) -> (String, Vec<Line<'static>>) {
     let Some(row) = row else {
         return (
             i18n::text(lang, Msg::TitleModelDetail).to_string(),
@@ -476,7 +492,7 @@ fn build_model_detail(lang: Lang, row: Option<&ModelStatsRow>) -> (String, Vec<L
         );
     };
     let wait = |millis: Option<i64>| millis.map_or("-".to_string(), format_duration_ms);
-    let pairs: [(&str, String); MODEL_DETAIL_LINES] = [
+    let pairs: [(&str, String); 9] = [
         (
             i18n::text(lang, Msg::ModelCounts),
             format!(
@@ -504,6 +520,10 @@ fn build_model_detail(lang: Lang, row: Option<&ModelStatsRow>) -> (String, Vec<L
             ),
         ),
         (
+            i18n::text(lang, Msg::DetailCacheSplit),
+            cache_split(row.cache_creation_5m_tokens, row.cache_creation_1h_tokens),
+        ),
+        (
             i18n::text(lang, Msg::WaitP50P90),
             format!("{} / {}", wait(row.wait_p50_ms), wait(row.wait_p90_ms)),
         ),
@@ -512,19 +532,29 @@ fn build_model_detail(lang: Lang, row: Option<&ModelStatsRow>) -> (String, Vec<L
             i18n::cost_value(lang, row.cost_usd_estimate),
         ),
         (
-            i18n::text(lang, Msg::LastRequest),
-            format_clock_time(&row.last_ts),
+            i18n::text(lang, Msg::DetailPerRequest),
+            per_request(row.cost_usd_estimate, row.output_tokens, row.requests),
+        ),
+        (
+            i18n::text(lang, Msg::DetailWindowShare),
+            window_share(lang, row.requests, row.cost_usd_estimate, window),
+        ),
+        (
+            i18n::text(lang, Msg::DetailFirstLast),
+            first_last(&row.first_ts, &row.last_ts),
         ),
     ];
-    let lines = pairs
+    let mut lines: Vec<Line<'static>> = pairs
         .into_iter()
-        .map(|(name, value)| {
-            Line::from(vec![
-                Span::styled(fit_display(name, DETAIL_LABEL_WIDTH), theme::STYLE_DIM),
-                Span::styled(value, theme::STYLE_TEXT),
-            ])
-        })
+        .map(|(name, value)| pair_line(name, value))
         .collect();
+    lines.extend(share_lines(
+        lang,
+        Msg::SectionAgentsByCost,
+        &row.agents,
+        ShareBasis::Cost,
+        row.cost_usd_estimate,
+    ));
     let base = i18n::text(lang, Msg::TitleModelDetail);
     let title = if row.model.is_empty() {
         base.to_string()
@@ -540,14 +570,17 @@ pub fn render_agents_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
     if render_db_gate(frame, state, area) {
         return;
     }
-    let detail_height = AGENT_DETAIL_HEIGHT.min(area.height.saturating_sub(5));
+    // 상세가 분포·최근 실행까지 담아 본문의 절반 남짓을 쓰고, 표는 머리글과 두어 행을 남김
+    let detail_height = ((u32::from(area.height) * AGENT_DETAIL_SHARE_PERCENT / 100) as u16)
+        .max(AGENT_DETAIL_MIN_HEIGHT)
+        .min(area.height.saturating_sub(AGENT_TABLE_MIN));
     let panes = state.card_layout.split_cards(
         &mut state.hit_areas,
         SplitGroup::AgentsRows,
         SplitAxis::Rows,
         area,
         &[area.height.saturating_sub(detail_height)],
-        &[5, 3],
+        &[AGENT_TABLE_MIN, 3],
     );
 
     // 1. 에이전트 통계 표
@@ -563,9 +596,15 @@ pub fn render_agents_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
         }
         _ => None,
     };
+    let agent_totals = agents
+        .as_ref()
+        .map_or(WindowTotals::default(), |sorted| WindowTotals {
+            requests: sorted.iter().map(|row| row.requests).sum(),
+            cost: sorted.iter().map(|row| row.cost_usd_estimate).sum(),
+        });
     match &agents {
         Some(sorted) => {
-            let cost_total: f64 = sorted.iter().map(|row| row.cost_usd_estimate).sum();
+            let cost_total = agent_totals.cost;
             let rows: Vec<Vec<TableCell>> = sorted
                 .iter()
                 .map(|row| {
@@ -642,7 +681,8 @@ pub fn render_agents_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // 2. 선택 에이전트 상세
     let selected = state.card_views[CardId::AgentTable as usize].selected;
     let selected_agent = agents.as_ref().and_then(|sorted| sorted.get(selected));
-    let (detail_title, detail_lines) = build_agent_detail(state.lang, selected_agent);
+    let (detail_title, detail_lines) =
+        build_agent_detail(state.lang, selected_agent, agent_totals, &state.inventory);
     render_text_card(
         frame,
         state,
@@ -657,8 +697,13 @@ pub fn render_agents_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
 }
 
 // 4. 에이전트 상세 ------------------------------------------------------------
-// 제목과 항목 줄 (도구 오류율, 주 모델, 추정 비용 포함)
-fn build_agent_detail(lang: Lang, row: Option<&AgentStatsRow>) -> (String, Vec<Line<'static>>) {
+// 제목과 항목 줄 (도구 오류율, 실행당 요청·비용, 구간 점유, 정의 파일 설정값, 주 모델), 이어서 모델·도구·최근 실행 구역
+fn build_agent_detail(
+    lang: Lang,
+    row: Option<&AgentStatsRow>,
+    window: WindowTotals,
+    inventory: &Panel<Inventory>,
+) -> (String, Vec<Line<'static>>) {
     let Some(row) = row else {
         return (
             i18n::text(lang, Msg::TitleAgentDetail).to_string(),
@@ -668,6 +713,7 @@ fn build_agent_detail(lang: Lang, row: Option<&AgentStatsRow>) -> (String, Vec<L
             ))],
         );
     };
+    let count = |value: u64| format_count(i64::try_from(value).unwrap_or(i64::MAX));
     let wait = |millis: Option<i64>| millis.map_or("-".to_string(), format_duration_ms);
     let error_rate = if row.tool_calls > 0 {
         row.tool_errors as f64 * 100.0 / row.tool_calls as f64
@@ -679,16 +725,26 @@ fn build_agent_detail(lang: Lang, row: Option<&AgentStatsRow>) -> (String, Vec<L
     } else {
         row.top_model.clone()
     };
-    let pairs: [(&str, String); AGENT_DETAIL_LINES] = [
+    let per_run = if row.runs > 0 {
+        format!(
+            "{:.1} / ${:.3}",
+            row.requests as f64 / row.runs as f64,
+            row.cost_usd_estimate / row.runs as f64
+        )
+    } else {
+        "-".to_string()
+    };
+    let pairs: [(&str, String); 12] = [
         (
             i18n::text(lang, Msg::AgentCounts),
             format!(
                 "{} / {} / {}",
-                format_count(i64::try_from(row.runs).unwrap_or(i64::MAX)),
-                format_count(i64::try_from(row.requests).unwrap_or(i64::MAX)),
-                format_count(i64::try_from(row.sessions).unwrap_or(i64::MAX)),
+                count(row.runs),
+                count(row.requests),
+                count(row.sessions),
             ),
         ),
+        (i18n::text(lang, Msg::DetailPerRun), per_run),
         (
             i18n::text(lang, Msg::InOut),
             format!(
@@ -707,6 +763,10 @@ fn build_agent_detail(lang: Lang, row: Option<&AgentStatsRow>) -> (String, Vec<L
             ),
         ),
         (
+            i18n::text(lang, Msg::DetailCacheSplit),
+            cache_split(row.cache_creation_5m_tokens, row.cache_creation_1h_tokens),
+        ),
+        (
             i18n::text(lang, Msg::WaitP50P90),
             format!("{} / {}", wait(row.wait_p50_ms), wait(row.wait_p90_ms)),
         ),
@@ -714,8 +774,8 @@ fn build_agent_detail(lang: Lang, row: Option<&AgentStatsRow>) -> (String, Vec<L
             i18n::text(lang, Msg::AgentToolCalls),
             i18n::tool_calls_value(
                 lang,
-                &format_count(i64::try_from(row.tool_calls).unwrap_or(i64::MAX)),
-                &format_count(i64::try_from(row.tool_errors).unwrap_or(i64::MAX)),
+                &count(row.tool_calls),
+                &count(row.tool_errors),
                 error_rate,
             ),
         ),
@@ -724,19 +784,51 @@ fn build_agent_detail(lang: Lang, row: Option<&AgentStatsRow>) -> (String, Vec<L
             i18n::cost_value(lang, row.cost_usd_estimate),
         ),
         (
+            i18n::text(lang, Msg::DetailWindowShare),
+            window_share(lang, row.requests, row.cost_usd_estimate, window),
+        ),
+        (
+            i18n::text(lang, Msg::DetailConfigured),
+            agent_config(lang, &row.agent, inventory),
+        ),
+        (
             i18n::text(lang, Msg::AgentTopLast),
             format!("{top_model} / {}", format_clock_time(&row.last_ts)),
         ),
+        (
+            i18n::text(lang, Msg::DetailFirstSeen),
+            if row.first_ts.is_empty() {
+                "-".to_string()
+            } else {
+                format_clock_time(&row.first_ts)
+            },
+        ),
     ];
-    let lines = pairs
+    let mut lines: Vec<Line<'static>> = pairs
         .into_iter()
-        .map(|(name, value)| {
-            Line::from(vec![
-                Span::styled(fit_display(name, DETAIL_LABEL_WIDTH), theme::STYLE_DIM),
-                Span::styled(value, theme::STYLE_TEXT),
-            ])
-        })
+        .map(|(name, value)| pair_line(name, value))
         .collect();
+
+    // 모델별 비용, 도구별 호출, 최근 실행
+    lines.extend(share_lines(
+        lang,
+        Msg::SectionModelsByCost,
+        &row.models,
+        ShareBasis::Cost,
+        row.cost_usd_estimate,
+    ));
+    lines.extend(share_lines(
+        lang,
+        Msg::SectionToolsByCalls,
+        &row.top_tools,
+        ShareBasis::Calls,
+        row.tool_calls as f64,
+    ));
+    if !row.recent_runs.is_empty() {
+        lines.push(section_line(lang, Msg::SectionRecentRuns));
+        lines.extend(row.recent_runs.iter().map(|run| run_line(lang, run)));
+    }
+
     let base = i18n::text(lang, Msg::TitleAgentDetail);
     let title = if row.agent.is_empty() {
         base.to_string()
@@ -744,6 +836,72 @@ fn build_agent_detail(lang: Lang, row: Option<&AgentStatsRow>) -> (String, Vec<L
         format!("{base} · {}", row.agent)
     };
     (title, lines)
+}
+
+// 4-1. 정의 파일 설정값 -------------------------------------------------------
+// ~/.claude/agents 의 같은 이름 정의 (메인은 정의 파일이 없음, 목록을 읽기 전이면 읽는 중)
+fn agent_config(lang: Lang, agent: &str, inventory: &Panel<Inventory>) -> String {
+    if agent == "main" || agent.is_empty() {
+        return i18n::text(lang, Msg::DetailConfigMain).to_string();
+    }
+    let entries = match inventory {
+        Panel::Ready(inventory) => &inventory.agents,
+        Panel::Pending => return i18n::text(lang, Msg::DetailConfigPending).to_string(),
+        Panel::Failed(_) => return "-".to_string(),
+    };
+    let Some(entry) = entries.iter().find(|entry| entry.name == agent) else {
+        return i18n::text(lang, Msg::DetailConfigMissing).to_string();
+    };
+    let or_dash = |text: &str| {
+        if text.is_empty() {
+            "-".to_string()
+        } else {
+            text.to_string()
+        }
+    };
+    i18n::agent_config_value(
+        lang,
+        &or_dash(&entry.model),
+        &or_dash(&entry.effort),
+        &entry
+            .max_turns
+            .map_or("-".to_string(), |turns| turns.to_string()),
+    )
+}
+
+// 4-2. 최근 실행 한 줄 --------------------------------------------------------
+// 이름 칸 = 실행 id 앞부분 (서브에이전트는 # 뒤, 메인은 세션 id), 값 = 마지막 모델·요청·비용·시작-끝 시각
+fn run_line(lang: Lang, run: &AgentRunSummary) -> Line<'static> {
+    let id = match run.run.rsplit_once('#') {
+        Some((_, suffix)) => format!(
+            "#{}",
+            suffix.chars().take(RUN_ID_PREFIX).collect::<String>()
+        ),
+        None => run.run.chars().take(RUN_ID_PREFIX).collect(),
+    };
+    let minute = |ts: &str| format_clock_time(ts).chars().take(5).collect::<String>();
+    let span = format!("{}-{}", minute(&run.first_ts), minute(&run.last_ts));
+    let model = if run.model.is_empty() {
+        "-"
+    } else {
+        short_model(&run.model)
+    };
+    Line::from(vec![
+        Span::styled(
+            fit_display(&format!("  {id}"), DETAIL_LABEL_WIDTH),
+            theme::STYLE_TEXT,
+        ),
+        Span::styled(
+            i18n::run_value(
+                lang,
+                model,
+                &format_count(i64::try_from(run.requests).unwrap_or(i64::MAX)),
+                run.cost_usd_estimate,
+                &span,
+            ),
+            theme::STYLE_TEXT,
+        ),
+    ])
 }
 
 #[cfg(test)]
@@ -777,22 +935,53 @@ mod tests {
             wait_p90_ms: None,
             cost_usd_estimate: 12.345,
             last_ts: "2026-11-15T01:00:00Z".to_string(),
+            ..ModelStatsRow::default()
         };
-        let (title, lines) = build_model_detail(KO, Some(&row));
+        let window = WindowTotals {
+            requests: 1_800,
+            cost: 24.69,
+        };
+        let (title, lines) = build_model_detail(KO, Some(&row), window);
         assert_eq!(title, "모델 상세 · claude-sonnet-5-5");
         let text: Vec<String> = lines.iter().map(line_text).collect();
         assert!(text.iter().any(|line| line.contains("900 / 3 / 2")));
         assert!(text.iter().any(|line| line.contains("적중 84.2%")));
         assert!(text.iter().any(|line| line.contains("1.2s / -")));
         assert!(text.iter().any(|line| line.contains("$12.35")));
+        // 요청당 비용·출력, 구간 점유 (요청·비용 모두 절반)
+        assert!(
+            text.iter().any(|line| line.contains("$0.0137 / 333")),
+            "{text:?}"
+        );
+        assert!(
+            text.iter()
+                .any(|line| line.contains("요청 50.0% · 비용 50.0%")),
+            "{text:?}"
+        );
+        // 에이전트 분포가 없으면 구역도 없음, 있으면 제목과 줄
+        assert_eq!(lines.len(), 9);
+        let with_agents = ModelStatsRow {
+            agents: vec![crate::tui::test_support::usage_share(
+                "main",
+                900,
+                0,
+                12.345,
+                "2026-11-15T01:00:00Z",
+            )],
+            ..row.clone()
+        };
+        let (_, lines) = build_model_detail(KO, Some(&with_agents), window);
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(text[9], "에이전트별 비용");
+        assert!(text[10].ends_with("요청 900 · $12.35 · 100%"), "{text:?}");
 
-        let (empty_title, empty_lines) = build_model_detail(KO, None);
+        let (empty_title, empty_lines) = build_model_detail(KO, None, window);
         assert_eq!(empty_title, "모델 상세");
         assert_eq!(empty_lines.len(), 1);
     }
 
     #[test]
-    fn agent_detail_reports_tool_error_rate_and_top_model() {
+    fn agent_detail_reports_tool_error_rate_top_model_config_and_recent_runs() {
         let row = AgentStatsRow {
             agent: "worker".to_string(),
             runs: 3,
@@ -802,27 +991,71 @@ mod tests {
             tool_errors: 5,
             top_model: "claude-sonnet-5-5".to_string(),
             cost_usd_estimate: 1.5,
+            recent_runs: vec![AgentRunSummary {
+                run: "worker#a1b2c3d4e5f6".to_string(),
+                model: "claude-haiku-4-5".to_string(),
+                requests: 12,
+                cost_usd_estimate: 0.25,
+                first_ts: "2026-11-15T01:20:00Z".to_string(),
+                last_ts: "2026-11-15T01:30:00Z".to_string(),
+                ..AgentRunSummary::default()
+            }],
             ..AgentStatsRow::default()
         };
-        let (title, lines) = build_agent_detail(KO, Some(&row));
+        let state = crate::tui::test_support::sample_state_with_tables();
+        let window = WindowTotals {
+            requests: 80,
+            cost: 3.0,
+        };
+        let (title, lines) = build_agent_detail(KO, Some(&row), window, &state.inventory);
         assert_eq!(title, "에이전트 상세 · worker");
         let text: Vec<String> = lines.iter().map(line_text).collect();
         assert!(text.iter().any(|line| line.contains("3 / 40 / 2")));
         assert!(text.iter().any(|line| line.contains("오류율 10.0%")));
         assert!(text.iter().any(|line| line.contains("claude-sonnet-5-5")));
+        // 실행당 요청·비용, 구간 점유, agents 폴더 정의의 설정값
+        assert!(
+            text.iter().any(|line| line.contains("13.3 / $0.500")),
+            "{text:?}"
+        );
+        assert!(
+            text.iter()
+                .any(|line| line.contains("요청 50.0% · 비용 50.0%"))
+        );
+        assert!(
+            text.iter()
+                .any(|line| line.contains("모델 sonnet · effort high · 최대턴 40")),
+            "{text:?}"
+        );
+        // 최근 실행: # 뒤 여덟 글자와 마지막 모델·요청·비용
+        assert!(text.iter().any(|line| line == "최근 실행"), "{text:?}");
+        let run = text
+            .iter()
+            .find(|line| line.starts_with("  #a1b2c3d4 "))
+            .expect("실행 줄");
+        assert!(run.contains("haiku-4-5 · 요청 12 · $0.25"), "{run}");
 
-        let (empty_title, _) = build_agent_detail(KO, None);
+        // 메인은 정의 파일 없음, 목록에 없으면 없음, 읽기 전이면 읽는 중
+        assert_eq!(
+            agent_config(KO, "main", &state.inventory),
+            "메인 세션 (정의 파일 없음)"
+        );
+        assert!(agent_config(KO, "ghost", &state.inventory).contains("정의 없음"));
+        assert!(agent_config(Lang::En, "worker", &Panel::Pending).contains("reading"));
+
+        let (empty_title, _) = build_agent_detail(KO, None, window, &state.inventory);
         assert_eq!(empty_title, "에이전트 상세");
     }
 
     #[test]
     fn detail_titles_drop_the_separator_when_the_name_is_empty() {
+        let window = WindowTotals::default();
         let nameless_model = ModelStatsRow::default();
-        let (title, _) = build_model_detail(KO, Some(&nameless_model));
+        let (title, _) = build_model_detail(KO, Some(&nameless_model), window);
         assert_eq!(title, "모델 상세");
 
         let nameless_agent = AgentStatsRow::default();
-        let (title, _) = build_agent_detail(KO, Some(&nameless_agent));
+        let (title, _) = build_agent_detail(KO, Some(&nameless_agent), window, &Panel::Pending);
         assert_eq!(title, "에이전트 상세");
     }
 }

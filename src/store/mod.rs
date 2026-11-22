@@ -50,7 +50,8 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     tool_name TEXT NOT NULL DEFAULT '',
     duration_ms INTEGER,
     is_error INTEGER NOT NULL DEFAULT 0,
-    error_kind TEXT NOT NULL DEFAULT ''
+    error_kind TEXT NOT NULL DEFAULT '',
+    detail TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_tool_calls_ts ON tool_calls(ts);
 CREATE TABLE IF NOT EXISTS hook_events (
@@ -100,6 +101,9 @@ const API_REQUEST_ADDED_COLUMNS: [(&str, &str); 4] = [
     ("project", "TEXT NOT NULL DEFAULT ''"),
 ];
 
+// 기존 DB 에 덧붙이는 tool_calls 열 (Skill 도구의 스킬 이름)
+const TOOL_CALL_ADDED_COLUMNS: [(&str, &str); 1] = [("detail", "TEXT NOT NULL DEFAULT ''")];
+
 // 1. 색인 커서 ----------------------------------------------------------------
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IndexCursor {
@@ -143,20 +147,26 @@ impl Store {
 
         // 기존 DB 열 추가 (있으면 건너뜀, 새로 붙으면 커서를 비워 백필 구간 재읽기)
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing: Vec<String> = tx
-            .prepare("PRAGMA table_info(api_requests)")?
-            .query_map([], |row| row.get(1))?
-            .collect::<Result<_, _>>()?;
         let mut added = false;
-        for (name, definition) in API_REQUEST_ADDED_COLUMNS {
-            if existing.iter().any(|column| column == name) {
-                continue;
+        let tables: [(&str, &[(&str, &str)]); 2] = [
+            ("api_requests", &API_REQUEST_ADDED_COLUMNS),
+            ("tool_calls", &TOOL_CALL_ADDED_COLUMNS),
+        ];
+        for (table, columns) in tables {
+            let existing: Vec<String> = tx
+                .prepare(&format!("PRAGMA table_info({table})"))?
+                .query_map([], |row| row.get(1))?
+                .collect::<Result<_, _>>()?;
+            for (name, definition) in columns {
+                if existing.iter().any(|column| column == name) {
+                    continue;
+                }
+                tx.execute_batch(&format!(
+                    "ALTER TABLE {table} ADD COLUMN {name} {definition}"
+                ))
+                .with_context(|| format!("열 추가 실패: {table}.{name}"))?;
+                added = true;
             }
-            tx.execute_batch(&format!(
-                "ALTER TABLE api_requests ADD COLUMN {name} {definition}"
-            ))
-            .with_context(|| format!("열 추가 실패: {name}"))?;
-            added = true;
         }
         if added {
             // 동시에 도는 이전 바이너리가 빈 커서를 소비해 새 열 없이 다시 색인할 수 있으므로
@@ -271,14 +281,17 @@ impl Store {
             }
         }
 
-        // 2. 도구 호출 시작
+        // 2. 도구 호출 시작 (신규만 집계, 백필 재읽기는 비어 있던 스킬 이름만 채움)
         {
             let mut stmt = tx.prepare_cached(
                 "INSERT OR IGNORE INTO tool_calls (source, tool_use_id, ts, session_id, agent, tool_name, \
-                 duration_ms, is_error, error_kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 duration_ms, is_error, error_kind, detail) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            )?;
+            let mut detail_stmt = tx.prepare_cached(
+                "UPDATE tool_calls SET detail = ?2 WHERE tool_use_id = ?1 AND detail = ''",
             )?;
             for row in &batch.tool_calls {
-                counts.tool_calls += stmt.execute(params![
+                let inserted = stmt.execute(params![
                     row.source.as_str(),
                     row.tool_use_id,
                     row.ts,
@@ -288,7 +301,12 @@ impl Store {
                     row.duration_ms,
                     row.is_error,
                     row.error_kind,
+                    row.detail,
                 ])? as u64;
+                counts.tool_calls += inserted;
+                if inserted == 0 && !row.detail.is_empty() {
+                    detail_stmt.execute(params![row.tool_use_id, row.detail])?;
+                }
             }
         }
 

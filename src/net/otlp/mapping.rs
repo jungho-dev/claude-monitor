@@ -289,6 +289,7 @@ fn map_tool_result(fields: &EventFields) -> Option<ToolCallRow> {
         duration_ms: read_i64_attr(attrs, "duration_ms"),
         is_error: attrs.get("success").map(String::as_str) == Some("false"),
         error_kind: attrs.get("error_type").cloned().unwrap_or_default(),
+        detail: String::new(),
     })
 }
 

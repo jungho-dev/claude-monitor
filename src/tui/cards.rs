@@ -6,7 +6,7 @@ use crate::tui::state::ActiveTab;
 use ratatui::layout::{Position, Rect};
 use std::time::{Duration, Instant};
 
-pub const CARD_COUNT: usize = CardId::CacheTimer as usize + 1;
+pub const CARD_COUNT: usize = CardId::SkillDetail as usize + 1;
 // 카드 제목을 누른 채 이 시간이 지나면 이동 모드
 pub const CARD_HOLD_TIME: Duration = Duration::from_millis(400);
 
@@ -49,6 +49,9 @@ pub enum CardId {
     // 개요 한도 카드, 모델 탭 캐시 타이머 카드
     LimitsCard,
     CacheTimer,
+    // 스킬 탭 표와 상세
+    SkillTable,
+    SkillDetail,
 }
 
 // 휠·키 동작 구분: 고정, 화면 위치만 이동, 선택 행과 화면 위치 함께 이동
@@ -79,8 +82,8 @@ impl CardId {
             | Self::SettingsAgents
             | Self::SettingsDoctor
             | Self::ReportBody => CardKind::Scrollable,
-            Self::ProjectTable | Self::AttributionTable => CardKind::Selectable,
-            Self::ProjectDetail => CardKind::Scrollable,
+            Self::ProjectTable | Self::AttributionTable | Self::SkillTable => CardKind::Selectable,
+            Self::ProjectDetail | Self::SkillDetail => CardKind::Scrollable,
             _ => CardKind::Static,
         }
     }
@@ -120,6 +123,8 @@ impl CardId {
             Self::ProjectTable => Some((SplitGroup::ProjectsRows, 0)),
             Self::ProjectDetail => Some((SplitGroup::ProjectsRows, 1)),
             Self::AttributionTable => Some((SplitGroup::ProjectsRows, 2)),
+            Self::SkillTable => Some((SplitGroup::SkillsRows, 0)),
+            Self::SkillDetail => Some((SplitGroup::SkillsRows, 1)),
         }
     }
 }
@@ -368,6 +373,8 @@ mod tests {
             CardId::AttributionTable,
             CardId::LimitsCard,
             CardId::CacheTimer,
+            CardId::SkillTable,
+            CardId::SkillDetail,
         ];
         assert_eq!(cards.len(), CARD_COUNT);
         for group in SplitGroup::ALL {

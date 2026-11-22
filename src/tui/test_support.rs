@@ -8,13 +8,13 @@ use crate::core::model::{
     ApiRequestRow, CounterSnapshot, HookEventRow, HookOutcome, LiveEvent, PortStatus,
     StatusSnapshot, ToolCallRow,
 };
-use crate::inventory::{AgentEntry, DoctorFinding, HookEntry, Inventory, McpEntry};
+use crate::inventory::{AgentEntry, DoctorFinding, HookEntry, Inventory, McpEntry, SkillEntry};
 use crate::store::limits::LimitSnapshot;
 use crate::store::metrics::{AttributionDimension, MetricAttributionRow};
 use crate::store::otel_events::CompactionStat;
 use crate::store::query::{
-    AgentStatsRow, CacheBreakRow, HookStatRow, MinuteBucket, ModelStatsRow, OverviewStats,
-    ProjectStatsRow, ToolLatencyRow,
+    AgentRunSummary, AgentStatsRow, CacheBreakRow, HookStatRow, MinuteBucket, ModelStatsRow,
+    OverviewStats, ProjectStatsRow, SkillStatsRow, ToolLatencyRow, UsageShare,
 };
 use crate::store::ratelimit::RatelimitSnapshotRow;
 use crate::tui::i18n::Lang;
@@ -216,6 +216,11 @@ pub fn sample_state_with_tables() -> AppState {
             wait_p90_ms: Some(3_400),
             cost_usd_estimate: 12.345,
             last_ts: "2026-11-15T01:00:00Z".to_string(),
+            first_ts: "2026-11-14T22:00:00Z".to_string(),
+            agents: vec![
+                usage_share("main", 600, 0, 9.1, "2026-11-15T01:00:00Z"),
+                usage_share("worker", 300, 0, 3.245, "2026-11-15T00:40:00Z"),
+            ],
         },
         ModelStatsRow {
             cache_creation_5m_tokens: 0,
@@ -233,6 +238,14 @@ pub fn sample_state_with_tables() -> AppState {
             wait_p90_ms: None,
             cost_usd_estimate: 0.75,
             last_ts: "2026-11-15T01:30:00Z".to_string(),
+            first_ts: "2026-11-14T23:00:00Z".to_string(),
+            agents: vec![usage_share(
+                "worker",
+                1_500,
+                0,
+                0.75,
+                "2026-11-15T01:30:00Z",
+            )],
         },
     ]);
     state.snapshot.agent_stats = Panel::Ready(vec![
@@ -255,6 +268,27 @@ pub fn sample_state_with_tables() -> AppState {
             tool_errors: 4,
             top_model: "claude-sonnet-5-5".to_string(),
             last_ts: "2026-11-15T01:00:00Z".to_string(),
+            first_ts: "2026-11-14T22:00:00Z".to_string(),
+            models: vec![usage_share(
+                "claude-sonnet-5-5",
+                700,
+                0,
+                9.5,
+                "2026-11-15T01:00:00Z",
+            )],
+            top_tools: vec![
+                usage_share("Bash", 300, 4, 0.0, "2026-11-15T01:00:00Z"),
+                usage_share("Read", 200, 0, 0.0, "2026-11-15T00:59:00Z"),
+            ],
+            recent_runs: vec![AgentRunSummary {
+                run: "sess-main-1".to_string(),
+                model: "claude-sonnet-5-5".to_string(),
+                requests: 240,
+                output_tokens: 70_000,
+                cost_usd_estimate: 3.2,
+                first_ts: "2026-11-15T00:10:00Z".to_string(),
+                last_ts: "2026-11-15T01:00:00Z".to_string(),
+            }],
         },
         AgentStatsRow {
             cache_creation_5m_tokens: 0,
@@ -275,6 +309,21 @@ pub fn sample_state_with_tables() -> AppState {
             tool_errors: 0,
             top_model: "claude-haiku-4-5".to_string(),
             last_ts: "2026-11-15T01:30:00Z".to_string(),
+            first_ts: "2026-11-14T23:00:00Z".to_string(),
+            models: vec![
+                usage_share("claude-sonnet-5-5", 200, 0, 2.85, "2026-11-15T00:40:00Z"),
+                usage_share("claude-haiku-4-5", 1_500, 0, 0.75, "2026-11-15T01:30:00Z"),
+            ],
+            top_tools: vec![usage_share("Edit", 380, 0, 0.0, "2026-11-15T01:30:00Z")],
+            recent_runs: vec![AgentRunSummary {
+                run: "worker#a1b2c3d4".to_string(),
+                model: "claude-haiku-4-5".to_string(),
+                requests: 140,
+                output_tokens: 15_000,
+                cost_usd_estimate: 0.3,
+                first_ts: "2026-11-15T01:20:00Z".to_string(),
+                last_ts: "2026-11-15T01:30:00Z".to_string(),
+            }],
         },
     ]);
     state.snapshot.projects = Panel::Ready(vec![
@@ -290,6 +339,25 @@ pub fn sample_state_with_tables() -> AppState {
             cache_creation_1h_tokens: 100_000,
             cost_usd_estimate: 8.4,
             last_ts: "2026-11-15T01:30:00Z".to_string(),
+            first_ts: "2026-11-14T22:00:00Z".to_string(),
+            models: vec![usage_share(
+                "claude-sonnet-5-5",
+                900,
+                0,
+                8.4,
+                "2026-11-15T01:30:00Z",
+            )],
+            agents: vec![
+                usage_share("main", 600, 0, 6.0, "2026-11-15T01:30:00Z"),
+                usage_share("worker", 300, 0, 2.4, "2026-11-15T01:00:00Z"),
+            ],
+            top_sessions: vec![usage_share(
+                "0f9e8d7c-1234-5678-9abc-def012345678",
+                500,
+                0,
+                5.0,
+                "2026-11-15T01:30:00Z",
+            )],
         },
         ProjectStatsRow {
             project: "claude-monitor".to_string(),
@@ -303,6 +371,7 @@ pub fn sample_state_with_tables() -> AppState {
             cache_creation_1h_tokens: 0,
             cost_usd_estimate: 3.1,
             last_ts: "2026-11-15T01:10:00Z".to_string(),
+            ..ProjectStatsRow::default()
         },
         ProjectStatsRow {
             project: "rust-fs-mcp".to_string(),
@@ -316,6 +385,7 @@ pub fn sample_state_with_tables() -> AppState {
             cache_creation_1h_tokens: 0,
             cost_usd_estimate: 0.5,
             last_ts: "2026-11-15T00:50:00Z".to_string(),
+            ..ProjectStatsRow::default()
         },
     ]);
     let attribution_row = |name: &str, cost_usd: f64| MetricAttributionRow {
@@ -347,6 +417,34 @@ pub fn sample_state_with_tables() -> AppState {
             AttributionDimension::Model,
             vec![attribution_row("claude-sonnet-5-5", 3.5)],
         ),
+    ]);
+    state.snapshot.skills = Panel::Ready(vec![
+        SkillStatsRow {
+            skill: "frontend-tui".to_string(),
+            calls: 6,
+            errors: 1,
+            sessions: 2,
+            first_ts: "2026-11-14T22:10:00Z".to_string(),
+            last_ts: "2026-11-15T01:20:00Z".to_string(),
+            agents: vec![
+                usage_share("main", 4, 0, 0.0, "2026-11-15T01:20:00Z"),
+                usage_share("worker", 2, 1, 0.0, "2026-11-15T00:30:00Z"),
+            ],
+            recent: vec![
+                usage_share("main", 1, 0, 0.0, "2026-11-15T01:20:00Z"),
+                usage_share("worker", 1, 1, 0.0, "2026-11-15T00:30:00Z"),
+            ],
+        },
+        SkillStatsRow {
+            skill: "core-response".to_string(),
+            calls: 3,
+            errors: 0,
+            sessions: 3,
+            first_ts: "2026-11-14T23:00:00Z".to_string(),
+            last_ts: "2026-11-15T01:00:00Z".to_string(),
+            agents: vec![usage_share("main", 3, 0, 0.0, "2026-11-15T01:00:00Z")],
+            recent: vec![usage_share("main", 1, 0, 0.0, "2026-11-15T01:00:00Z")],
+        },
     ]);
     state.inventory = Panel::Ready(Inventory {
         hooks: vec![
@@ -395,6 +493,23 @@ pub fn sample_state_with_tables() -> AppState {
                 ..AgentEntry::default()
             },
         ],
+        skills: vec![
+            SkillEntry {
+                name: "frontend-tui".to_string(),
+                description_chars: 180,
+                path: "C:/cm-test-claude/skills/frontend-tui/SKILL.md".to_string(),
+            },
+            SkillEntry {
+                name: "core-response".to_string(),
+                description_chars: 150,
+                path: "C:/cm-test-claude/skills/core-response/SKILL.md".to_string(),
+            },
+            SkillEntry {
+                name: "utils-table".to_string(),
+                description_chars: 210,
+                path: "C:/cm-test-claude/skills/utils-table/SKILL.md".to_string(),
+            },
+        ],
         env_keys: vec!["DEBUG".to_string()],
         ..Inventory::default()
     });
@@ -427,6 +542,18 @@ pub fn sample_state_with_tables() -> AppState {
             .to_string(),
     ));
     state
+}
+
+// 3-1. 분포 항목 한 줄 --------------------------------------------------------
+pub fn usage_share(name: &str, count: u64, errors: u64, cost: f64, last_ts: &str) -> UsageShare {
+    UsageShare {
+        name: name.to_string(),
+        count,
+        errors,
+        output_tokens: count as i64 * 300,
+        cost_usd_estimate: cost,
+        last_ts: last_ts.to_string(),
+    }
 }
 
 // 4. 스크롤바용 긴 목록 -------------------------------------------------------

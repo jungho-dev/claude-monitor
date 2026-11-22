@@ -90,6 +90,9 @@ pub struct ToolCallRow {
     pub duration_ms: Option<i64>,
     pub is_error: bool,
     pub error_kind: String,
+    // 도구 입력에서 뽑은 짧은 식별 값 (Skill 도구는 스킬 이름, 그 밖의 도구는 빈 값)
+    #[serde(default)]
+    pub detail: String,
 }
 
 // 5. 도구 완료 행 -------------------------------------------------------------

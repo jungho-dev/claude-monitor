@@ -285,6 +285,12 @@ fn dispatch_ui_command(
             app.doctor = state::Panel::Pending;
             poller::spawn_settings_load(app.config.clone(), ui_tx.clone());
         }
+        UiCommand::RefreshWithSettings => {
+            let _ = poll_tx.send(PollCommand::RefreshNow);
+            app.inventory = state::Panel::Pending;
+            app.doctor = state::Panel::Pending;
+            poller::spawn_settings_load(app.config.clone(), ui_tx.clone());
+        }
         UiCommand::LoadReport(date) => {
             // 실시간 여부는 UI 가 지금 오늘로 보는 날 기준 (수집 스레드가 시계를 다시 읽지 않음)
             let live = date == app.today;

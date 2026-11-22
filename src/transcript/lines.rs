@@ -7,6 +7,7 @@ use std::fmt;
 
 const TEXT_PREFIX_LIMIT: usize = 400;
 const LABEL_LIMIT: usize = 40;
+const SKILL_LABEL_LIMIT: usize = 80;
 const DENIAL_NAME_MARKERS: [&str; 2] = ["(detected: ", "(감지: "];
 
 // 1. 기록 한 줄 ---------------------------------------------------------------
@@ -54,7 +55,7 @@ pub struct LineCacheCreation {
 }
 
 // 4. 내용 블록 ----------------------------------------------------------------
-// 도구 입력·본문은 필드에서 제외해 건너뜀, 결과 본문은 앞부분만 보관
+// 도구 입력은 스킬 이름만 읽고 나머지는 건너뜀, 결과 본문은 앞부분만 보관
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct LineBlock {
@@ -64,6 +65,89 @@ pub struct LineBlock {
     pub tool_use_id: Option<String>,
     pub is_error: Option<bool>,
     pub content: Option<TextPrefix>,
+    pub input: Option<ToolInputPeek>,
+}
+
+// 4-1. 도구 입력 엿보기 -------------------------------------------------------
+// Skill 도구의 skill 값만 짧은 식별자로 보관 (형식이 다르면 빈 값)
+#[derive(Debug, Default)]
+pub struct ToolInputPeek {
+    pub skill: String,
+}
+
+struct ToolInputVisitor;
+
+impl<'de> Deserialize<'de> for ToolInputPeek {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(ToolInputVisitor)
+    }
+}
+
+impl<'de> Visitor<'de> for ToolInputVisitor {
+    type Value = ToolInputPeek;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("도구 입력 객체")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<ToolInputPeek, A::Error> {
+        let mut peek = ToolInputPeek::default();
+        while let Some(key) = map.next_key::<String>()? {
+            if key == "skill" {
+                peek.skill = skill_label(map.next_value::<serde_json::Value>()?);
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(peek)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<ToolInputPeek, A::Error> {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(ToolInputPeek::default())
+    }
+
+    fn visit_str<E: serde::de::Error>(self, _text: &str) -> Result<ToolInputPeek, E> {
+        Ok(ToolInputPeek::default())
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, _value: bool) -> Result<ToolInputPeek, E> {
+        Ok(ToolInputPeek::default())
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, _value: i64) -> Result<ToolInputPeek, E> {
+        Ok(ToolInputPeek::default())
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, _value: u64) -> Result<ToolInputPeek, E> {
+        Ok(ToolInputPeek::default())
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, _value: f64) -> Result<ToolInputPeek, E> {
+        Ok(ToolInputPeek::default())
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<ToolInputPeek, E> {
+        Ok(ToolInputPeek::default())
+    }
+}
+
+// 스킬 이름 정규화: 앞 슬래시 제거, 식별자 문자와 길이 한도를 벗어나면 버림
+fn skill_label(value: serde_json::Value) -> String {
+    let serde_json::Value::String(text) = value else {
+        return String::new();
+    };
+    let name = text.trim().trim_start_matches('/');
+    let valid = !name.is_empty()
+        && name.len() <= SKILL_LABEL_LIMIT
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':' | '.'));
+    if valid {
+        name.to_string()
+    } else {
+        String::new()
+    }
 }
 
 // 5. 본문 앞부분 --------------------------------------------------------------

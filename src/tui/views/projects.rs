@@ -4,7 +4,7 @@
 use crate::store::metrics::{AttributionDimension, MetricAttributionRow};
 use crate::store::query::ProjectStatsRow;
 use crate::tui::cards::CardId;
-use crate::tui::format::{fit_display, format_clock_time, format_compact, format_count};
+use crate::tui::format::{format_clock_time, format_compact, format_count};
 use crate::tui::i18n::{self, Lang, Msg};
 use crate::tui::layout::{SplitAxis, SplitGroup};
 use crate::tui::sort::{compare_attribution_row, compare_project_row, sort_rows};
@@ -14,17 +14,19 @@ use crate::tui::views::common::{
     CardTable, ColumnFit, ColumnSpec, PanelNote, TableCell, TextCard, panel_message,
     render_card_table, render_db_gate, render_notice_card, render_text_card,
 };
+use crate::tui::views::detail::{
+    ShareBasis, WindowTotals, first_last, pair_line, per_request, share_lines, window_share,
+};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::text::{Line, Span};
 
-// 상세 항목 이름 칸 폭
-const DETAIL_LABEL_WIDTH: usize = 23;
-
-// 상세 카드 줄 수와 높이 (높이 = 줄 수 + 위아래 테두리 2줄)
-const PROJECT_DETAIL_LINES: usize = 5;
+// 상세 카드 항목 줄 수와 기본 높이 (항목 8줄 + 모델 구역 제목과 한 줄 + 테두리 2줄, 나머지 분포는 스크롤)
+const PROJECT_DETAIL_LINES: usize = 8;
 const DETAIL_BORDER_ROWS: u16 = 2;
-const PROJECT_DETAIL_HEIGHT: u16 = PROJECT_DETAIL_LINES as u16 + DETAIL_BORDER_ROWS;
+const PROJECT_DETAIL_HEIGHT: u16 = PROJECT_DETAIL_LINES as u16 + 2 + DETAIL_BORDER_ROWS;
+// 세션별 비용 구역의 세션 id 앞부분 길이
+const SESSION_ID_PREFIX: usize = 8;
 
 // 프로젝트 표 열 (정렬 열 번호와 순서 일치: sort.rs)
 pub const PROJECT_COLUMNS: [ColumnSpec; 11] = [
@@ -97,9 +99,15 @@ pub fn render_projects_tab(frame: &mut Frame, area: Rect, state: &mut AppState) 
         }
         _ => None,
     };
+    let project_totals = projects
+        .as_ref()
+        .map_or(WindowTotals::default(), |sorted| WindowTotals {
+            requests: sorted.iter().map(|row| row.requests).sum(),
+            cost: sorted.iter().map(|row| row.cost_usd_estimate).sum(),
+        });
     match &projects {
         Some(sorted) => {
-            let cost_total: f64 = sorted.iter().map(|row| row.cost_usd_estimate).sum();
+            let cost_total = project_totals.cost;
             let rows: Vec<Vec<TableCell>> = sorted
                 .iter()
                 .map(|row| {
@@ -156,7 +164,8 @@ pub fn render_projects_tab(frame: &mut Frame, area: Rect, state: &mut AppState) 
     // 2. 선택 프로젝트 상세
     let selected = state.card_views[CardId::ProjectTable as usize].selected;
     let selected_project = projects.as_ref().and_then(|sorted| sorted.get(selected));
-    let (detail_title, detail_lines) = build_project_detail(state.lang, selected_project);
+    let (detail_title, detail_lines) =
+        build_project_detail(state.lang, selected_project, project_totals);
     render_text_card(
         frame,
         state,
@@ -251,8 +260,13 @@ pub fn render_projects_tab(frame: &mut Frame, area: Rect, state: &mut AppState) 
 }
 
 // 3. 프로젝트 상세 ------------------------------------------------------------
-// 제목(프로젝트·브랜치)과 항목 줄 (요청·세션, 입출력, 캐시 읽기·생성, 추정 비용, 마지막 요청)
-fn build_project_detail(lang: Lang, row: Option<&ProjectStatsRow>) -> (String, Vec<Line<'static>>) {
+// 제목(프로젝트·브랜치)과 항목 줄 (요청·세션, 입출력, 캐시 읽기·생성, 추정 비용, 요청·세션당 비용, 구간 점유, 처음·마지막 요청)
+// 이어서 모델·에이전트·세션별 비용 구역
+fn build_project_detail(
+    lang: Lang,
+    row: Option<&ProjectStatsRow>,
+    window: WindowTotals,
+) -> (String, Vec<Line<'static>>) {
     let Some(row) = row else {
         return (
             i18n::text(lang, Msg::TitleProjectDetail).to_string(),
@@ -293,19 +307,63 @@ fn build_project_detail(lang: Lang, row: Option<&ProjectStatsRow>) -> (String, V
             i18n::cost_value(lang, row.cost_usd_estimate),
         ),
         (
-            i18n::text(lang, Msg::LastRequest),
-            format_clock_time(&row.last_ts),
+            i18n::text(lang, Msg::DetailPerRequest),
+            per_request(row.cost_usd_estimate, row.output_tokens, row.requests),
+        ),
+        (
+            i18n::text(lang, Msg::DetailPerSession),
+            if row.sessions > 0 {
+                format!(
+                    "{:.1} / ${:.2}",
+                    row.requests as f64 / row.sessions as f64,
+                    row.cost_usd_estimate / row.sessions as f64
+                )
+            } else {
+                "-".to_string()
+            },
+        ),
+        (
+            i18n::text(lang, Msg::DetailWindowShare),
+            window_share(lang, row.requests, row.cost_usd_estimate, window),
+        ),
+        (
+            i18n::text(lang, Msg::DetailFirstLast),
+            first_last(&row.first_ts, &row.last_ts),
         ),
     ];
-    let lines = pairs
+    let mut lines: Vec<Line<'static>> = pairs
         .into_iter()
-        .map(|(name, value)| {
-            Line::from(vec![
-                Span::styled(fit_display(name, DETAIL_LABEL_WIDTH), theme::STYLE_DIM),
-                Span::styled(value, theme::STYLE_TEXT),
-            ])
+        .map(|(name, value)| pair_line(name, value))
+        .collect();
+    lines.extend(share_lines(
+        lang,
+        Msg::SectionModelsByCost,
+        &row.models,
+        ShareBasis::Cost,
+        row.cost_usd_estimate,
+    ));
+    lines.extend(share_lines(
+        lang,
+        Msg::SectionAgentsByCost,
+        &row.agents,
+        ShareBasis::Cost,
+        row.cost_usd_estimate,
+    ));
+    let sessions: Vec<_> = row
+        .top_sessions
+        .iter()
+        .map(|session| crate::store::query::UsageShare {
+            name: session.name.chars().take(SESSION_ID_PREFIX).collect(),
+            ..session.clone()
         })
         .collect();
+    lines.extend(share_lines(
+        lang,
+        Msg::SectionSessionsByCost,
+        &sessions,
+        ShareBasis::Cost,
+        row.cost_usd_estimate,
+    ));
     let mut title = i18n::text(lang, Msg::TitleProjectDetail).to_string();
     for segment in [&row.project, &row.git_branch] {
         if !segment.is_empty() {
@@ -322,6 +380,7 @@ mod tests {
     use crate::tui::sort::{SortKind, SortState, sort_spec};
     use crate::tui::state::{ATTRIBUTION_DIMENSIONS, ActiveTab, UiCommand};
     use crate::tui::test_support::sample_state_with_tables;
+    use crate::tui::views::detail::DETAIL_LABEL_WIDTH;
     use crate::tui::views::render_frame;
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -459,7 +518,7 @@ mod tests {
                 };
                 assert!(text.contains(project_title), "{case}\n{text}");
                 assert!(text.contains(attribution_title), "{case}\n{text}");
-                assert_eq!(state.hit_areas.tab_rects.len(), 8, "{case}");
+                assert_eq!(state.hit_areas.tab_rects.len(), 9, "{case}");
                 // 폭이 모자라면 글자 열이 먼저 줄고 숫자는 유지됨 (100열), 넓으면 이름 전체가 보임 (130열)
                 if width >= 100 {
                     assert!(text.contains("frontend-tui"), "{case}");
@@ -491,7 +550,7 @@ mod tests {
     }
 
     #[test]
-    fn all_eight_tabs_stay_visible_and_clickable_from_60_to_wide_columns() {
+    fn all_nine_tabs_stay_visible_and_clickable_from_60_to_wide_columns() {
         for lang in BOTH {
             for width in 60..=120u16 {
                 let mut state = sample_state_with_tables();
@@ -499,23 +558,46 @@ mod tests {
                 let buffer = draw(&mut state, width, 16);
                 let case = format!("{lang:?} {width}");
                 let rects: Vec<(ActiveTab, Rect)> = state.hit_areas.tab_rects.clone();
-                assert_eq!(rects.len(), 8, "{case}");
+                assert_eq!(rects.len(), 9, "{case}");
                 for pair in rects.windows(2) {
                     assert!(pair[0].1.right() <= pair[1].1.x, "{case}");
                 }
                 assert!(rects.last().unwrap().1.right() <= width, "{case}");
-                if width == 60 {
-                    // 60열: 모든 탭 글자가 잘리지 않고 보임
-                    let tab_row = row_text(&buffer, 1);
+                let tab_row = row_text(&buffer, 1);
+                // 현재 탭 이름은 항상 전부 보임
+                assert!(
+                    tab_row.contains(state.tab.tab_label(lang)),
+                    "{case}: {tab_row}"
+                );
+                // 글자 폭이 들어가면(한국어 60열, 영어 67열 이상) 모든 탭 글자가 잘리지 않고 보임
+                let glued: usize = ActiveTab::ALL
+                    .iter()
+                    .map(|tab| Span::raw(tab.tab_label(lang)).width() + 1)
+                    .sum();
+                if usize::from(width) >= glued {
                     for (tab, _) in &rects {
                         assert!(tab_row.contains(tab.tab_label(lang)), "{case}: {tab_row}");
+                    }
+                } else {
+                    // 모자라면 다른 탭 이름은 말줄임, 번호는 모두 남음
+                    assert!(tab_row.contains('…'), "{case}: {tab_row}");
+                    for digit in 1..=9 {
+                        assert!(tab_row.contains(&digit.to_string()), "{case}: {tab_row}");
                     }
                 }
             }
             let mut state = sample_state_with_tables();
             state.lang = lang;
             draw(&mut state, 60, 16);
-            for (tab, rect) in state.hit_areas.tab_rects.clone() {
+            // 현재 탭이 바뀌면 이름 폭도 바뀌므로 매번 마지막 그림의 영역을 클릭
+            for tab in ActiveTab::ALL {
+                let rect = state
+                    .hit_areas
+                    .tab_rects
+                    .iter()
+                    .find(|(hit_tab, _)| *hit_tab == tab)
+                    .map(|(_, rect)| *rect)
+                    .unwrap_or_else(|| panic!("{lang:?} {tab:?}"));
                 click(&mut state, rect.x + rect.width / 2, rect.y);
                 assert_eq!(state.tab, tab, "{lang:?} {tab:?}");
                 draw(&mut state, 60, 16);
@@ -822,6 +904,7 @@ mod tests {
             cache_creation_1h_tokens: 50_000,
             cost_usd_estimate: 12.345,
             last_ts: "2026-11-15T01:00:00Z".to_string(),
+            ..ProjectStatsRow::default()
         };
         let line_text = |line: &Line<'_>| -> String {
             line.spans
@@ -829,11 +912,29 @@ mod tests {
                 .map(|span| span.content.as_ref())
                 .collect()
         };
+        let window = WindowTotals {
+            requests: 2_400,
+            cost: 12.345,
+        };
         for lang in BOTH {
-            let (title, lines) = build_project_detail(lang, Some(&row));
+            let (title, lines) = build_project_detail(lang, Some(&row), window);
             let text: Vec<String> = lines.iter().map(line_text).collect();
             assert!(title.ends_with("· claude-monitor · main"), "{title}");
             assert_eq!(lines.len(), PROJECT_DETAIL_LINES);
+            // 요청당·세션당 비용과 구간 점유 (요청 절반, 비용 전부)
+            assert!(
+                text.iter().any(|line| line.contains("$0.0103 / 333")),
+                "{text:?}"
+            );
+            assert!(
+                text.iter().any(|line| line.contains("300.0 / $3.09")),
+                "{text:?}"
+            );
+            assert!(
+                text.iter().any(|line| line.contains("50.0% · ")),
+                "{text:?}"
+            );
+            assert!(text.iter().any(|line| line.contains("100.0%")), "{text:?}");
             assert!(
                 text.iter().any(|line| line.contains("1,200 / 4")),
                 "{text:?}"
@@ -857,11 +958,46 @@ mod tests {
             project: "solo".to_string(),
             ..ProjectStatsRow::default()
         };
-        let (title, _) = build_project_detail(Lang::En, Some(&nameless));
+        let (title, _) = build_project_detail(Lang::En, Some(&nameless), window);
         assert_eq!(title, "Project detail · solo");
-        let (empty_title, empty_lines) = build_project_detail(Lang::Ko, None);
+        let (empty_title, empty_lines) = build_project_detail(Lang::Ko, None, window);
         assert_eq!(empty_title, "프로젝트 상세");
         assert_eq!(empty_lines.len(), 1);
+    }
+
+    #[test]
+    fn project_detail_lists_models_agents_and_shortened_sessions_by_cost() {
+        let state = sample_state_with_tables();
+        let Panel::Ready(projects) = &state.snapshot.projects else {
+            panic!("프로젝트 표본");
+        };
+        let (_, lines) =
+            build_project_detail(Lang::En, Some(&projects[0]), WindowTotals::default());
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        for heading in ["Models by cost", "Agents by cost", "Sessions by cost"] {
+            assert!(
+                text.iter().any(|line| line == heading),
+                "{heading}: {text:?}"
+            );
+        }
+        // 세션 id 는 앞 여덟 글자만, 점유율은 프로젝트 비용 기준
+        let session = text
+            .iter()
+            .find(|line| line.starts_with("  0f9e8d7c "))
+            .expect("세션 줄");
+        assert!(session.ends_with("500 req · $5.00 · 60%"), "{session}");
+        assert!(
+            !text.iter().any(|line| line.contains("0f9e8d7c-")),
+            "{text:?}"
+        );
     }
 
     #[test]

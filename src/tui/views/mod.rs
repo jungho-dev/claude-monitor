@@ -2,6 +2,7 @@
 //! 화면 조립: 앱 바, 탭 바, 본문, 하단 버튼·안내, 카드 경계 손잡이, 도움말 겹침.
 
 pub mod common;
+pub mod detail;
 pub mod feed;
 pub mod models;
 pub mod overview;
@@ -10,6 +11,7 @@ pub mod projects;
 mod render_matrix;
 pub mod report;
 pub mod settings;
+pub mod skills;
 pub mod tables;
 
 use crate::tui::cards::{CardKind, UiAction, UiHitAreas};
@@ -75,6 +77,7 @@ pub fn render_frame(frame: &mut Frame, state: &mut AppState) {
         ActiveTab::Settings => settings::render_settings_tab(frame, chunks[2], state),
         ActiveTab::Report => report::render_report_tab(frame, chunks[2], state),
         ActiveTab::Projects => projects::render_projects_tab(frame, chunks[2], state),
+        ActiveTab::Skills => skills::render_skills_tab(frame, chunks[2], state),
     }
     render_footer(frame, chunks[3], state);
 
@@ -160,34 +163,52 @@ fn render_app_bar(frame: &mut Frame, area: Rect, state: &AppState) {
 }
 
 // 3. 탭 바 --------------------------------------------------------------------
-// 탭마다 클릭 영역 등록, 전체 폭을 넘으면 간격 0, 그래도 넘으면 번호 붙임·여백 없는 압축, 마지막은 간격·왼쪽 여백 0
+// 탭마다 클릭 영역 등록, 전체 폭을 넘으면 간격 0, 그래도 넘으면 번호 붙임·여백 없는 압축, 마지막은 현재 탭만 전체 이름
 fn render_tab_bar(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let row_end = area.x.saturating_add(area.width);
     let mut cursor = area.x.saturating_add(1);
 
     // 1. 압축 단계 (0 전체, 1 간격 0, 2 번호 붙임·여백 없음·간격 1)
     let tab_count = ActiveTab::ALL.len();
-    let full_labels: usize = ActiveTab::ALL
-        .iter()
-        .map(|tab| Span::raw(tab.tab_label(state.lang)).width())
-        .sum();
+    let label_width = |tab: ActiveTab| Span::raw(tab.tab_label(state.lang)).width();
+    let full_labels: usize = ActiveTab::ALL.iter().map(|tab| label_width(*tab)).sum();
     let full_width = full_labels + 4 * tab_count + tab_count;
     let compact_width = full_labels + 4 * tab_count + 1;
     // 단계 3 = 번호 붙임·여백 없음·간격 0·왼쪽 여백 0 (번호 붙인 압축으로도 모자랄 때)
     let tight_width = full_labels + 2 * tab_count;
-    let level = if full_width <= area.width as usize {
+    let glued_width = full_labels + tab_count;
+    let available = area.width as usize;
+    let level = if full_width <= available {
         0
-    } else if compact_width <= area.width as usize {
+    } else if compact_width <= available {
         1
-    } else if tight_width <= area.width as usize {
+    } else if tight_width <= available {
         2
-    } else {
+    } else if glued_width <= available {
         3
+    } else {
+        4
     };
-    let gap = u16::from(level != 1 && level != 3);
-    if level == 3 {
+    let gap = u16::from(level == 0 || level == 2);
+    if level >= 3 {
         cursor = area.x;
     }
+    // 단계 4 = 단계 3 에서 다른 탭 이름을 같은 폭 안으로 말줄임 (들어가는 가장 넓은 폭, 현재 탭은 전체 이름)
+    let current_width = label_width(state.tab);
+    let fits = |limit: usize| {
+        let others: usize = ActiveTab::ALL
+            .iter()
+            .filter(|tab| **tab != state.tab)
+            .map(|tab| label_width(*tab).min(limit))
+            .sum();
+        tab_count + current_width + others <= available
+    };
+    let widest = ActiveTab::ALL
+        .iter()
+        .map(|tab| label_width(*tab))
+        .max()
+        .unwrap_or(0);
+    let other_limit = (0..=widest).rev().find(|limit| fits(*limit)).unwrap_or(0);
 
     // 2. 탭 그리기
     let tab_order = state.tab_order;
@@ -209,9 +230,14 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 theme::BG_BASE,
             )
         };
-        let label = tab.tab_label(state.lang);
+        let full_label = tab.tab_label(state.lang);
+        let label = if level == 4 && state.tab != *tab && label_width(*tab) > other_limit {
+            fit_display(full_label, other_limit)
+        } else {
+            full_label.to_string()
+        };
         let line = match level {
-            2 | 3 => Line::from(vec![
+            2..=4 => Line::from(vec![
                 Span::styled(format!("{}", index + 1), key_style),
                 Span::styled(label, name_style),
             ]),
@@ -680,7 +706,7 @@ mod tests {
         assert!(actions.contains(&UiAction::ToggleLanguage));
         assert!(actions.contains(&UiAction::Reindex));
         assert!(actions.contains(&UiAction::Quit));
-        assert_eq!(state.hit_areas.tab_rects.len(), 8);
+        assert_eq!(state.hit_areas.tab_rects.len(), 9);
     }
 
     #[test]
@@ -1251,11 +1277,12 @@ mod tests {
     }
 
     #[test]
-    fn all_eight_tabs_visible_and_clickable_at_minimum_width() {
+    fn all_nine_tabs_visible_and_clickable_at_minimum_width() {
         let mut state = sample_state_with_snapshot();
         // 탭 바는 둘째 줄
         let tab_row = render_to_text(&mut state, MIN_WIDTH, MIN_HEIGHT)[1].clone();
-        assert_eq!(state.hit_areas.tab_rects.len(), 8);
+        assert_eq!(state.hit_areas.tab_rects.len(), 9);
+        assert!(tab_row.contains("9스킬"));
         assert!(tab_row.contains("7리포트"));
         assert!(tab_row.contains("6설정"));
         assert!(tab_row.contains("5에이전트"));
@@ -1275,7 +1302,7 @@ mod tests {
                 .iter()
                 .map(|(_, rect)| *rect)
                 .collect();
-            assert_eq!(rects.len(), 8, "{width}");
+            assert_eq!(rects.len(), 9, "{width}");
             for pair in rects.windows(2) {
                 assert!(pair[0].right() <= pair[1].x, "{width}");
             }
@@ -1294,26 +1321,27 @@ mod tests {
     fn wide_terminal_keeps_full_labels() {
         let mut state = sample_state_with_snapshot();
         let tab_row = render_to_text(&mut state, 100, 24)[1].clone();
-        assert_eq!(state.hit_areas.tab_rects.len(), 8);
+        assert_eq!(state.hit_areas.tab_rects.len(), 9);
         assert!(tab_row.contains("5 에이전트"));
         assert!(tab_row.contains("6 설정"));
         assert!(tab_row.contains("7 리포트"));
 
-        // 정확히 전체 라벨이 들어가는 폭(80열)에서는 압축 없음 (탭 사이 간격 1)
-        let tab_row = render_to_text(&mut state, 80, 24)[1].clone();
-        assert!(tab_row.contains("7 리포트"));
-        assert_eq!(state.hit_areas.tab_rects.len(), 8);
+        // 정확히 전체 라벨이 들어가는 폭(89열)에서는 압축 없음 (탭 사이 간격 1)
+        let tab_row = render_to_text(&mut state, 89, 24)[1].clone();
+        assert!(tab_row.contains("9 스킬"));
+        assert_eq!(state.hit_areas.tab_rects.len(), 9);
         let rects = &state.hit_areas.tab_rects;
         assert_eq!(rects[1].1.x, rects[0].1.right() + 1);
         // 한 칸 좁으면 간격 0, 더 좁으면 번호 붙임 압축
-        let tab_row = render_to_text(&mut state, 79, 24)[1].clone();
-        assert!(tab_row.contains("7 리포트"));
-        assert_eq!(state.hit_areas.tab_rects.len(), 8);
+        let tab_row = render_to_text(&mut state, 88, 24)[1].clone();
+        assert!(tab_row.contains("9 스킬"));
+        assert_eq!(state.hit_areas.tab_rects.len(), 9);
         let rects = &state.hit_areas.tab_rects;
         assert_eq!(rects[1].1.x, rects[0].1.right());
         let tab_row = render_to_text(&mut state, 60, 24)[1].clone();
         assert!(tab_row.contains("7리포트"));
-        assert_eq!(state.hit_areas.tab_rects.len(), 8);
+        assert!(tab_row.contains("9스킬"));
+        assert_eq!(state.hit_areas.tab_rects.len(), 9);
     }
 
     #[test]
@@ -1943,7 +1971,7 @@ mod tests {
                     let case = format!("{lang:?} {tab:?} {width}x{height}: {footer}");
                     assert!(footer.contains(help), "{case}");
                     assert!(footer.contains(quit), "{case}");
-                    assert_eq!(state.hit_areas.tab_rects.len(), 8, "{case}");
+                    assert_eq!(state.hit_areas.tab_rects.len(), 9, "{case}");
                     let kinds: Vec<UiAction> = state
                         .hit_areas
                         .button_rects
@@ -2075,7 +2103,7 @@ mod tests {
         for expected in [
             "Keyboard",
             "Mouse",
-            "1-8, Tab, Shift-Tab",
+            "1-9, Tab, Shift-Tab",
             "Switch language (EN / KO)",
             "Shift+Arrows",
             "q, Esc, Ctrl+C",

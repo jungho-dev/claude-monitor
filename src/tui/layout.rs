@@ -8,7 +8,7 @@ use ratatui::layout::Rect;
 pub const MAX_CUTS: usize = 5;
 pub const MAX_SLOTS: usize = MAX_CUTS + 1;
 const RATIO_SCALE: u32 = 10_000;
-pub const GROUP_COUNT: usize = SplitGroup::ProjectsRows as usize + 1;
+pub const GROUP_COUNT: usize = SplitGroup::SkillsRows as usize + 1;
 // 순서를 바꾸지 않은 칸 배치 (칸 번호 = 카드 번호)
 pub const IDENTITY_ORDER: [u8; MAX_SLOTS] = [0, 1, 2, 3, 4, 5];
 
@@ -29,6 +29,7 @@ pub enum SplitGroup {
     SettingsRows,
     ReportCols,
     ProjectsRows,
+    SkillsRows,
 }
 
 impl SplitGroup {
@@ -45,6 +46,7 @@ impl SplitGroup {
         Self::SettingsRows,
         Self::ReportCols,
         Self::ProjectsRows,
+        Self::SkillsRows,
     ];
 
     // 배치 파일에서 그룹을 가리키는 고정 이름 (열거형 번호는 쓰지 않음)
@@ -62,6 +64,7 @@ impl SplitGroup {
             Self::SettingsRows => "settings_rows",
             Self::ReportCols => "report_cols",
             Self::ProjectsRows => "projects_rows",
+            Self::SkillsRows => "skills_rows",
         }
     }
 
@@ -78,7 +81,8 @@ impl SplitGroup {
             | Self::ToolsRows
             | Self::HooksRows
             | Self::AgentsRows
-            | Self::ReportCols => 2,
+            | Self::ReportCols
+            | Self::SkillsRows => 2,
             Self::ProjectsRows => 3,
         }
     }
@@ -731,7 +735,7 @@ mod tests {
             .iter()
             .filter(|group| group.is_reorderable())
             .count();
-        assert_eq!(reorderable, 10);
+        assert_eq!(reorderable, 11);
         assert_eq!(SplitGroup::ReportCols.axis(), SplitAxis::Columns);
         assert_eq!(SplitGroup::OverviewKpiCols.axis(), SplitAxis::Columns);
         assert_eq!(SplitGroup::SettingsRows.axis(), SplitAxis::Rows);

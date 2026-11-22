@@ -300,6 +300,15 @@ fn apply_line(state: &mut ScanState, context: &LineContext, line: TranscriptLine
             duration_ms: None,
             is_error: false,
             error_kind: String::new(),
+            detail: if tool_name == "Skill" {
+                block
+                    .input
+                    .as_ref()
+                    .map(|input| input.skill.clone())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            },
         });
     }
 

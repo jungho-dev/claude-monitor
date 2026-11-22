@@ -396,7 +396,7 @@ mod tests {
         );
         assert_eq!(state.tab_order, ActiveTab::ALL);
 
-        state.switch_tab(ActiveTab::Projects);
+        state.switch_tab(ActiveTab::Skills);
         assert_eq!(press_key(&mut state, KeyCode::Char('>')), UiCommand::None);
         assert_eq!(state.tab_order, ActiveTab::ALL);
     }

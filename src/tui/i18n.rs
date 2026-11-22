@@ -401,6 +401,51 @@ define_messages! {
     AttributionDimensionHint => ("Press d to change dimension", "d 키로 차원 변경"),
     HintDimension => ("d Dimension", "d 차원"),
     HelpDimension => ("Cycle attribution dimension (Projects tab)", "귀속 차원 전환 (프로젝트 탭)"),
+
+    // 스킬 탭
+    TabSkills => ("Skills", "스킬"),
+    ColSkill => ("Skill", "스킬"),
+    ColInstalled => ("Inst", "설치"),
+    ColTopCaller => ("Caller", "주 호출"),
+    ColDescChars => ("Desc", "설명"),
+    TitleSkillsPending => ("Skills", "스킬"),
+    TitleSkillDetail => ("Skill detail", "스킬 상세"),
+    NoSkillSelected => ("No skill selected", "선택한 스킬 없음"),
+    HintSkillSource => ("Skill tool calls", "Skill 도구 호출 기준"),
+    SkillsEmpty => ("No skills installed or called", "설치·호출된 스킬 없음"),
+    SkillsEmptyHint => ("Add skills under ~/.claude/skills or call one", "~/.claude/skills 에 추가하거나 호출하면 표시"),
+    SkillUnnamed => ("(name not recorded)", "(이름 미기록)"),
+    SkillCalls => ("Calls / errors / sess", "호출 / 오류 / 세션"),
+    SkillShare => ("Share of skill calls", "스킬 호출 점유"),
+    SkillFirstLast => ("First / last call", "처음 / 마지막 호출"),
+    SkillInstalled => ("Installed at", "설치 위치"),
+    SkillNotInstalled => ("not in ~/.claude/skills (call record only)", "~/.claude/skills 에 없음 (호출 기록만)"),
+    SkillInventoryPending => ("reading skill files…", "스킬 파일 읽는 중…"),
+    SkillDescription => ("Description length", "설명 길이"),
+    SkillCostOtel => ("Cost (OTel)", "비용 (OTel)"),
+    SkillNoOtel => ("no OTel metric for this skill", "이 스킬의 OTel 지표 없음"),
+    SkillNeverCalled => ("not called in this window", "이 구간에 호출 없음"),
+    SkillCallError => ("error", "오류"),
+
+    // 모델·에이전트·프로젝트 상세 보강 (항목 이름 22칸 이내)
+    DetailPerRequest => ("Cost / out per req", "요청당 비용 / 출력"),
+    DetailWindowShare => ("Share of window", "구간 점유"),
+    DetailCacheSplit => ("Cache wr 5m / 1h", "캐시생성 5m / 1h"),
+    DetailFirstSeen => ("First seen", "처음 기록"),
+    DetailFirstLast => ("First / last request", "처음 / 마지막 요청"),
+    DetailPerRun => ("Reqs / cost per run", "실행당 요청 / 비용"),
+    DetailPerSession => ("Reqs / cost per sess", "세션당 요청 / 비용"),
+    DetailConfigured => ("Configured", "설정값"),
+    DetailConfigMain => ("main session (no agent file)", "메인 세션 (정의 파일 없음)"),
+    DetailConfigMissing => ("no file in ~/.claude/agents", "~/.claude/agents 에 정의 없음"),
+    DetailConfigPending => ("reading agent files…", "에이전트 정의 읽는 중…"),
+    SectionAgentsByCost => ("Agents by cost", "에이전트별 비용"),
+    SectionModelsByCost => ("Models by cost", "모델별 비용"),
+    SectionToolsByCalls => ("Tools by calls", "도구별 호출"),
+    SectionSessionsByCost => ("Sessions by cost", "세션별 비용"),
+    SectionRecentRuns => ("Recent runs", "최근 실행"),
+    SectionCallers => ("Callers", "호출 에이전트"),
+    SectionRecentCalls => ("Recent calls", "최근 호출"),
     // 피드: OTLP 신규 이벤트 태그(4칸 이하)·상세 제목·항목·낱말
     TagSubagent => ("Sub ", "서브"),
     TagCompaction => ("Comp", "압축"),
@@ -897,13 +942,89 @@ pub fn attribution_title(lang: Lang, dimension: &str, count: usize) -> String {
     }
 }
 
+// 스킬 탭·상세 카드 보강 문구 (이름·모델·시각은 데이터라 번역하지 않음)
+pub fn skill_table_title(lang: Lang, installed: Option<usize>, used: usize, calls: u64) -> String {
+    match (lang, installed) {
+        (Lang::En, Some(installed)) => {
+            format!("Skills · {installed} installed · {used} used · {calls} calls")
+        }
+        (Lang::En, None) => format!("Skills · {used} used · {calls} calls"),
+        (Lang::Ko, Some(installed)) => {
+            format!("스킬 · 설치 {installed}개 · 사용 {used}개 · 호출 {calls}회")
+        }
+        (Lang::Ko, None) => format!("스킬 · 사용 {used}개 · 호출 {calls}회"),
+    }
+}
+
+pub fn skill_calls_value(
+    lang: Lang,
+    calls: &str,
+    errors: &str,
+    sessions: &str,
+    rate: f64,
+) -> String {
+    match lang {
+        Lang::En => format!("{calls} / {errors} / {sessions}  (error {rate:.1}%)"),
+        Lang::Ko => format!("{calls} / {errors} / {sessions}  (오류율 {rate:.1}%)"),
+    }
+}
+
+pub fn chars_value(lang: Lang, chars: &str) -> String {
+    match lang {
+        Lang::En => format!("{chars} chars"),
+        Lang::Ko => format!("{chars}자"),
+    }
+}
+
+pub fn otel_cost_value(lang: Lang, cost: f64, input: &str, output: &str) -> String {
+    match lang {
+        Lang::En => format!("${cost:.2}  (in {input} / out {output})"),
+        Lang::Ko => format!("${cost:.2}  (입력 {input} / 출력 {output})"),
+    }
+}
+
+pub fn window_share_value(lang: Lang, requests: f64, cost: f64) -> String {
+    match lang {
+        Lang::En => format!("req {requests:.1}% · cost {cost:.1}%"),
+        Lang::Ko => format!("요청 {requests:.1}% · 비용 {cost:.1}%"),
+    }
+}
+
+pub fn agent_config_value(lang: Lang, model: &str, effort: &str, turns: &str) -> String {
+    match lang {
+        Lang::En => format!("model {model} · effort {effort} · turns {turns}"),
+        Lang::Ko => format!("모델 {model} · effort {effort} · 최대턴 {turns}"),
+    }
+}
+
+pub fn share_cost_value(lang: Lang, count: &str, cost: f64, share: f64) -> String {
+    match lang {
+        Lang::En => format!("{count} req · ${cost:.2} · {share:.0}%"),
+        Lang::Ko => format!("요청 {count} · ${cost:.2} · {share:.0}%"),
+    }
+}
+
+pub fn share_calls_value(lang: Lang, count: &str, errors: &str, share: f64) -> String {
+    match lang {
+        Lang::En => format!("{count} calls · {errors} err · {share:.0}%"),
+        Lang::Ko => format!("호출 {count} · 오류 {errors} · {share:.0}%"),
+    }
+}
+
+pub fn run_value(lang: Lang, model: &str, requests: &str, cost: f64, span: &str) -> String {
+    match lang {
+        Lang::En => format!("{model} · {requests} req · ${cost:.2} · {span}"),
+        Lang::Ko => format!("{model} · 요청 {requests} · ${cost:.2} · {span}"),
+    }
+}
+
 // 7. 도움말 줄 ----------------------------------------------------------------
 // (키, 뜻) 쌍, 뜻이 빈 줄은 구역 제목, 키 글자는 번역하지 않음
 pub fn help_rows(lang: Lang) -> Vec<(&'static str, &'static str)> {
     let words = |msg: Msg| text(lang, msg);
     vec![
         (words(Msg::HelpSectionKeyboard), ""),
-        ("1-8, Tab, Shift-Tab", words(Msg::HelpSwitchTab)),
+        ("1-9, Tab, Shift-Tab", words(Msg::HelpSwitchTab)),
         ("<  >", words(Msg::HelpMoveTab)),
         ("↑ ↓ PgUp PgDn Home End", words(Msg::HelpMoveRows)),
         ("w", words(Msg::HelpWindow)),
@@ -1150,7 +1271,7 @@ mod tests {
                 "{lang:?}"
             );
             assert!(
-                rows.iter().any(|(keys, _)| *keys == "1-8, Tab, Shift-Tab"),
+                rows.iter().any(|(keys, _)| *keys == "1-9, Tab, Shift-Tab"),
                 "{lang:?}"
             );
         }
@@ -1194,6 +1315,20 @@ mod tests {
             Msg::AgentCounts,
             Msg::AgentToolCalls,
             Msg::AgentTopLast,
+            Msg::DetailPerRequest,
+            Msg::DetailWindowShare,
+            Msg::DetailCacheSplit,
+            Msg::DetailFirstSeen,
+            Msg::DetailFirstLast,
+            Msg::DetailPerRun,
+            Msg::DetailPerSession,
+            Msg::DetailConfigured,
+            Msg::SkillCalls,
+            Msg::SkillShare,
+            Msg::SkillFirstLast,
+            Msg::SkillInstalled,
+            Msg::SkillDescription,
+            Msg::SkillCostOtel,
         ];
         let mid_labels = [
             Msg::ToolCallsErrors,

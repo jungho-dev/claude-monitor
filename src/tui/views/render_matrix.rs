@@ -204,11 +204,22 @@ fn every_tab_renders_in_both_languages_at_the_size_matrix_with_consistent_chrome
 
                 // 1. 앱 바 배지와 탭 바 (탭마다 적중 영역이 그 탭 글자를 덮음)
                 assert!(row_text(&buffer, 0).contains("claude-monitor"), "{case}");
-                assert_eq!(state.hit_areas.tab_rects.len(), 8, "{case}");
+                assert_eq!(state.hit_areas.tab_rects.len(), 9, "{case}");
                 for (hit_tab, rect) in &state.hit_areas.tab_rects {
                     let text = rect_text(&buffer, rect.y, rect.x, rect.right());
                     assert_eq!(rect.y, 1, "{case}");
-                    assert!(text.contains(hit_tab.tab_label(lang)), "{case}: {text}");
+                    // 현재 탭은 전체 이름, 좁은 폭의 다른 탭은 같은 이름의 앞부분 + 말줄임
+                    let label = hit_tab.tab_label(lang);
+                    let shown = text
+                        .trim()
+                        .trim_start_matches(|ch: char| ch.is_ascii_digit())
+                        .trim();
+                    match shown.strip_suffix('…') {
+                        Some(prefix) if *hit_tab != state.tab => {
+                            assert!(label.starts_with(prefix), "{case}: {text}");
+                        }
+                        _ => assert!(text.contains(label), "{case}: {text}"),
+                    }
                 }
 
                 // 2. 하단 칩: 도움말·종료·언어 칩은 모든 크기에 있고, 칩끼리 겹치지 않으며 글자가 [키] 로 시작

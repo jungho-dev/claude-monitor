@@ -11,7 +11,7 @@ use crate::store::metrics::{AttributionDimension, MetricAttributionRow};
 use crate::store::otel_events::CompactionStat;
 use crate::store::query::{
     AgentStatsRow, CacheBreakRow, HookStatRow, ModelStatsRow, OverviewStats, ProjectStatsRow,
-    ToolLatencyRow,
+    SkillStatsRow, ToolLatencyRow,
 };
 use crate::tui::format::fit_display;
 use crate::tui::i18n::Failure;
@@ -136,6 +136,7 @@ struct HeavyPanels {
     agent_stats: Panel<Vec<AgentStatsRow>>,
     cache_breaks: Panel<Vec<CacheBreakRow>>,
     projects: Panel<Vec<ProjectStatsRow>>,
+    skills: Panel<Vec<SkillStatsRow>>,
     attribution: Panel<Vec<(AttributionDimension, Vec<MetricAttributionRow>)>>,
     limit_extras: LimitExtras,
 }
@@ -279,6 +280,7 @@ fn collect_snapshot(
         heavy.cache_breaks =
             guard_panel(|| open_store.query_cache_breaks(&since, &until, CACHE_BREAK_LIMIT));
         heavy.projects = guard_panel(|| open_store.query_project_stats(&since, &until));
+        heavy.skills = guard_panel(|| open_store.query_skill_stats(&since, &until));
         // 지표 테이블이 없는 이전 DB 는 지표 없음(빈 목록)으로 취급
         heavy.attribution = guard_panel(|| {
             let mut by_dimension = Vec::with_capacity(ATTRIBUTION_DIMENSIONS.len());
@@ -299,6 +301,7 @@ fn collect_snapshot(
     snapshot.agent_stats = heavy.agent_stats.clone();
     snapshot.cache_breaks = heavy.cache_breaks.clone();
     snapshot.projects = heavy.projects.clone();
+    snapshot.skills = heavy.skills.clone();
     snapshot.attribution = heavy.attribution.clone();
 
     // 5-1. 한도 카드 입력 (공식 스냅샷·소진 예상용 기록·API 키 헤더는 매번, 컴팩션·로컬 추정은 무거운 주기만)
