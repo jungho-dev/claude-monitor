@@ -268,7 +268,7 @@ async fn respond_aggregate(
             StatusCode::NOT_FOUND,
             &serde_json::json!({"error": "not found"}),
         ),
-        Err(failure) => failure,
+        Err(failure) => *failure,
     }
 }
 
@@ -329,7 +329,7 @@ async fn respond_report_read(
             StatusCode::NOT_FOUND,
             &serde_json::json!({"error": "리포트 없음"}),
         ),
-        Err(failure) => failure,
+        Err(failure) => *failure,
     }
 }
 
@@ -365,7 +365,7 @@ async fn respond_report_write(
             StatusCode::OK,
             &serde_json::json!({"path": path.display().to_string()}),
         ),
-        Err(failure) => failure,
+        Err(failure) => *failure,
     }
 }
 
@@ -375,7 +375,7 @@ async fn respond_reindex(ctx: Arc<AppContext>) -> Response<ResponseBody> {
         run_blocking_job(move || transcript::index_transcripts_once(&ctx.config, &ctx.store)).await;
     match indexed {
         Ok(summary) => json_response(StatusCode::OK, &summary),
-        Err(failure) => failure,
+        Err(failure) => *failure,
     }
 }
 
@@ -397,19 +397,19 @@ fn find_query_param(query: Option<&str>, key: &str) -> Option<String> {
 }
 
 // 10. 블로킹 작업 실행 --------------------------------------------------------
-// 오류·panic 은 500 응답으로 반환
+// 오류·panic 은 500 응답으로 반환 (응답 값이 커서 오류 쪽은 Box, clippy::result_large_err)
 async fn run_blocking_job<T: Send + 'static>(
     work: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
-) -> Result<T, Response<ResponseBody>> {
+) -> Result<T, Box<Response<ResponseBody>>> {
     match tokio::task::spawn_blocking(work).await {
         Ok(Ok(output)) => Ok(output),
-        Ok(Err(err)) => Err(json_response(
+        Ok(Err(err)) => Err(Box::new(json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &serde_json::json!({"error": format!("{err:#}")}),
-        )),
-        Err(_) => Err(json_response(
+        ))),
+        Err(_) => Err(Box::new(json_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &serde_json::json!({"error": "내부 오류 (작업 중단)"}),
-        )),
+        ))),
     }
 }

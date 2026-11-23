@@ -17,6 +17,8 @@ const REMOVE_ATTEMPTS: u32 = 20;
 const REMOVE_RETRY_MS: u64 = 50;
 const DEFERRED_REMOVE_ATTEMPTS: u32 = 300;
 const DEFERRED_RETRY_MS: u64 = 100;
+// 고정 기록 복사본의 백필 기간 (일, 파일 수정 시각과 무관하게 색인)
+const FIXTURE_BACKFILL_DAYS: u32 = 36_500;
 
 // 1. 시험 작업 공간 -----------------------------------------------------------
 // _cleanup 은 마지막 필드: store 가 닫힌 뒤 폴더 삭제
@@ -74,8 +76,10 @@ pub fn prepare_fixture_workspace(label: &str) -> TestWorkspace {
         ports: PortConfig::default(),
         gateway: GatewayConfig::default(),
         hooks: HookConfig::default(),
+        // 복사본은 원본 수정 시각을 이어받을 수 있어(Windows) 백필 기간 컷오프에 걸리지 않게 넓힘
         indexer: IndexerConfig {
             projects_dir: Some(projects_dir.clone()),
+            backfill_days: FIXTURE_BACKFILL_DAYS,
             ..IndexerConfig::default()
         },
         report: ReportConfig::default(),

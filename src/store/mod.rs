@@ -8,7 +8,7 @@ pub mod power;
 pub mod query;
 pub mod ratelimit;
 
-use crate::core::model::{IngestBatch, IngestCounts};
+use crate::core::model::{DataSource, IngestBatch, IngestCounts};
 use anyhow::Context;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use std::fs;
@@ -104,6 +104,9 @@ const API_REQUEST_ADDED_COLUMNS: [(&str, &str); 4] = [
 // 기존 DB 에 덧붙이는 tool_calls 열 (Skill 도구의 스킬 이름)
 const TOOL_CALL_ADDED_COLUMNS: [(&str, &str); 1] = [("detail", "TEXT NOT NULL DEFAULT ''")];
 
+// OTLP 선점 도구 호출 행을 기록 출처로 승격하는 재색인을 마친 스키마 판 (PRAGMA user_version)
+const TOOL_CALL_PROMOTE_VERSION: i64 = 1;
+
 // 1. 색인 커서 ----------------------------------------------------------------
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IndexCursor {
@@ -167,6 +170,20 @@ impl Store {
                 .with_context(|| format!("열 추가 실패: {table}.{name}"))?;
                 added = true;
             }
+        }
+
+        // OTLP 가 먼저 넣은 도구 호출 행이 있던 DB 는 한 번 재색인해 기록 출처로 승격
+        let version: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version < TOOL_CALL_PROMOTE_VERSION {
+            let has_otlp_first: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM tool_calls WHERE source <> 'transcript')",
+                [],
+                |row| row.get(0),
+            )?;
+            added |= has_otlp_first;
+            tx.execute_batch(&format!(
+                "PRAGMA user_version = {TOOL_CALL_PROMOTE_VERSION}"
+            ))?;
         }
         if added {
             // 동시에 도는 이전 바이너리가 빈 커서를 소비해 새 열 없이 다시 색인할 수 있으므로
@@ -282,6 +299,8 @@ impl Store {
         }
 
         // 2. 도구 호출 시작 (신규만 집계, 백필 재읽기는 비어 있던 스킬 이름만 채움)
+        // 같은 tool_use_id 를 OTLP 가 먼저 넣었으면 기록 행이 출처·에이전트를 넘겨받음
+        // (통계 조회는 transcript 출처만 읽으므로 승격하지 않으면 해당 호출이 빠짐)
         {
             let mut stmt = tx.prepare_cached(
                 "INSERT OR IGNORE INTO tool_calls (source, tool_use_id, ts, session_id, agent, tool_name, \
@@ -289,6 +308,11 @@ impl Store {
             )?;
             let mut detail_stmt = tx.prepare_cached(
                 "UPDATE tool_calls SET detail = ?2 WHERE tool_use_id = ?1 AND detail = ''",
+            )?;
+            let mut promote_stmt = tx.prepare_cached(
+                "UPDATE tool_calls SET source = ?2, agent = ?3, \
+                 session_id = CASE WHEN session_id = '' THEN ?4 ELSE session_id END \
+                 WHERE tool_use_id = ?1 AND source <> ?2",
             )?;
             for row in &batch.tool_calls {
                 let inserted = stmt.execute(params![
@@ -306,6 +330,14 @@ impl Store {
                 counts.tool_calls += inserted;
                 if inserted == 0 && !row.detail.is_empty() {
                     detail_stmt.execute(params![row.tool_use_id, row.detail])?;
+                }
+                if inserted == 0 && row.source == DataSource::Transcript {
+                    promote_stmt.execute(params![
+                        row.tool_use_id,
+                        row.source.as_str(),
+                        row.agent,
+                        row.session_id,
+                    ])?;
                 }
             }
         }
@@ -477,7 +509,9 @@ impl Store {
 mod tests {
     use super::query::{CACHE_BREAK_PREVIOUS_SQL, DENY_SOURCE_SQL};
     use super::{IndexCursor, Store};
-    use crate::core::model::{ApiRequestRow, DataSource, HookEventRow, HookOutcome, IngestBatch};
+    use crate::core::model::{
+        ApiRequestRow, DataSource, HookEventRow, HookOutcome, IngestBatch, ToolCallRow,
+    };
     use crate::transcript::test_support::unique_temp_dir;
     use rusqlite::{Connection, params};
     use std::sync::Arc;
@@ -1023,6 +1057,79 @@ mod tests {
             })
             .expect("저장값 조회");
         assert_eq!(stored, (700, 300, "main".to_string(), "demo".to_string()));
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+    // 12. OTLP 선점 도구 호출 행 승격 -----------------------------------------
+    #[test]
+    fn transcript_tool_call_promotes_otlp_first_row_and_reopen_plants_backfill() {
+        // 1. OTLP 가 먼저 적재 (에이전트 빈 값, 스킬 이름 있음)
+        let dir = unique_temp_dir("store-tool-promote");
+        let db_path = dir.join("promote.db");
+        let store = Store::open_store(&db_path).expect("저장소 열기");
+        let otlp_row = ToolCallRow {
+            source: DataSource::Otlp,
+            tool_use_id: "toolu_A".to_string(),
+            ts: "2026-11-22T01:00:00.000Z".to_string(),
+            session_id: "sess-a".to_string(),
+            tool_name: "Skill".to_string(),
+            duration_ms: Some(6),
+            detail: "core-git".to_string(),
+            ..ToolCallRow::default()
+        };
+        store
+            .insert_batch(&IngestBatch {
+                tool_calls: vec![otlp_row.clone()],
+                ..IngestBatch::default()
+            })
+            .expect("OTLP 적재");
+
+        // 2. 재열기: 승격 판 이전이면 표식을 한 번 심음 (판 기록 후 재열기는 심지 않음)
+        drop(store);
+        let store = Store::open_store(&db_path).expect("판 갱신 열기");
+        assert!(!store.consume_index_backfill().expect("새 DB 는 판만 기록"));
+        store
+            .with_conn(|conn| conn.execute_batch("PRAGMA user_version = 0"))
+            .expect("이전 판 흉내");
+        drop(store);
+        let store = Store::open_store(&db_path).expect("이전 판 열기");
+        assert!(store.consume_index_backfill().expect("표식 소비"));
+        drop(store);
+        let store = Store::open_store(&db_path).expect("재열기");
+        assert!(!store.consume_index_backfill().expect("두 번째 소비"));
+
+        // 3. 같은 id 의 기록 행: 신규 0건, 출처·에이전트 승격, OTLP 값 유지
+        let counts = store
+            .insert_batch(&IngestBatch {
+                tool_calls: vec![ToolCallRow {
+                    source: DataSource::Transcript,
+                    agent: "main".to_string(),
+                    duration_ms: None,
+                    detail: "other".to_string(),
+                    ..otlp_row
+                }],
+                ..IngestBatch::default()
+            })
+            .expect("기록 적재");
+        assert_eq!(counts.tool_calls, 0);
+        let stored: (String, String, String, Option<i64>) = store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT source, agent, detail, duration_ms FROM tool_calls                      WHERE tool_use_id = 'toolu_A'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+            })
+            .expect("저장값 조회");
+        assert_eq!(
+            stored,
+            (
+                "transcript".to_string(),
+                "main".to_string(),
+                "core-git".to_string(),
+                Some(6)
+            )
+        );
         drop(store);
         std::fs::remove_dir_all(&dir).ok();
     }
