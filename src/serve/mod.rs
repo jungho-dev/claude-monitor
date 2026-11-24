@@ -16,9 +16,9 @@ use std::fs;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::runtime::Builder;
 use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinSet;
@@ -38,6 +38,22 @@ const READY_POLL_SLEEP: Duration = Duration::from_millis(50);
 
 // 이 프로세스가 실제로 바인드한 서버 이름 (상태 응답의 수신 여부 근거)
 pub(crate) static BOUND_LISTENER_NAMES: OnceLock<Vec<&'static str>> = OnceLock::new();
+
+// 이 프로세스 실행 파일의 빌드 식별자 "크기-수정시각ms" (serve·TUI 빌드 일치 판정)
+// 실행 중 파일이 새 빌드로 바뀌어도 기동 당시 값을 유지하도록 main 첫 줄에서 강제 초기화,
+// 메타데이터를 못 읽으면 빈 값이고 비교 쪽은 빈 값이면 판정을 생략
+pub static BUILD_ID: LazyLock<String> = LazyLock::new(|| {
+    let Ok(metadata) = std::env::current_exe().and_then(fs::metadata) else {
+        return String::new();
+    };
+    let Ok(modified) = metadata.modified() else {
+        return String::new();
+    };
+    let Ok(elapsed) = modified.duration_since(UNIX_EPOCH) else {
+        return String::new();
+    };
+    format!("{}-{}", metadata.len(), elapsed.as_millis())
+});
 
 // 1. 선점 리스너 --------------------------------------------------------------
 #[derive(Debug)]
@@ -280,9 +296,21 @@ pub fn ensure_background_serve(
     config: &AppConfig,
     config_path: Option<&Path>,
 ) -> anyhow::Result<bool> {
-    // 1. 이미 상주 중
+    // 1. 이미 상주 중 (다른 빌드면 재시작 안내, 상태 조회 실패는 판정할 수 없어 안내 생략)
     let admin_addr = SocketAddr::from(([127, 0, 0, 1], config.ports.admin));
-    if TcpStream::connect_timeout(&admin_addr, ADMIN_PROBE_TIMEOUT).is_ok() {
+    let running = TcpStream::connect_timeout(&admin_addr, ADMIN_PROBE_TIMEOUT).is_ok();
+    let stale_pid = match running.then(|| net::admin::fetch_status_blocking(config.ports.admin)) {
+        Some(Ok(status)) if !BUILD_ID.is_empty() && status.build_id != *BUILD_ID => {
+            Some(status.pid)
+        }
+        _ => None,
+    };
+    if let Some(pid) = stale_pid {
+        eprintln!(
+            "[cm] 상주 중인 serve(pid {pid})가 이 실행 파일과 다른 빌드임. serve 를 종료한 뒤 다시 시작해야 새 빌드로 수집함"
+        );
+    }
+    if running {
         return Ok(false);
     }
 
@@ -646,5 +674,22 @@ mod tests {
             || None,
         )
         .expect("응답 시 준비 완료");
+    }
+
+    // 12. 빌드 식별자 ---------------------------------------------------------
+    #[test]
+    fn build_id_is_the_running_executable_size_and_modified_millis() {
+        let exe_path = std::env::current_exe().expect("실행 파일 경로");
+        let metadata = std::fs::metadata(exe_path).expect("실행 파일 메타데이터");
+        let modified_ms = metadata
+            .modified()
+            .expect("수정 시각")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("기원 이후")
+            .as_millis();
+        assert_eq!(
+            *super::BUILD_ID,
+            format!("{}-{modified_ms}", metadata.len())
+        );
     }
 }

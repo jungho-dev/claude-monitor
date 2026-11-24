@@ -15,7 +15,7 @@ use crate::core::model::{PortStatus, StatusSnapshot};
 use crate::net::common::{
     ResponseBody, full_body, json_response, serve_local_http, serve_local_listener, text_response,
 };
-use crate::serve::BOUND_LISTENER_NAMES;
+use crate::serve::{BOUND_LISTENER_NAMES, BUILD_ID};
 use crate::{report, transcript};
 use anyhow::Context;
 use chrono::{Duration as ChronoDuration, Local, NaiveDate, SecondsFormat, Utc};
@@ -144,6 +144,7 @@ async fn respond_status(ctx: &Arc<AppContext>) -> Response<ResponseBody> {
     // 3. 스냅샷 구성
     let snapshot = StatusSnapshot {
         version: env!("CARGO_PKG_VERSION").to_string(),
+        build_id: BUILD_ID.clone(),
         pid: std::process::id(),
         started_at: ctx.started_at.to_rfc3339_opts(SecondsFormat::Millis, true),
         uptime_secs: u64::try_from((Utc::now() - ctx.started_at).num_seconds()).unwrap_or(0),

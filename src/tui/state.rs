@@ -232,6 +232,8 @@ pub struct DashboardSnapshot {
     pub taken_at: Option<DateTime<Utc>>,
     pub db_state: DbState,
     pub status: Panel<StatusSnapshot>,
+    // serve 가 이 TUI 실행 파일과 다른 빌드로 상주 중 (빌드 식별자 불일치)
+    pub serve_stale: bool,
     pub overview: Panel<OverviewStats>,
     pub today: Panel<OverviewStats>,
     pub tools: Panel<Vec<ToolLatencyRow>>,
@@ -370,6 +372,8 @@ pub struct AppState {
     pub always_on_top: bool,
     pub show_help: bool,
     pub toast: Option<Toast>,
+    // 다른 빌드 serve 알림을 이미 띄운 serve pid (pid 마다 한 번)
+    pub stale_serve_warned_pid: Option<u32>,
     pub report_date: NaiveDate,
     pub report: Panel<Option<String>>,
     // 리포트 본문 줄별 화면 시작 행 (줄바꿈 반영, 직전 그리기 기준)
@@ -420,6 +424,7 @@ impl AppState {
             always_on_top: false,
             show_help: false,
             toast: None,
+            stale_serve_warned_pid: None,
             report_date: today,
             report: Panel::Pending,
             report_row_starts: Vec::new(),
@@ -842,6 +847,18 @@ impl AppState {
     pub fn apply_ui_message(&mut self, message: UiMessage, now: Instant) {
         match message {
             UiMessage::Snapshot(snapshot) => {
+                // 다른 빌드 serve 는 pid 마다 한 번 알림 (구간과 무관)
+                if let Panel::Ready(status) = &snapshot.status
+                    && snapshot.serve_stale
+                    && self.stale_serve_warned_pid != Some(status.pid)
+                {
+                    self.stale_serve_warned_pid = Some(status.pid);
+                    self.toast = Some(Toast {
+                        text: i18n::serve_stale_build(self.lang, status.pid),
+                        level: ToastLevel::Error,
+                        expires_at: now + TOAST_LIFETIME,
+                    });
+                }
                 // 구간을 바꾼 뒤 늦게 온 이전 구간 스냅샷은 버림
                 if snapshot.window == self.window {
                     let keys = self.capture_selection_keys();
@@ -2240,6 +2257,48 @@ mod tests {
         assert_eq!(
             state.toast.as_ref().unwrap().text,
             "DB schema upgrade failed: database is locked"
+        );
+    }
+
+    #[test]
+    fn a_stale_serve_build_raises_one_error_toast_per_serve_pid() {
+        let mut state = sample_state();
+        let now = Instant::now();
+        let window = state.window;
+        let stale = |pid: u32, serve_stale: bool| {
+            UiMessage::Snapshot(Box::new(DashboardSnapshot {
+                window,
+                status: Panel::Ready(StatusSnapshot {
+                    pid,
+                    ..StatusSnapshot::default()
+                }),
+                serve_stale,
+                ..DashboardSnapshot::default()
+            }))
+        };
+
+        // 같은 빌드면 알림 없음
+        state.apply_ui_message(stale(7, false), now);
+        assert!(state.toast.is_none());
+
+        // 다른 빌드면 pid 를 담은 오류 알림 한 번
+        state.apply_ui_message(stale(7, true), now);
+        let toast = state.toast.take().unwrap();
+        assert_eq!(
+            toast.text,
+            "serve(pid 7)가 다른 빌드로 실행 중: serve 를 재시작해야 이 빌드로 수집함"
+        );
+        assert_eq!(toast.level, ToastLevel::Error);
+        assert_eq!(toast.expires_at, now + TOAST_LIFETIME);
+
+        // 같은 serve 는 다시 알리지 않고, 다른 pid 로 바뀌면 다시 알림
+        state.apply_ui_message(stale(7, true), now);
+        assert!(state.toast.is_none());
+        state.lang = Lang::En;
+        state.apply_ui_message(stale(8, true), now);
+        assert_eq!(
+            state.toast.as_ref().unwrap().text,
+            "serve (pid 8) runs another build: restart serve to collect with this build"
         );
     }
 

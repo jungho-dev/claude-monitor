@@ -11,6 +11,7 @@ use claude_monitor::{
 };
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::LazyLock;
 
 // 1. 명령줄 -------------------------------------------------------------------
 #[derive(Debug, Parser)]
@@ -82,6 +83,8 @@ enum CliCommand {
 
 // 2. 진입점 -------------------------------------------------------------------
 fn main() -> ExitCode {
+    // 빌드 식별자는 실행 파일이 교체되기 전 기동 시점 값으로 고정
+    LazyLock::force(&serve::BUILD_ID);
     let args = CliArgs::parse();
     let config = match AppConfig::load(args.config.as_deref()) {
         Ok(config) => config,

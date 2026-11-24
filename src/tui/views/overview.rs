@@ -148,10 +148,12 @@ fn render_status_header(frame: &mut Frame, state: &mut AppState, area: Rect) {
     let mut status_items: Vec<Vec<Span<'static>>> = Vec::new();
     match &snapshot.status {
         Panel::Ready(status) => {
-            status_items.push(vec![Span::styled(
-                format!("● {}", i18n::text(lang, Msg::ServeRunning)),
-                theme::STYLE_OK,
-            )]);
+            let (serve_label, serve_style) = if snapshot.serve_stale {
+                (i18n::text(lang, Msg::ServeStaleBuild), theme::STYLE_WARN)
+            } else {
+                (i18n::text(lang, Msg::ServeRunning), theme::STYLE_OK)
+            };
+            status_items.push(vec![Span::styled(format!("● {serve_label}"), serve_style)]);
             let pairs = [
                 (
                     i18n::text(lang, Msg::StatusUptime),

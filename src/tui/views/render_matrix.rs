@@ -544,6 +544,34 @@ fn server_status_card_drops_whole_items_and_marks_a_closed_port_without_color_al
 }
 
 #[test]
+fn server_status_card_warns_when_serve_runs_another_build() {
+    for lang in [Lang::En, Lang::Ko] {
+        let mut state = sample_state_with_snapshot();
+        state.lang = lang;
+        let case = lang_name(lang);
+        let (running, stale) = match lang {
+            Lang::En => ("● serve running", "● serve on another build · restart it"),
+            Lang::Ko => ("● serve 실행 중", "● serve 빌드 불일치 · 재시작 필요"),
+        };
+        let normal = row_text(&draw(&mut state, 130, 40), 3);
+        assert!(normal.contains(running), "{case}: {normal}");
+
+        // 불일치면 같은 자리에 경고색 문구, pid 는 그대로 표시
+        state.snapshot.serve_stale = true;
+        let buffer = draw(&mut state, 130, 40);
+        let warned = row_text(&buffer, 3);
+        assert!(warned.contains(stale), "{case}: {warned}");
+        assert!(warned.contains("pid 4242"), "{case}: {warned}");
+        let dot_x = u16::try_from(warned[..warned.find('●').unwrap()].chars().count()).unwrap();
+        assert_eq!(
+            buffer.cell((dot_x, 3)).unwrap().fg,
+            theme::COLOR_WARN,
+            "{case}"
+        );
+    }
+}
+
+#[test]
 fn freshness_dot_is_green_when_fresh_warn_with_age_when_stale_and_hollow_when_waiting() {
     let mut state = sample_state_with_snapshot();
     state.lang = Lang::En;

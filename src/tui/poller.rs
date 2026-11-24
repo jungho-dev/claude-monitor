@@ -6,6 +6,7 @@ use crate::core::model::LiveEvent;
 use crate::inventory;
 use crate::net::admin;
 use crate::report;
+use crate::serve::BUILD_ID;
 use crate::store::Store;
 use crate::store::metrics::{AttributionDimension, MetricAttributionRow};
 use crate::store::otel_events::CompactionStat;
@@ -231,6 +232,10 @@ fn collect_snapshot(
         Panel::Failed(_) => Panel::Failed(Failure::ServeOff),
         other => other,
     };
+    snapshot.serve_stale = matches!(
+        &snapshot.status,
+        Panel::Ready(status) if !BUILD_ID.is_empty() && status.build_id != *BUILD_ID
+    );
 
     // 2. DB 열기 (없으면 빈 상태)
     let db_path = config.data_dir.join(DB_FILE_NAME);

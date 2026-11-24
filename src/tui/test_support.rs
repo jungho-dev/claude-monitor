@@ -46,6 +46,7 @@ pub fn sample_state_with_snapshot() -> AppState {
 
     let status = StatusSnapshot {
         version: "0.1.0".to_string(),
+        build_id: "1-1".to_string(),
         pid: 4242,
         started_at: "2026-11-15T00:00:00Z".to_string(),
         uptime_secs: 3_900,

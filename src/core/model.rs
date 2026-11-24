@@ -224,6 +224,9 @@ pub struct CounterSnapshot {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StatusSnapshot {
     pub version: String,
+    // 실행 파일 "크기-수정시각ms" 빌드 식별자 (이 필드가 없던 이전 serve 응답은 빈 값)
+    #[serde(default)]
+    pub build_id: String,
     pub pid: u32,
     pub started_at: String,
     pub uptime_secs: u64,

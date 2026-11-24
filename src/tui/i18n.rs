@@ -164,6 +164,7 @@ define_messages! {
     // 개요 탭
     TitleServerStatus => ("Server status", "서버 상태"),
     ServeRunning => ("serve running", "serve 실행 중"),
+    ServeStaleBuild => ("serve on another build · restart it", "serve 빌드 불일치 · 재시작 필요"),
     ServeChecking => ("Checking status", "상태 확인 중"),
     ServeRunHint => ("Run serve as a resident process", "serve 명령으로 상주 실행"),
     StatusUptime => ("Uptime", "가동"),
@@ -925,6 +926,17 @@ pub fn schema_upgrade_failed(lang: Lang, error: &str) -> String {
     match lang {
         Lang::En => format!("DB schema upgrade failed: {error}"),
         Lang::Ko => format!("DB 스키마 갱신 실패: {error}"),
+    }
+}
+
+pub fn serve_stale_build(lang: Lang, pid: u32) -> String {
+    match lang {
+        Lang::En => format!(
+            "serve (pid {pid}) runs another build: restart serve to collect with this build"
+        ),
+        Lang::Ko => {
+            format!("serve(pid {pid})가 다른 빌드로 실행 중: serve 를 재시작해야 이 빌드로 수집함")
+        }
     }
 }
 
