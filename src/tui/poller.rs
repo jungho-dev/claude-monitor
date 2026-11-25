@@ -418,7 +418,9 @@ pub fn spawn_settings_load(config: AppConfig, ui_tx: Sender<UiMessage>) {
     let _ = thread::Builder::new()
         .name("cm-tui-settings".to_string())
         .spawn(move || {
-            let inventory = guard_panel(|| inventory::load_inventory(&config.claude_home));
+            let inventory = Box::new(guard_panel(|| {
+                inventory::load_inventory(&config.claude_home)
+            }));
             let doctor = guard_panel(|| inventory::run_doctor_checks(&config));
             let _ = ui_tx.send(UiMessage::Settings { inventory, doctor });
         });

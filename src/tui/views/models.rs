@@ -564,8 +564,34 @@ fn build_model_detail(
     (title, lines)
 }
 
-// 3. 에이전트 탭 --------------------------------------------------------------
-// 에이전트 종류별 통계 표와 선택 에이전트 상세
+// 3. 에이전트 행 병합 ---------------------------------------------------------
+// 호출 기록 행 뒤에 호출 없는 설정 에이전트(~/.claude/agents, 이름 순)와 내장 에이전트를 값 0 행으로 붙임
+// 집계가 준비되지 않으면 None, 설정 목록을 읽기 전이면 호출 기록 행만
+pub fn agent_rows(
+    stats: &Panel<Vec<AgentStatsRow>>,
+    inventory: &Panel<Inventory>,
+) -> Option<Vec<AgentStatsRow>> {
+    let Panel::Ready(stats) = stats else {
+        return None;
+    };
+    let mut rows = stats.clone();
+    let Panel::Ready(inventory) = inventory else {
+        return Some(rows);
+    };
+    let configured = inventory.agents.iter().map(|entry| &entry.name);
+    for name in configured.chain(inventory.builtin_agents.iter()) {
+        if !rows.iter().any(|row| row.agent == *name) {
+            rows.push(AgentStatsRow {
+                agent: name.clone(),
+                ..AgentStatsRow::default()
+            });
+        }
+    }
+    Some(rows)
+}
+
+// 3-1. 에이전트 탭 ------------------------------------------------------------
+// 에이전트 종류별 통계 표(호출 없는 설정 에이전트 포함)와 선택 에이전트 상세
 pub fn render_agents_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
     if render_db_gate(frame, state, area) {
         return;
@@ -584,18 +610,15 @@ pub fn render_agents_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
     );
 
     // 1. 에이전트 통계 표
-    let agents: Option<Vec<AgentStatsRow>> = match &state.snapshot.agent_stats {
-        Panel::Ready(rows) => {
-            let mut sorted = rows.clone();
+    let agents: Option<Vec<AgentStatsRow>> =
+        agent_rows(&state.snapshot.agent_stats, &state.inventory).map(|mut sorted| {
             sort_rows(
                 &mut sorted,
                 state.card_sorts[CardId::AgentTable as usize],
                 compare_agent_row,
             );
-            Some(sorted)
-        }
-        _ => None,
-    };
+            sorted
+        });
     let agent_totals = agents
         .as_ref()
         .map_or(WindowTotals::default(), |sorted| WindowTotals {
@@ -647,11 +670,19 @@ pub fn render_agents_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
                             error_style,
                         )],
                         vec![Span::styled(
-                            short_model(&row.top_model).to_string(),
+                            if row.top_model.is_empty() {
+                                "-".to_string()
+                            } else {
+                                short_model(&row.top_model).to_string()
+                            },
                             theme::STYLE_DIM,
                         )],
                         vec![Span::styled(
-                            format_clock_time(&row.last_ts),
+                            if row.last_ts.is_empty() {
+                                "-".to_string()
+                            } else {
+                                format_clock_time(&row.last_ts)
+                            },
                             theme::STYLE_DIM,
                         )],
                     ]
@@ -839,17 +870,21 @@ fn build_agent_detail(
 }
 
 // 4-1. 정의 파일 설정값 -------------------------------------------------------
-// ~/.claude/agents 의 같은 이름 정의 (메인은 정의 파일이 없음, 목록을 읽기 전이면 읽는 중)
+// ~/.claude/agents 의 같은 이름 정의 (메인·내장 에이전트는 정의 파일이 없음, 목록을 읽기 전이면 읽는 중)
 fn agent_config(lang: Lang, agent: &str, inventory: &Panel<Inventory>) -> String {
     if agent == "main" || agent.is_empty() {
         return i18n::text(lang, Msg::DetailConfigMain).to_string();
     }
-    let entries = match inventory {
-        Panel::Ready(inventory) => &inventory.agents,
+    let loaded = match inventory {
+        Panel::Ready(inventory) => inventory,
         Panel::Pending => return i18n::text(lang, Msg::DetailConfigPending).to_string(),
         Panel::Failed(_) => return "-".to_string(),
     };
-    let Some(entry) = entries.iter().find(|entry| entry.name == agent) else {
+    let found = loaded.agents.iter().find(|entry| entry.name == agent);
+    if found.is_none() && loaded.builtin_agents.iter().any(|name| name == agent) {
+        return i18n::text(lang, Msg::DetailConfigBuiltin).to_string();
+    }
+    let Some(entry) = found else {
         return i18n::text(lang, Msg::DetailConfigMissing).to_string();
     };
     let or_dash = |text: &str| {
@@ -1057,5 +1092,32 @@ mod tests {
         let nameless_agent = AgentStatsRow::default();
         let (title, _) = build_agent_detail(KO, Some(&nameless_agent), window, &Panel::Pending);
         assert_eq!(title, "에이전트 상세");
+    }
+
+    #[test]
+    fn agent_rows_append_configured_agents_without_calls_as_zero_rows() {
+        let mut state = crate::tui::test_support::sample_state_with_tables();
+        if let Panel::Ready(inventory) = &mut state.inventory {
+            inventory.builtin_agents = vec!["general-purpose".to_string(), "worker".to_string()];
+        }
+        let rows = agent_rows(&state.snapshot.agent_stats, &state.inventory).expect("행");
+        let names: Vec<&str> = rows.iter().map(|row| row.agent.as_str()).collect();
+        // 호출 기록 행(main, worker) 뒤에 호출 없는 설정 에이전트 tester, 내장 general-purpose 한 번씩
+        assert_eq!(names, ["main", "worker", "tester", "general-purpose"]);
+        for zero in &rows[2..] {
+            assert_eq!((zero.runs, zero.requests, zero.tool_calls), (0, 0, 0));
+            assert_eq!(zero.cost_usd_estimate, 0.0);
+        }
+        assert_eq!(
+            agent_config(KO, "general-purpose", &state.inventory),
+            "내장 에이전트 (정의 파일 없음)"
+        );
+        // 같은 이름의 정의 파일이 있으면 파일 설정값이 우선
+        assert!(agent_config(KO, "worker", &state.inventory).contains("sonnet"));
+
+        // 설정 목록을 읽기 전이면 호출 기록 행만, 집계 전이면 None
+        let only_stats = agent_rows(&state.snapshot.agent_stats, &Panel::Pending).expect("행");
+        assert_eq!(only_stats.len(), 2);
+        assert!(agent_rows(&Panel::Pending, &state.inventory).is_none());
     }
 }

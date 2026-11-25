@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 use claude_monitor::core::config::{AppConfig, DB_FILE_NAME};
 use claude_monitor::statuscheck::StatusOnceOptions;
 use claude_monitor::store::Store;
+use claude_monitor::tui::TuiExit;
 use claude_monitor::{
     hooks, inventory, net, report, serve, statuscheck, statusline, transcript, tui,
 };
@@ -99,13 +100,17 @@ fn main() -> ExitCode {
         }
     };
 
-    // 명령 없음: serve 분리 상주 보장 후 TUI (TUI 종료 후에도 serve 유지)
+    // 명령 없음: serve 분리 상주 보장 후 TUI (TUI 종료 후에도 serve 유지, 강제 재시작은 최신 exe 로 재기동)
     let Some(command) = args.command else {
         if let Err(err) = serve::ensure_background_serve(&config, args.config.as_deref()) {
             eprintln!("serve 자동 기동 실패: {err:#}");
         }
-        return match tui::run_tui(&config) {
-            Ok(()) => ExitCode::SUCCESS,
+        let outcome = tui::run_tui(&config).and_then(|exit| match exit {
+            TuiExit::Quit => Ok(0),
+            TuiExit::Restart => serve::restart_with_latest_build(&config, args.config.as_deref()),
+        });
+        return match outcome {
+            Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),
             Err(err) => {
                 eprintln!("오류: {err:#}");
                 ExitCode::from(1)
@@ -118,7 +123,10 @@ fn main() -> ExitCode {
         CliCommand::Start => {
             serve::ensure_background_serve(&config, args.config.as_deref()).map(|_| 0)
         }
-        CliCommand::Tui => tui::run_tui(&config).map(|_| 0),
+        CliCommand::Tui => tui::run_tui(&config).and_then(|exit| match exit {
+            TuiExit::Quit => Ok(0),
+            TuiExit::Restart => serve::restart_with_latest_build(&config, args.config.as_deref()),
+        }),
         CliCommand::Index => Store::open_store(&config.data_dir.join(DB_FILE_NAME))
             .and_then(|store| transcript::index_transcripts_once(&config, &store))
             .map(|summary| {

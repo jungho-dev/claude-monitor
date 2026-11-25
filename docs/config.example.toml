@@ -39,7 +39,7 @@ enabled = true
 # dir = "C:/Users/<user>/.config/claude-monitor/reports"
 run_hour = 0
 # Report text language: "ko" or "en"
-language = "ko"
+language = "en"
 
 # Modern Standby handling (sleep postponement, standby gap detection, resume hints)
 [power]

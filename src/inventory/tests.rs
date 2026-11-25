@@ -242,6 +242,36 @@ fn inventory_reads_agent_and_skill_frontmatter() {
     );
 }
 
+// 9-1. 내장 에이전트 목록과 Explore·Plan 끄기 변수 ----------------------------
+#[test]
+fn inventory_lists_builtin_agents_and_drops_explore_plan_when_disabled() {
+    let home = temp_data_dir("builtin-agents");
+    let _cleanup = TempDirGuard(home.clone());
+    fs::write(home.join("settings.json"), r#"{"env":{"DEBUG":"1"}}"#).expect("설정 쓰기");
+    let enabled = load_inventory(&home).expect("적재");
+    assert_eq!(
+        enabled.builtin_agents,
+        [
+            "general-purpose",
+            "statusline-setup",
+            "claude-code-guide",
+            "Explore",
+            "Plan"
+        ]
+    );
+
+    fs::write(
+        home.join("settings.json"),
+        r#"{"env":{"CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS":"1"}}"#,
+    )
+    .expect("설정 쓰기");
+    let disabled = load_inventory(&home).expect("적재");
+    assert_eq!(
+        disabled.builtin_agents,
+        ["general-purpose", "statusline-setup", "claude-code-guide"]
+    );
+}
+
 // 10. 비밀값 미포함 -----------------------------------------------------------
 #[test]
 fn inventory_json_carries_no_secret_values() {

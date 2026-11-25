@@ -454,7 +454,7 @@ fn long_card_titles_drop_middle_segments_and_keep_the_sort_tail_at_the_minimum_s
         (
             Lang::En,
             ActiveTab::Agents,
-            "Agent stats · 2 kinds · est. (API rates) · Sort Reqs↓",
+            "Agent stats · 3 kinds · est. (API rates) · Sort Reqs↓",
         ),
         (
             Lang::En,
@@ -469,7 +469,7 @@ fn long_card_titles_drop_middle_segments_and_keep_the_sort_tail_at_the_minimum_s
         (
             Lang::Ko,
             ActiveTab::Agents,
-            "에이전트 통계 · 2종 · 추정 (API 단가) · 정렬 요청↓",
+            "에이전트 통계 · 3종 · 추정 (API 단가) · 정렬 요청↓",
         ),
     ];
     for (lang, tab, expected) in cases {

@@ -35,6 +35,8 @@ const READY_TIMEOUT: Duration = Duration::from_secs(8);
 const ADMIN_PROBE_TIMEOUT: Duration = Duration::from_millis(100);
 const READY_HTTP_TIMEOUT: Duration = Duration::from_millis(500);
 const READY_POLL_SLEEP: Duration = Duration::from_millis(50);
+// 강제 종료한 serve 가 관리 포트를 놓을 때까지 기다리는 한도
+const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 // 이 프로세스가 실제로 바인드한 서버 이름 (상태 응답의 수신 여부 근거)
 pub(crate) static BOUND_LISTENER_NAMES: OnceLock<Vec<&'static str>> = OnceLock::new();
@@ -42,18 +44,7 @@ pub(crate) static BOUND_LISTENER_NAMES: OnceLock<Vec<&'static str>> = OnceLock::
 // 이 프로세스 실행 파일의 빌드 식별자 "크기-수정시각ms" (serve·TUI 빌드 일치 판정)
 // 실행 중 파일이 새 빌드로 바뀌어도 기동 당시 값을 유지하도록 main 첫 줄에서 강제 초기화,
 // 메타데이터를 못 읽으면 빈 값이고 비교 쪽은 빈 값이면 판정을 생략
-pub static BUILD_ID: LazyLock<String> = LazyLock::new(|| {
-    let Ok(metadata) = std::env::current_exe().and_then(fs::metadata) else {
-        return String::new();
-    };
-    let Ok(modified) = metadata.modified() else {
-        return String::new();
-    };
-    let Ok(elapsed) = modified.duration_since(UNIX_EPOCH) else {
-        return String::new();
-    };
-    format!("{}-{}", metadata.len(), elapsed.as_millis())
-});
+pub static BUILD_ID: LazyLock<String> = LazyLock::new(read_exe_build_id);
 
 // 1. 선점 리스너 --------------------------------------------------------------
 #[derive(Debug)]
@@ -368,7 +359,97 @@ pub fn ensure_background_serve(
     Ok(true)
 }
 
-// 6. 기동 완료 대기 -----------------------------------------------------------
+// 6. 최신 빌드 강제 재기동 ----------------------------------------------------
+/// TUI 강제 재시작: 디스크의 최신 exe 와 빌드가 다른 serve 를 종료하고 최신 exe 로 다시 기동한 뒤,
+/// TUI 를 최신 exe 와 같은 인자로 다시 실행해 그 종료 코드를 반환 (Windows 는 exec 이 없어 자식 종료까지 대기).
+pub fn restart_with_latest_build(
+    config: &AppConfig,
+    config_path: Option<&Path>,
+) -> anyhow::Result<i32> {
+    // 1. serve 종료 (구 빌드에는 종료 API 가 없어 pid 로 강제 종료, 관리 포트가 풀릴 때까지 대기)
+    // 관리자 권한 serve 는 일반 권한 TUI 가 종료할 수 없어 UAC 승인 뒤 관리자 권한 taskkill 로 한 번 더 시도
+    let admin_addr = SocketAddr::from(([127, 0, 0, 1], config.ports.admin));
+    let terminate_serve = |pid: u32| -> anyhow::Result<()> {
+        let pid_text = pid.to_string();
+        #[cfg(windows)]
+        let plain = Command::new("taskkill")
+            .args(["/PID", pid_text.as_str(), "/F"])
+            .stdin(Stdio::null())
+            .output()
+            .with_context(|| format!("serve(pid {pid}) 종료 명령 실행 실패"))?;
+        #[cfg(windows)]
+        let killed = if plain.status.success() {
+            true
+        } else {
+            eprintln!(
+                "[cm] serve(pid {pid}) 종료 거부됨 (관리자 권한 serve 로 보임), UAC 승인 후 다시 시도"
+            );
+            let elevated = format!(
+                "$p = Start-Process taskkill -ArgumentList '/PID','{pid}','/F' -Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode"
+            );
+            Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    elevated.as_str(),
+                ])
+                .stdin(Stdio::null())
+                .status()
+                .with_context(|| format!("serve(pid {pid}) 관리자 권한 종료 실행 실패"))?
+                .success()
+        };
+        #[cfg(not(windows))]
+        let killed = Command::new("kill")
+            .arg(&pid_text)
+            .stdin(Stdio::null())
+            .status()
+            .with_context(|| format!("serve(pid {pid}) 종료 명령 실행 실패"))?
+            .success();
+        if !killed {
+            bail!("serve(pid {pid}) 종료 실패: 권한 승인 거부 또는 종료 불가");
+        }
+        let started = Instant::now();
+        while TcpStream::connect_timeout(&admin_addr, ADMIN_PROBE_TIMEOUT).is_ok() {
+            if started.elapsed() >= STOP_TIMEOUT {
+                bail!(
+                    "serve(pid {pid}) 종료 후에도 관리 포트 {} 가 {:.1}초 동안 열려 있음",
+                    config.ports.admin,
+                    STOP_TIMEOUT.as_secs_f32()
+                );
+            }
+            thread::sleep(READY_POLL_SLEEP);
+        }
+        Ok(())
+    };
+
+    // 2. 상주 serve 판정 (디스크 exe 와 같은 빌드면 유지, 식별자를 못 읽으면 강제 재기동, 조회 실패는 미실행으로 보고 기동만)
+    let latest_build = read_exe_build_id();
+    let (stale_pid, serve_missing) = match net::admin::fetch_status_blocking(config.ports.admin) {
+        Ok(status) if !latest_build.is_empty() && status.build_id == latest_build => (None, false),
+        Ok(status) => (Some(status.pid), false),
+        Err(_) => (None, true),
+    };
+
+    // 3. 다른 빌드 serve 종료 후 최신 exe 로 기동
+    if let Some(pid) = stale_pid {
+        eprintln!("[cm] 다른 빌드 serve(pid {pid}) 종료 후 최신 빌드로 재기동");
+        terminate_serve(pid)?;
+    }
+    if stale_pid.is_some() || serve_missing {
+        ensure_background_serve(config, config_path)?;
+    }
+
+    // 4. TUI 를 최신 exe 로 같은 인자 재실행 (콘솔·표준 입출력은 그대로 물려줌)
+    let exe_path = std::env::current_exe().context("실행 파일 경로 확인 실패")?;
+    let status = Command::new(&exe_path)
+        .args(std::env::args_os().skip(1))
+        .status()
+        .with_context(|| format!("TUI 재실행 실패: {}", exe_path.display()))?;
+    Ok(status.code().unwrap_or(1))
+}
+
+// 7. 기동 완료 대기 -----------------------------------------------------------
 /// 관리 서버 /health ok 응답까지 대기 (준비 완료 뒤에만 응답), 자식 종료 시 중단.
 fn wait_until_serve_ready(
     admin_addr: SocketAddr,
@@ -404,6 +485,21 @@ fn wait_until_serve_ready(
         limit.as_secs_f32(),
         log_path.display()
     )
+}
+
+// 8. 실행 파일 빌드 식별자 ----------------------------------------------------
+// "크기-수정시각ms", 기동 시점 BUILD_ID 와 강제 재기동 때 디스크의 최신 exe 판정이 함께 씀 (메타데이터를 못 읽으면 빈 값)
+fn read_exe_build_id() -> String {
+    let Ok(metadata) = std::env::current_exe().and_then(fs::metadata) else {
+        return String::new();
+    };
+    let Ok(modified) = metadata.modified() else {
+        return String::new();
+    };
+    let Ok(elapsed) = modified.duration_since(UNIX_EPOCH) else {
+        return String::new();
+    };
+    format!("{}-{}", metadata.len(), elapsed.as_millis())
 }
 
 #[cfg(test)]

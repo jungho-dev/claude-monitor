@@ -57,6 +57,13 @@ pub const DEFAULT_CONSOLE_FONT: &str = "D2Coding ligature";
 // 창 최상단 고정 상태 (종료·panic 복원 경로가 공유)
 static TOPMOST_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+// TUI 종료 방식 (Restart 는 터미널 복원 뒤 main 이 serve·TUI 를 최신 exe 로 재기동)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuiExit {
+    Quit,
+    Restart,
+}
+
 // 1. 터미널 복원 가드 ---------------------------------------------------------
 // 정상 종료·오류·panic 어느 경로든 Drop 으로 원래 화면 복구, 이어서 상태 저장 스레드의 남은 요청을 쓰고 합류 (마지막 확정 저장이 사라지지 않음)
 struct TerminalGuard {
@@ -89,7 +96,7 @@ fn restore_terminal() {
 }
 
 // 3. TUI 실행 -----------------------------------------------------------------
-pub fn run_tui(config: &AppConfig) -> anyhow::Result<()> {
+pub fn run_tui(config: &AppConfig) -> anyhow::Result<TuiExit> {
     // 1. 상태와 배경 수집 스레드 (상태 파일은 홈 공용 폴더 고정, 시작할 때 한 번 정함)
     let mut app = AppState::new(config.clone(), Local::now().date_naive());
     app.state_file = resolve_tui_state_path(
@@ -144,7 +151,12 @@ pub fn run_tui(config: &AppConfig) -> anyhow::Result<()> {
         &guard.writer,
     );
     let _ = panic::take_hook();
-    outcome
+    outcome?;
+    Ok(if app.restart_requested {
+        TuiExit::Restart
+    } else {
+        TuiExit::Quit
+    })
 }
 
 // 4. 이벤트 루프 --------------------------------------------------------------

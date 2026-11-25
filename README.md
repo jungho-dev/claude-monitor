@@ -331,6 +331,7 @@ cargo uninstall claude-monitor
     - `d`: cycle the attribution dimension (skill, MCP server, plugin, agent, model), projects tab only
     - `i`: reindex
     - `g` and `i` go through the admin API and need a running `serve`
+    - `!`: force restart, only while `serve` runs another build: stops that `serve` (asks for UAC approval when it runs elevated), starts `serve` from the latest exe on disk, and reruns the TUI from that exe with the same arguments
     - `t`: toggle always-on-top
     - `Shift+Up`, `Shift+Down`, `Shift+Left`, `Shift+Right`: move the focused card one slot (see Card order)
     - `l`: reset the card sizes, card order, and dragged column widths of the current tab
@@ -346,6 +347,7 @@ cargo uninstall claude-monitor
     - Press a tab and drag it along the tab bar to reorder the tabs (see Tab order).
     - A button release lost outside the window ends every drag the way a release does: the first move without a button or the next press commits a moved card boundary, column width, or scrollbar drag (and saves the layout), and a tab switch commits it instead of dropping it.
     - The bottom bar holds clickable buttons for reindex, window, refresh, top-most, layout reset, language, help, and quit; the report tab adds previous and next date and generate buttons.
+    - While `serve` runs another build, a warn-colored `[!] Force restart` chip leads the bottom bar and stays visible at the minimum size; clicking it does what `!` does.
 4. **Views**
     - The event feed is a table card with a pinned header (time, kind, name, duration, agent, input, output, cache read) that follows the same column rules as the other tables: text columns get their natural width before any `…`, text columns shrink before the numeric ones, and the right-most columns hide last, with the name and agent columns keeping a readable minimum width first. A hook row shows route, guard, and detail in the name cell and its verdict in the agent cell.
     - The settings tab shows hooks, MCP servers, agents, and diagnostics as table cards with the same header sort and draggable columns; the allow list, load warnings, and the skill and env summary continue below the table rows as auxiliary lines in the same scroll, and a diagnostic's fix hint stays in its message cell.
@@ -357,7 +359,7 @@ cargo uninstall claude-monitor
     - The limit and API-key levels carry a mark besides the color: ` !` from 80 % used (warn) and ` !!` from 95 % (critical); the cache hit line of the cache timer card marks ` !` below 80 % and ` !!` below 50 %.
     - The models tab shows per-model stats (requests, sessions, agent types, tokens, cache hit ratio, wait p50/p90, estimated cost, last seen) with a detail card, the cache-break candidates, and a cache timer card built from the latest status line snapshot; the cache timer card is hidden when its card is too short, wherever it sits.
     - The projects tab shows a project and branch table (requests, sessions, tokens, cache writes by 5-minute and 1-hour, estimated cost, last seen) with a detail card, and an attribution table of cost by skill, MCP server, plugin, agent, or model; `d` cycles the dimension and the choice is saved in the state file (see State file), and the table needs the OTLP metrics (see Connect Claude Code).
-    - The agents tab shows per-agent-type stats (runs, requests, sessions, tokens, estimated cost, wait p50/p90, tool calls and errors, top model, last seen) with a detail card.
+    - The agents tab shows per-agent-type stats (runs, requests, sessions, tokens, estimated cost, wait p50/p90, tool calls and errors, top model, last seen) with a detail card; every agent defined in `~/.claude/agents` and every Claude Code built-in agent (`general-purpose`, `statusline-setup`, `claude-code-guide`, plus `Explore` and `Plan` unless `CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS` is `1` or `true` in the `settings.json` env) is listed, and one with no calls in the window shows 0.
     - The report view shows box tables verbatim and converts legacy pipe-table reports to box tables when displaying them.
     - The report tab opens on today's report, built live; `v` toggles between the daily and the weekly view, and the weekly view opens on the current week, also built live, with `Left` and `Right` moving by one week (not past the current week).
     - The dashboard's today follows the clock across midnight: a report view that showed today or this week moves to the new day or week and is built live there, while a past day or week stays.
@@ -578,7 +580,7 @@ cargo uninstall claude-monitor
     - Every key is optional; this block shows the defaults, and `docs/config.example.toml` carries the same keys.
     - `gateway.enabled` defaults to `true`; `false` leaves port `47332` untouched.
     - `gateway.upstream_timeout_secs` limits the wait for upstream response headers (504 on timeout); a streamed body has no deadline after the headers arrive. It must be at least 1.
-    - `report.language` (`"ko"` or `"en"`, default `"ko"`) sets the language of the daily and weekly report text.
+    - `report.language` (`"ko"` or `"en"`, default `"en"`) sets the language of the daily and weekly report text.
     - `[pricing.models."<prefix>"]` overrides the cost estimate rates (see Cost Estimate); it is commented out in the block below and is read when a command starts.
     - `power.enabled` starts the standby monitor thread; `power.keep_awake` asks Windows to postpone system sleep (`SetThreadExecutionState` with `ES_SYSTEM_REQUIRED`, never `ES_DISPLAY_REQUIRED`) while a gateway stream is open or a gateway request or hook call happened within `power.awake_grace_secs`.
     - A wall-clock jump larger than `power.gap_threshold_secs` between two monitor ticks is recorded as a standby gap; `power.hint_window_secs` is how long after a gap a prompt still gets the hint.
@@ -614,7 +616,7 @@ backfill_days = 7
 enabled = true
 # dir = "C:/Users/<user>/.config/claude-monitor/reports"
 run_hour = 0
-language = "ko"
+language = "en"
 
 [power]
 enabled = true

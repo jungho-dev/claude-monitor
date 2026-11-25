@@ -11,10 +11,20 @@ const SCRIPT_EXTENSIONS: [&str; 9] = [
     ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", ".ps1", ".sh",
 ];
 
+// Claude Code 내장 에이전트 (정의 파일 없음), Explore·Plan 은 settings.json env 의 끄기 변수가 켜져 있으면 빠짐
+const BUILTIN_AGENTS: [&str; 3] = ["general-purpose", "statusline-setup", "claude-code-guide"];
+const EXPLORE_PLAN_AGENTS: [&str; 2] = ["Explore", "Plan"];
+const DISABLE_EXPLORE_PLAN_KEY: &str = "CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS";
+
 // 1. 설정 목록 읽기 -----------------------------------------------------------
 pub fn read_inventory(claude_home: &Path) -> anyhow::Result<Inventory> {
     let mut inventory = Inventory {
         claude_home: claude_home.display().to_string(),
+        builtin_agents: BUILTIN_AGENTS
+            .iter()
+            .chain(EXPLORE_PLAN_AGENTS.iter())
+            .map(|name| (*name).to_string())
+            .collect(),
         ..Default::default()
     };
     let denied = read_settings_file(claude_home, &mut inventory);
@@ -108,9 +118,18 @@ fn read_settings_file(claude_home: &Path, inventory: &mut Inventory) -> Vec<Stri
         }
     }
 
-    // 3. env 키 이름 (값 제외)
+    // 3. env 키 이름 (값 제외), Explore·Plan 끄기 변수가 켜져 있으면 내장 목록에서 뺀
     if let Some(Value::Object(env)) = root.get("env") {
         inventory.env_keys = env.keys().cloned().collect();
+        let explore_plan_disabled = env
+            .get(DISABLE_EXPLORE_PLAN_KEY)
+            .and_then(Value::as_str)
+            .is_some_and(|flag| matches!(flag.trim(), "1" | "true"));
+        if explore_plan_disabled {
+            inventory
+                .builtin_agents
+                .retain(|name| !EXPLORE_PLAN_AGENTS.contains(&name.as_str()));
+        }
     }
 
     // 4. 허용 URL

@@ -298,7 +298,7 @@ fn render_footer_buttons(frame: &mut Frame, row: Rect, state: &mut AppState) {
         state.window.window_label(lang)
     );
     let chip_name = |msg: Msg| format!(" {} ", i18n::text(lang, msg));
-    let left_chips: Vec<(UiAction, Line<'static>)> = vec![
+    let mut left_chips: Vec<(UiAction, Line<'static>)> = vec![
         (
             UiAction::Reindex,
             Line::from(vec![
@@ -342,6 +342,20 @@ fn render_footer_buttons(frame: &mut Frame, row: Rect, state: &mut AppState) {
             Span::styled(chip_name(Msg::ChipLanguage), name_style),
         ]),
     );
+    // 빌드 불일치면 강제 재시작 칩을 경고색으로 맨 앞에 (폭이 모자라도 마지막까지 남음)
+    if state.snapshot.serve_stale {
+        let warn_key = chip.fg(theme::COLOR_WARN).add_modifier(Modifier::BOLD);
+        left_chips.insert(
+            0,
+            (
+                UiAction::ForceRestart,
+                Line::from(vec![
+                    Span::styled(" [!]", warn_key),
+                    Span::styled(chip_name(Msg::ChipForceRestart), chip.fg(theme::COLOR_WARN)),
+                ]),
+            ),
+        );
+    }
     let right_chips: Vec<(UiAction, Line<'static>)> = vec![
         (
             UiAction::ShowHelp,
@@ -707,6 +721,44 @@ mod tests {
         assert!(actions.contains(&UiAction::Reindex));
         assert!(actions.contains(&UiAction::Quit));
         assert_eq!(state.hit_areas.tab_rects.len(), 9);
+    }
+
+    #[test]
+    fn force_restart_chip_leads_the_footer_only_while_serve_runs_another_build() {
+        // 1. 같은 빌드: 칩 없음
+        let mut state = sample_state_with_snapshot();
+        let normal = render_to_text(&mut state, 130, 40).join("\n");
+        assert!(!normal.contains("[!]"), "{normal}");
+        assert!(
+            state
+                .hit_areas
+                .button_rects
+                .iter()
+                .all(|(action, _)| *action != UiAction::ForceRestart)
+        );
+
+        // 2. 불일치: 경고색 칩이 맨 앞, 최소 폭에서도 남고 클릭 영역 등록
+        state.snapshot.serve_stale = true;
+        for (width, height) in [(130, 40), (MIN_WIDTH, MIN_HEIGHT)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| render_frame(frame, &mut state))
+                .unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            let (action, rect) = state.hit_areas.button_rects[0];
+            assert_eq!(action, UiAction::ForceRestart, "{width}x{height}");
+            let footer = row_text(&buffer, rect.y, width);
+            assert!(
+                footer.starts_with("  [!] 강제 재시작 "),
+                "{width}x{height}: {footer}"
+            );
+            assert_eq!(buffer.cell((rect.x + 1, rect.y)).unwrap().symbol(), "[");
+            assert_eq!(
+                buffer.cell((rect.x + 1, rect.y)).unwrap().fg,
+                theme::COLOR_WARN,
+                "{width}x{height}"
+            );
+        }
     }
 
     #[test]

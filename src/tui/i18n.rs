@@ -81,6 +81,7 @@ define_messages! {
     ChipPinOff => ("Pin OFF", "최상단 OFF"),
     ChipResetLayout => ("Reset layout", "배치 초기화"),
     ChipLanguage => ("EN", "KO"),
+    ChipForceRestart => ("Force restart", "강제 재시작"),
     ChipHelp => ("Help", "도움말"),
     ChipQuit => ("Quit", "종료"),
 
@@ -125,6 +126,7 @@ define_messages! {
     HelpResetLayout => ("Reset card size, order, widths (tab)", "현재 탭 카드 크기·순서·열 폭 기본 배치"),
     HelpLanguage => ("Switch language (EN / KO)", "표시 언어 전환 (EN / KO)"),
     HelpToggleHelp => ("Open / close help", "도움말 열기·닫기"),
+    HelpForceRestart => ("Build mismatch: rerun serve and TUI on the latest exe", "빌드 불일치 시 serve·TUI 를 최신 exe 로 강제 재시작"),
     HelpQuit => ("Quit", "종료"),
     HelpKeyClickTab => ("Click tab/button", "탭·버튼 클릭"),
     HelpClickTab => ("Switch tab, run footer button", "탭 전환, 하단 버튼 실행"),
@@ -439,6 +441,7 @@ define_messages! {
     DetailConfigured => ("Configured", "설정값"),
     DetailConfigMain => ("main session (no agent file)", "메인 세션 (정의 파일 없음)"),
     DetailConfigMissing => ("no file in ~/.claude/agents", "~/.claude/agents 에 정의 없음"),
+    DetailConfigBuiltin => ("built-in agent (no agent file)", "내장 에이전트 (정의 파일 없음)"),
     DetailConfigPending => ("reading agent files…", "에이전트 정의 읽는 중…"),
     SectionAgentsByCost => ("Agents by cost", "에이전트별 비용"),
     SectionModelsByCost => ("Models by cost", "모델별 비용"),
@@ -932,10 +935,12 @@ pub fn schema_upgrade_failed(lang: Lang, error: &str) -> String {
 pub fn serve_stale_build(lang: Lang, pid: u32) -> String {
     match lang {
         Lang::En => format!(
-            "serve (pid {pid}) runs another build: restart serve to collect with this build"
+            "serve (pid {pid}) runs another build: press [!] Force restart to rerun on the latest build"
         ),
         Lang::Ko => {
-            format!("serve(pid {pid})가 다른 빌드로 실행 중: serve 를 재시작해야 이 빌드로 수집함")
+            format!(
+                "serve(pid {pid})가 다른 빌드로 실행 중: 하단 [!] 강제 재시작으로 최신 빌드 재실행"
+            )
         }
     }
 }
@@ -1052,6 +1057,7 @@ pub fn help_rows(lang: Lang) -> Vec<(&'static str, &'static str)> {
         ("L", words(Msg::HelpLanguage)),
         ("d", words(Msg::HelpDimension)),
         ("?", words(Msg::HelpToggleHelp)),
+        ("!", words(Msg::HelpForceRestart)),
         ("q, Esc, Ctrl+C", words(Msg::HelpQuit)),
         (words(Msg::HelpSectionMouse), ""),
         (words(Msg::HelpKeyClickTab), words(Msg::HelpClickTab)),

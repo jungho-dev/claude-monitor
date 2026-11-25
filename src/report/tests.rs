@@ -26,7 +26,8 @@ use unicode_width::UnicodeWidthStr;
 // 1. 리포트 본문 --------------------------------------------------------------
 #[test]
 fn report_covers_indexed_fixture_day() {
-    let workspace = prepare_fixture_workspace("report");
+    let mut workspace = prepare_fixture_workspace("report");
+    workspace.config.report.language = ReportLanguage::Ko;
     index_transcripts_once(&workspace.config, &workspace.store).expect("색인");
     let report_date = NaiveDate::from_ymd_opt(2026, 11, 10).expect("날짜");
 
@@ -163,7 +164,7 @@ async fn scheduler_overwrites_existing_yesterday_report() {
 
     // 3. 덮어쓴 본문 확인
     let markdown = regenerated.expect("어제 리포트 재생성");
-    assert!(markdown.contains("## 1. 요약"));
+    assert!(markdown.contains("## 1. Summary"));
 }
 
 // 4. 건수 천 단위 구분 --------------------------------------------------------
@@ -527,7 +528,7 @@ fn weekly_report_is_stored_under_week_key_in_table_and_file() {
         .expect("조회")
         .expect("보관본");
     assert_eq!(fs::read_to_string(&path).expect("파일"), saved);
-    assert!(saved.starts_with("# 주간 에이전트 리포트 2026-W46 (2026-11-09 ~ 2026-11-15)"));
+    assert!(saved.starts_with("# Weekly Agent Report 2026-W46 (2026-11-09 ~ 2026-11-15)"));
 
     // 2. 일일 보관본과 키 충돌 없음
     assert_eq!(
@@ -594,7 +595,7 @@ async fn tuesday_run_writes_missing_last_week_report_but_keeps_stored_copy() {
     assert!(ctx.store.load_daily_report(&key).expect("조회").is_none());
     generate_scheduled_report(&ctx, weekly_report_target(tuesday, false)).await;
     let created = ctx.store.load_daily_report(&key).expect("조회");
-    assert!(created.is_some_and(|text| text.contains("## 1. 이번 주 요약")));
+    assert!(created.is_some_and(|text| text.contains("## 1. This Week Summary")));
 
     // 2. 이미 있으면 다시 실행해도 덮어쓰지 않음
     ctx.store
@@ -634,7 +635,7 @@ async fn partial_weekly_copy_saved_before_the_week_ended_is_regenerated_on_a_non
         .expect("부분 본 저장");
     generate_scheduled_report(&ctx, weekly_report_target(tuesday, false)).await;
     let regenerated = ctx.store.load_daily_report(&key).expect("조회");
-    assert!(regenerated.is_some_and(|text| text.contains("## 1. 이번 주 요약")));
+    assert!(regenerated.is_some_and(|text| text.contains("## 1. This Week Summary")));
     let generated_at = stored_at();
     assert!(generated_at >= week_end, "{generated_at}");
 
@@ -657,7 +658,7 @@ async fn partial_weekly_copy_saved_before_the_week_ended_is_regenerated_on_a_non
         .expect("보관본 저장");
     generate_scheduled_report(&ctx, weekly_report_target(tuesday, false)).await;
     let replaced = ctx.store.load_daily_report(&key).expect("조회");
-    assert!(replaced.is_some_and(|text| text.contains("## 1. 이번 주 요약")));
+    assert!(replaced.is_some_and(|text| text.contains("## 1. This Week Summary")));
 }
 
 // 11-1. 예약 생성 종류 --------------------------------------------------------
@@ -673,7 +674,7 @@ async fn scheduled_weekly_report_overwrites_but_if_missing_keeps_stored_copy() {
     // 1. 보관본 없음: 시작 시 판정이 생성
     generate_scheduled_report(&ctx, ScheduledReport::WeeklyIfStale(week_start)).await;
     let created = ctx.store.load_daily_report(&key).expect("조회");
-    assert!(created.is_some_and(|text| text.contains("## 1. 이번 주 요약")));
+    assert!(created.is_some_and(|text| text.contains("## 1. This Week Summary")));
 
     // 2. 보관본 있음: 덮어쓰지 않음
     ctx.store
@@ -688,7 +689,7 @@ async fn scheduled_weekly_report_overwrites_but_if_missing_keeps_stored_copy() {
     // 3. 월요일 예약(Weekly): 덮어씀
     generate_scheduled_report(&ctx, ScheduledReport::Weekly(week_start)).await;
     let replaced = ctx.store.load_daily_report(&key).expect("조회");
-    assert!(replaced.is_some_and(|text| text.contains("## 1. 이번 주 요약")));
+    assert!(replaced.is_some_and(|text| text.contains("## 1. This Week Summary")));
 }
 
 // 11-2. 시작 시 지난주 리포트 생성 --------------------------------------------
@@ -717,7 +718,7 @@ async fn scheduler_writes_last_week_report_on_start_when_missing() {
 
     // 3. 본문 확인
     let markdown = stored.expect("지난주 리포트 생성");
-    assert!(markdown.contains(&format!("주간 에이전트 리포트 {key} (")));
+    assert!(markdown.contains(&format!("Weekly Agent Report {key} (")));
 }
 
 // 12. 관리 포트 주간 라우트 ---------------------------------------------------

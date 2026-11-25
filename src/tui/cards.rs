@@ -160,6 +160,8 @@ pub enum UiAction {
     TogglePin,
     ResetLayout,
     ToggleLanguage,
+    // 빌드 불일치 때만 동작: serve·TUI 를 최신 exe 로 다시 실행
+    ForceRestart,
     ReportPrev,
     ReportNext,
     ReportGenerate,

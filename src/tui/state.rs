@@ -27,6 +27,7 @@ use crate::tui::sort::{
     compare_tool_row, default_card_sorts, sort_rows, sort_spec,
 };
 use crate::tui::tab_move::TabDrag;
+use crate::tui::views::models::agent_rows;
 use crate::tui::views::projects::attribution_rows;
 use crate::tui::views::skills::skill_rows;
 use chrono::{DateTime, Duration as ChronoDuration, Local, NaiveDate, Utc};
@@ -283,7 +284,7 @@ pub struct Toast {
 pub enum UiMessage {
     Snapshot(Box<DashboardSnapshot>),
     Settings {
-        inventory: Panel<Inventory>,
+        inventory: Box<Panel<Inventory>>,
         doctor: Panel<Vec<DoctorFinding>>,
     },
     Report {
@@ -382,6 +383,8 @@ pub struct AppState {
     pub doctor: Panel<Vec<DoctorFinding>>,
     pub settings_requested: bool,
     pub should_quit: bool,
+    // 강제 재시작으로 끝냄 (터미널 복원 뒤 main 이 serve·TUI 를 최신 exe 로 재기동)
+    pub restart_requested: bool,
     // 프로젝트 탭 귀속 표가 보이는 차원 (d 키로 순환)
     pub attribution_dimension: AttributionDimension,
     // 리포트 탭 주간 보기 (기본은 일간), 선택한 주의 월요일 (기본은 이번 주)
@@ -432,6 +435,7 @@ impl AppState {
             doctor: Panel::Pending,
             settings_requested: false,
             should_quit: false,
+            restart_requested: false,
             attribution_dimension: ATTRIBUTION_DIMENSIONS[0],
             report_weekly: false,
             report_week: week_start_of(today),
@@ -557,6 +561,7 @@ impl AppState {
         match key.code {
             KeyCode::Char('q' | 'Q') | KeyCode::Esc => self.perform_action(UiAction::Quit),
             KeyCode::Char('?') => self.perform_action(UiAction::ShowHelp),
+            KeyCode::Char('!') => self.perform_action(UiAction::ForceRestart),
             KeyCode::BackTab => self.switch_tab(self.tab_order[(slot + TAB_COUNT - 1) % TAB_COUNT]),
             KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.switch_tab(self.tab_order[(slot + TAB_COUNT - 1) % TAB_COUNT])
@@ -686,6 +691,13 @@ impl AppState {
                 self.show_toast(i18n::text(self.lang, Msg::ToastLanguage), ToastLevel::Info);
                 UiCommand::SaveState
             }
+            // 빌드가 같으면 버튼이 없으므로 키도 무시
+            UiAction::ForceRestart if self.snapshot.serve_stale => {
+                self.restart_requested = true;
+                self.should_quit = true;
+                UiCommand::None
+            }
+            UiAction::ForceRestart => UiCommand::None,
             UiAction::ReportPrev => {
                 if self.report_weekly {
                     self.report_week -= ChronoDuration::days(7);
@@ -867,7 +879,7 @@ impl AppState {
                 }
             }
             UiMessage::Settings { inventory, doctor } => {
-                self.inventory = inventory;
+                self.inventory = *inventory;
                 self.doctor = doctor;
             }
             UiMessage::Report { date, body } => {
@@ -955,12 +967,9 @@ impl AppState {
                 Some(sorted.iter().map(|row| row.model.clone()).collect())
             }
             CardId::AgentTable => {
-                let Panel::Ready(agents) = &self.snapshot.agent_stats else {
-                    return None;
-                };
-                let mut sorted = agents.clone();
+                let mut sorted = agent_rows(&self.snapshot.agent_stats, &self.inventory)?;
                 sort_rows(&mut sorted, sort, compare_agent_row);
-                Some(sorted.iter().map(|row| row.agent.clone()).collect())
+                Some(sorted.into_iter().map(|row| row.agent).collect())
             }
             CardId::CacheBreaks => {
                 let Panel::Ready(breaks) = &self.snapshot.cache_breaks else {
@@ -1562,6 +1571,29 @@ mod tests {
         );
         interrupted.handle_key_event(ctrl_c);
         assert!(interrupted.should_quit);
+    }
+
+    #[test]
+    fn force_restart_quits_for_restart_only_when_serve_runs_another_build() {
+        // 같은 빌드면 ! 키와 버튼 동작 모두 무시
+        let mut state = sample_state();
+        assert_eq!(
+            state.handle_key_event(press(KeyCode::Char('!'))),
+            UiCommand::None
+        );
+        state.perform_action(UiAction::ForceRestart);
+        assert!(!state.should_quit && !state.restart_requested);
+
+        // 빌드 불일치면 재시작 표시와 함께 종료
+        state.snapshot.serve_stale = true;
+        state.handle_key_event(press(KeyCode::Char('!')));
+        assert!(state.should_quit && state.restart_requested);
+
+        // 일반 종료는 재시작 표시 없음
+        let mut quitting = sample_state();
+        quitting.snapshot.serve_stale = true;
+        quitting.handle_key_event(press(KeyCode::Char('q')));
+        assert!(quitting.should_quit && !quitting.restart_requested);
     }
 
     #[test]
@@ -2286,7 +2318,7 @@ mod tests {
         let toast = state.toast.take().unwrap();
         assert_eq!(
             toast.text,
-            "serve(pid 7)가 다른 빌드로 실행 중: serve 를 재시작해야 이 빌드로 수집함"
+            "serve(pid 7)가 다른 빌드로 실행 중: 하단 [!] 강제 재시작으로 최신 빌드 재실행"
         );
         assert_eq!(toast.level, ToastLevel::Error);
         assert_eq!(toast.expires_at, now + TOAST_LIFETIME);
@@ -2298,7 +2330,7 @@ mod tests {
         state.apply_ui_message(stale(8, true), now);
         assert_eq!(
             state.toast.as_ref().unwrap().text,
-            "serve (pid 8) runs another build: restart serve to collect with this build"
+            "serve (pid 8) runs another build: press [!] Force restart to rerun on the latest build"
         );
     }
 

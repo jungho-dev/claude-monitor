@@ -70,6 +70,9 @@ pub struct Inventory {
     pub hooks: Vec<HookEntry>,
     pub mcp_servers: Vec<McpEntry>,
     pub agents: Vec<AgentEntry>,
+    // Claude Code 내장 에이전트 이름 (정의 파일 없음, 끄는 env 변수 반영)
+    #[serde(default)]
+    pub builtin_agents: Vec<String>,
     pub skills: Vec<SkillEntry>,
     // 값 제외, 키 이름만
     pub env_keys: Vec<String>,

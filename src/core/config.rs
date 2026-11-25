@@ -87,8 +87,8 @@ pub struct ReportConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReportLanguage {
-    #[default]
     Ko,
+    #[default]
     En,
 }
 
@@ -194,7 +194,7 @@ impl Default for ReportConfig {
             enabled: true,
             dir: None,
             run_hour: 0,
-            language: ReportLanguage::Ko,
+            language: ReportLanguage::En,
         }
     }
 }
@@ -558,7 +558,7 @@ mod tests {
         let english: ConfigFile = toml::from_str("[report]\nlanguage = \"en\"").expect("en 파싱");
         assert_eq!(english.report.language, ReportLanguage::En);
         let default_file = ConfigFile::default();
-        assert_eq!(default_file.report.language, ReportLanguage::Ko);
+        assert_eq!(default_file.report.language, ReportLanguage::En);
         assert!(toml::from_str::<ConfigFile>("[report]\nlanguage = \"fr\"").is_err());
     }
 
