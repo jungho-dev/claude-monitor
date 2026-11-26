@@ -82,7 +82,7 @@ claude-monitor/
 │   │   └── tests.rs : index to aggregate to report flow, schedule time
 │   ├── inventory/
 │   │   ├── mod.rs : hook, MCP, agent, skill, and env-key inventory types, doctor entry
-│   │   ├── load.rs : read settings.json, .claude.json, agent and skill headers, no values
+│   │   ├── load.rs : read settings.json, plugin hooks.json, .claude.json, agent and skill headers, no values
 │   │   ├── doctor.rs : data directory, ports, relay target, hook registration, allowed URL, telemetry, gateway, projects folder checks
 │   │   └── tests.rs : inventory and doctor tests on fixture Claude homes
 │   ├── power/

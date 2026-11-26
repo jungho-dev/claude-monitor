@@ -260,7 +260,7 @@ fn check_hook_registration(
         findings.push(DoctorFinding {
             level: "warn".to_string(),
             topic: "hook-registration".to_string(),
-            message: format!("settings.json 에 cm 훅 포트 {hooks_port} 등록 없음"),
+            message: format!("settings.json · 플러그인 hooks.json 에 cm 훅 포트 {hooks_port} 등록 없음"),
             fix_hint: format!(
                 "settings.json hooks.PreToolUse 에서 ^Bash$ 항목 ({}/hook/pretool-guard) 을 다음 항목으로 교체 (onFailure block, timeout 10 유지): {snippet}",
                 config.hooks.relay_target.trim_end_matches('/')

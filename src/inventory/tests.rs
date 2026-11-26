@@ -334,6 +334,61 @@ fn inventory_command_target_keeps_only_script_name() {
     assert_eq!(inventory.hooks[1].target, "plain.exe");
 }
 
+// 13-1. 플러그인 hooks.json 훅 ------------------------------------------------
+#[test]
+fn inventory_reads_plugin_hooks_from_plugin_dirs() {
+    let home = temp_data_dir("plugin-hooks");
+    let _cleanup = TempDirGuard(home.clone());
+    let registered = home.join("plugins").join("registered");
+    let broken = home.join("plugins").join("broken");
+    let without_hooks = home.join("plugins").join("without-hooks");
+    fs::create_dir_all(registered.join("hooks")).expect("플러그인 폴더");
+    fs::create_dir_all(broken.join("hooks")).expect("플러그인 폴더");
+    fs::create_dir_all(&without_hooks).expect("플러그인 폴더");
+    fs::write(
+        registered.join("hooks").join("hooks.json"),
+        r#"{"hooks":{"PreToolUse":[{"matcher":"^Bash$","hooks":[{"type":"http","url":"http://127.0.0.1:47333/hook/pretool-chain?token=dummy-hook-secret","timeout":10,"onFailure":"block"}]}],"Stop":{"hooks":[]}}}"#,
+    )
+    .expect("hooks.json 쓰기");
+    fs::write(broken.join("hooks").join("hooks.json"), "{broken").expect("hooks.json 쓰기");
+    let plugin_dirs =
+        std::env::join_paths([&registered, &broken, &without_hooks]).expect("경로 목록");
+    let settings = serde_json::json!({
+        "env": { "CLAUDE_CODE_PLUGIN_DIRS": plugin_dirs.to_string_lossy() },
+        "hooks": { "SessionEnd": [{ "hooks": [{ "type": "command", "command": "bun C:/x/end.ts" }] }] },
+    });
+    fs::write(home.join("settings.json"), settings.to_string()).expect("설정 쓰기");
+
+    let inventory = load_inventory(&home).expect("적재");
+    assert_eq!(inventory.hooks.len(), 2);
+    assert_eq!(inventory.hooks[0].event, "SessionEnd");
+    assert_eq!(inventory.hooks[1].event, "PreToolUse");
+    assert_eq!(inventory.hooks[1].matcher, "^Bash$");
+    assert_eq!(
+        inventory.hooks[1].target,
+        "http://127.0.0.1:47333/hook/pretool-chain"
+    );
+    assert_eq!(inventory.hooks[1].on_failure, "block");
+    assert!(
+        inventory
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("hooks.Stop") && warning.contains("registered"))
+    );
+    assert!(
+        inventory
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("broken") && warning.contains("형식 오류"))
+    );
+    assert!(
+        !inventory
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("without-hooks"))
+    );
+}
+
 // 14. URL 대상 축약 -----------------------------------------------------------
 #[test]
 fn inventory_url_targets_drop_userinfo_query_and_fragment() {

@@ -104,8 +104,8 @@ const API_REQUEST_ADDED_COLUMNS: [(&str, &str); 4] = [
 // 기존 DB 에 덧붙이는 tool_calls 열 (Skill 도구의 스킬 이름)
 const TOOL_CALL_ADDED_COLUMNS: [(&str, &str); 1] = [("detail", "TEXT NOT NULL DEFAULT ''")];
 
-// OTLP 선점 도구 호출 행을 기록 출처로 승격하는 재색인을 마친 스키마 판 (PRAGMA user_version)
-const TOOL_CALL_PROMOTE_VERSION: i64 = 1;
+// 도구 호출 승격·이름 교정 재색인 판 (PRAGMA user_version)
+const TOOL_CALL_REINDEX_VERSION: i64 = 2;
 
 // 1. 색인 커서 ----------------------------------------------------------------
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -172,17 +172,18 @@ impl Store {
             }
         }
 
-        // OTLP 가 먼저 넣은 도구 호출 행이 있던 DB 는 한 번 재색인해 기록 출처로 승격
+        // OTLP 선점·가림 이름 행이 있던 DB 는 한 번 재색인
         let version: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version < TOOL_CALL_PROMOTE_VERSION {
-            let has_otlp_first: bool = tx.query_row(
-                "SELECT EXISTS (SELECT 1 FROM tool_calls WHERE source <> 'transcript')",
+        if version < TOOL_CALL_REINDEX_VERSION {
+            let has_stale_rows: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM tool_calls WHERE source <> 'transcript' \
+                 OR tool_name IN ('mcp_tool', 'skill_tool', 'dynamic_tool', 'other_tool'))",
                 [],
                 |row| row.get(0),
             )?;
-            added |= has_otlp_first;
+            added |= has_stale_rows;
             tx.execute_batch(&format!(
-                "PRAGMA user_version = {TOOL_CALL_PROMOTE_VERSION}"
+                "PRAGMA user_version = {TOOL_CALL_REINDEX_VERSION}"
             ))?;
         }
         if added {
@@ -299,7 +300,7 @@ impl Store {
         }
 
         // 2. 도구 호출 시작 (신규만 집계, 백필 재읽기는 비어 있던 스킬 이름만 채움)
-        // 같은 tool_use_id 를 OTLP 가 먼저 넣었으면 기록 행이 출처·에이전트를 넘겨받음
+        // 같은 tool_use_id 를 OTLP 가 먼저 넣었으면 기록 행이 출처·에이전트·도구 이름을 넘겨받음
         // (통계 조회는 transcript 출처만 읽으므로 승격하지 않으면 해당 호출이 빠짐)
         {
             let mut stmt = tx.prepare_cached(
@@ -311,8 +312,9 @@ impl Store {
             )?;
             let mut promote_stmt = tx.prepare_cached(
                 "UPDATE tool_calls SET source = ?2, agent = ?3, \
-                 session_id = CASE WHEN session_id = '' THEN ?4 ELSE session_id END \
-                 WHERE tool_use_id = ?1 AND source <> ?2",
+                 session_id = CASE WHEN session_id = '' THEN ?4 ELSE session_id END, \
+                 tool_name = ?5 \
+                 WHERE tool_use_id = ?1 AND (source <> ?2 OR tool_name <> ?5)",
             )?;
             for row in &batch.tool_calls {
                 let inserted = stmt.execute(params![
@@ -337,6 +339,7 @@ impl Store {
                         row.source.as_str(),
                         row.agent,
                         row.session_id,
+                        row.tool_name,
                     ])?;
                 }
             }
@@ -1130,6 +1133,84 @@ mod tests {
                 Some(6)
             )
         );
+        drop(store);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // 13. 가림 도구 이름 교정 -------------------------------------------------
+    #[test]
+    fn transcript_tool_call_replaces_redacted_name_and_old_db_plants_backfill() {
+        // 1. OTLP 가림 이름 적재 후 기록 행으로 승격
+        let dir = unique_temp_dir("store-tool-rename");
+        let db_path = dir.join("rename.db");
+        let store = Store::open_store(&db_path).expect("저장소 열기");
+        let otlp_row = ToolCallRow {
+            source: DataSource::Otlp,
+            tool_use_id: "toolu_M".to_string(),
+            ts: "2026-11-26T01:00:00.000Z".to_string(),
+            session_id: "sess-m".to_string(),
+            tool_name: "mcp_tool".to_string(),
+            ..ToolCallRow::default()
+        };
+        let transcript_row = ToolCallRow {
+            source: DataSource::Transcript,
+            agent: "main".to_string(),
+            tool_name: "mcp__rust-fs-mcp__file-read".to_string(),
+            ..otlp_row.clone()
+        };
+        store
+            .insert_batch(&IngestBatch {
+                tool_calls: vec![otlp_row, transcript_row.clone()],
+                ..IngestBatch::default()
+            })
+            .expect("적재");
+        let read_name = |store: &Store| -> (String, String) {
+            store
+                .with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT source, tool_name FROM tool_calls WHERE tool_use_id = 'toolu_M'",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                })
+                .expect("저장값 조회")
+        };
+        let expected = (
+            "transcript".to_string(),
+            "mcp__rust-fs-mcp__file-read".to_string(),
+        );
+        assert_eq!(read_name(&store), expected);
+
+        // 2. 이미 승격된 가림 이름 행: 재색인 시 이름만 교정
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "UPDATE tool_calls SET tool_name = 'mcp_tool' WHERE tool_use_id = 'toolu_M'",
+                )
+            })
+            .expect("가림 이름 되돌림");
+        store
+            .insert_batch(&IngestBatch {
+                tool_calls: vec![transcript_row],
+                ..IngestBatch::default()
+            })
+            .expect("재색인 적재");
+        assert_eq!(read_name(&store), expected);
+
+        // 3. 이전 판 DB 의 가림 이름 행은 백필 표식을 한 번 심음
+        store
+            .with_conn(|conn| {
+                conn.execute_batch(
+                    "UPDATE tool_calls SET tool_name = 'mcp_tool'; PRAGMA user_version = 1",
+                )
+            })
+            .expect("이전 판 흉내");
+        drop(store);
+        let store = Store::open_store(&db_path).expect("이전 판 열기");
+        assert!(store.consume_index_backfill().expect("표식 소비"));
+        drop(store);
+        let store = Store::open_store(&db_path).expect("재열기");
+        assert!(!store.consume_index_backfill().expect("두 번째 소비"));
         drop(store);
         std::fs::remove_dir_all(&dir).ok();
     }

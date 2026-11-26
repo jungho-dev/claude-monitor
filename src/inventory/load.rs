@@ -1,10 +1,11 @@
 //! inventory/load.rs
-//! Claude 홈 설정 읽기: settings.json 훅·env 키, .claude.json MCP, 에이전트·스킬 머리글 (값 제외).
+//! Claude 홈 설정 읽기: settings.json 훅·env 키, 플러그인 hooks.json 훅, .claude.json MCP, 에이전트·스킬 머리글 (값 제외).
 
 use super::{AgentEntry, HookEntry, Inventory, McpEntry, SkillEntry};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 const SCRIPT_EXTENSIONS: [&str; 9] = [
@@ -15,6 +16,8 @@ const SCRIPT_EXTENSIONS: [&str; 9] = [
 const BUILTIN_AGENTS: [&str; 3] = ["general-purpose", "statusline-setup", "claude-code-guide"];
 const EXPLORE_PLAN_AGENTS: [&str; 2] = ["Explore", "Plan"];
 const DISABLE_EXPLORE_PLAN_KEY: &str = "CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS";
+// 훅 등록을 담은 로컬 플러그인 폴더 목록 (settings.json env, OS 경로 구분자)
+const PLUGIN_DIRS_KEY: &str = "CLAUDE_CODE_PLUGIN_DIRS";
 
 // 1. 설정 목록 읽기 -----------------------------------------------------------
 pub fn read_inventory(claude_home: &Path) -> anyhow::Result<Inventory> {
@@ -35,7 +38,7 @@ pub fn read_inventory(claude_home: &Path) -> anyhow::Result<Inventory> {
 }
 
 // 2. settings.json 읽기 -------------------------------------------------------
-// 훅 목록, env 키 이름, 허용 URL 을 채우고 차단된 MCP 서버 이름 반환
+// 훅 목록(플러그인 hooks.json 포함), env 키 이름, 허용 URL 을 채우고 차단된 MCP 서버 이름 반환
 fn read_settings_file(claude_home: &Path, inventory: &mut Inventory) -> Vec<String> {
     // 1. 파일 해석
     let path = claude_home.join("settings.json");
@@ -60,62 +63,7 @@ fn read_settings_file(claude_home: &Path, inventory: &mut Inventory) -> Vec<Stri
 
     // 2. 훅 등록
     if let Some(Value::Object(events)) = root.get("hooks") {
-        for (event, groups) in events {
-            let Some(groups) = groups.as_array() else {
-                inventory
-                    .warnings
-                    .push(format!("hooks.{event} 형식 오류 (배열 아님)"));
-                continue;
-            };
-            for group in groups {
-                let matcher = group.get("matcher").and_then(Value::as_str).unwrap_or("");
-                let hooks = group.get("hooks").and_then(Value::as_array);
-                for hook in hooks.into_iter().flatten() {
-                    let hook_type = hook.get("type").and_then(Value::as_str).unwrap_or("");
-                    let target = match hook_type {
-                        "http" => {
-                            let url = hook.get("url").and_then(Value::as_str).unwrap_or("");
-                            redact_url_target(url, true)
-                        }
-                        "command" => {
-                            let command = hook.get("command").and_then(Value::as_str).unwrap_or("");
-                            let args: Vec<String> = hook
-                                .get("args")
-                                .and_then(Value::as_array)
-                                .into_iter()
-                                .flatten()
-                                .filter_map(|arg| arg.as_str().map(str::to_string))
-                                .collect();
-                            describe_command_target(command, &args)
-                        }
-                        _ => String::new(),
-                    };
-                    let timeout = hook.get("timeout");
-                    inventory.hooks.push(HookEntry {
-                        event: event.clone(),
-                        matcher: matcher.to_string(),
-                        if_condition: hook
-                            .get("if")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                        hook_type: hook_type.to_string(),
-                        target,
-                        is_async: hook.get("async").and_then(Value::as_bool).unwrap_or(false),
-                        timeout_secs: timeout.and_then(|value| {
-                            value
-                                .as_u64()
-                                .or_else(|| value.as_f64().map(|secs| secs as u64))
-                        }),
-                        on_failure: hook
-                            .get("onFailure")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                    });
-                }
-            }
-        }
+        push_hook_events(events, "", inventory);
     }
 
     // 3. env 키 이름 (값 제외), Explore·Plan 끄기 변수가 켜져 있으면 내장 목록에서 뺀
@@ -154,10 +102,108 @@ fn read_settings_file(claude_home: &Path, inventory: &mut Inventory) -> Vec<Stri
             }
         }
     }
+
+    // 6. 플러그인 hooks.json (settings.json env 의 CLAUDE_CODE_PLUGIN_DIRS 만 읽고 cm 프로세스 env 는 쓰지 않음)
+    // hooks.json 이 없는 플러그인은 훅이 없는 정상 상태라 경고 없이 건너뜀
+    let plugin_dirs = root
+        .get("env")
+        .and_then(|env| env.get(PLUGIN_DIRS_KEY))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    for plugin_dir in std::env::split_paths(plugin_dirs) {
+        if plugin_dir.as_os_str().is_empty() {
+            continue;
+        }
+        let hooks_path = plugin_dir.join("hooks").join("hooks.json");
+        let text = match fs::read_to_string(&hooks_path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => {
+                inventory
+                    .warnings
+                    .push(format!("{} 읽기 실패: {err}", hooks_path.display()));
+                continue;
+            }
+        };
+        let plugin_root: Value = match serde_json::from_str(text.trim_start_matches('\u{feff}')) {
+            Ok(plugin_root) => plugin_root,
+            Err(err) => {
+                inventory
+                    .warnings
+                    .push(format!("{} 형식 오류: {err}", hooks_path.display()));
+                continue;
+            }
+        };
+        if let Some(Value::Object(events)) = plugin_root.get("hooks") {
+            let source = format!("{} ", hooks_path.display());
+            push_hook_events(events, &source, inventory);
+        }
+    }
     denied
 }
 
-// 3. 명령 대상 요약 -----------------------------------------------------------
+// 3. 훅 등록 해석 -------------------------------------------------------------
+/// `hooks` 객체의 이벤트별 항목을 목록에 추가 (`source` 는 경고 앞에 붙는 출처, settings.json 은 빈 문자열).
+fn push_hook_events(events: &Map<String, Value>, source: &str, inventory: &mut Inventory) {
+    for (event, groups) in events {
+        let Some(groups) = groups.as_array() else {
+            inventory
+                .warnings
+                .push(format!("{source}hooks.{event} 형식 오류 (배열 아님)"));
+            continue;
+        };
+        for group in groups {
+            let matcher = group.get("matcher").and_then(Value::as_str).unwrap_or("");
+            let hooks = group.get("hooks").and_then(Value::as_array);
+            for hook in hooks.into_iter().flatten() {
+                let hook_type = hook.get("type").and_then(Value::as_str).unwrap_or("");
+                let target = match hook_type {
+                    "http" => {
+                        let url = hook.get("url").and_then(Value::as_str).unwrap_or("");
+                        redact_url_target(url, true)
+                    }
+                    "command" => {
+                        let command = hook.get("command").and_then(Value::as_str).unwrap_or("");
+                        let args: Vec<String> = hook
+                            .get("args")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|arg| arg.as_str().map(str::to_string))
+                            .collect();
+                        describe_command_target(command, &args)
+                    }
+                    _ => String::new(),
+                };
+                let timeout = hook.get("timeout");
+                inventory.hooks.push(HookEntry {
+                    event: event.clone(),
+                    matcher: matcher.to_string(),
+                    if_condition: hook
+                        .get("if")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    hook_type: hook_type.to_string(),
+                    target,
+                    is_async: hook.get("async").and_then(Value::as_bool).unwrap_or(false),
+                    timeout_secs: timeout.and_then(|value| {
+                        value
+                            .as_u64()
+                            .or_else(|| value.as_f64().map(|secs| secs as u64))
+                    }),
+                    on_failure: hook
+                        .get("onFailure")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                });
+            }
+        }
+    }
+}
+
+// 4. 명령 대상 요약 -----------------------------------------------------------
 /// 실행 파일 이름과 첫 스크립트 파일 이름만 남김 (그 외 인자 값 제외).
 fn describe_command_target(command: &str, args: &[String]) -> String {
     // 1. 실행 파일과 인자 후보 분리
@@ -187,7 +233,7 @@ fn describe_command_target(command: &str, args: &[String]) -> String {
     program_name
 }
 
-// 4. URL 표시 대상 축약 -------------------------------------------------------
+// 5. URL 표시 대상 축약 -------------------------------------------------------
 /// userinfo·질의·조각을 제거하고 `scheme://host[:port]` 만 남김 (`keep_path` 면 경로 유지).
 fn redact_url_target(url: &str, keep_path: bool) -> String {
     // 1. 스킴 분리
@@ -211,7 +257,7 @@ fn redact_url_target(url: &str, keep_path: bool) -> String {
     format!("{scheme_prefix}{host_port}{path}")
 }
 
-// 5. MCP 서버 읽기 ------------------------------------------------------------
+// 6. MCP 서버 읽기 ------------------------------------------------------------
 fn read_mcp_servers(claude_home: &Path, denied: &[String], inventory: &mut Inventory) {
     // 1. 파일 탐색 (홈 아래 우선, 없으면 상위 폴더)
     let mut candidates: Vec<PathBuf> = vec![claude_home.join(".claude.json")];
@@ -269,7 +315,7 @@ fn read_mcp_servers(claude_home: &Path, denied: &[String], inventory: &mut Inven
     append_denied_only(denied, &seen, inventory);
 }
 
-// 6. 차단 전용 서버 추가 ------------------------------------------------------
+// 7. 차단 전용 서버 추가 ------------------------------------------------------
 fn append_denied_only(denied: &[String], seen: &BTreeSet<String>, inventory: &mut Inventory) {
     for name in denied {
         if !seen.contains(name) {
@@ -283,7 +329,7 @@ fn append_denied_only(denied: &[String], seen: &BTreeSet<String>, inventory: &mu
     }
 }
 
-// 7. 에이전트 읽기 ------------------------------------------------------------
+// 8. 에이전트 읽기 ------------------------------------------------------------
 fn read_agent_files(claude_home: &Path, inventory: &mut Inventory) {
     let dir = claude_home.join("agents");
     let Ok(entries) = fs::read_dir(&dir) else {
@@ -323,7 +369,7 @@ fn read_agent_files(claude_home: &Path, inventory: &mut Inventory) {
         .sort_by(|left, right| left.name.cmp(&right.name));
 }
 
-// 8. 스킬 읽기 ----------------------------------------------------------------
+// 9. 스킬 읽기 ----------------------------------------------------------------
 fn read_skill_files(claude_home: &Path, inventory: &mut Inventory) {
     let dir = claude_home.join("skills");
     let Ok(entries) = fs::read_dir(&dir) else {
@@ -359,7 +405,7 @@ fn read_skill_files(claude_home: &Path, inventory: &mut Inventory) {
         .sort_by(|left, right| left.name.cmp(&right.name));
 }
 
-// 9. 머리글 해석 --------------------------------------------------------------
+// 10. 머리글 해석 -------------------------------------------------------------
 /// `---` 사이 `key: value` 줄을 읽음 (따옴표 제거, 들여쓴 이어짐 줄은 공백으로 이음).
 fn parse_frontmatter(text: &str) -> HashMap<String, String> {
     let mut fields: HashMap<String, String> = HashMap::new();

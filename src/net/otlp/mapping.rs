@@ -279,13 +279,25 @@ fn map_api_request(fields: &EventFields) -> ApiRequestRow {
 fn map_tool_result(fields: &EventFields) -> Option<ToolCallRow> {
     let attrs = &fields.attrs;
     let tool_use_id = attrs.get("tool_use_id").filter(|text| !text.is_empty())?;
+
+    // MCP 실제 이름 복원 (파싱 실패 시 가림 이름)
+    let raw_name = attrs.get("tool_name").cloned().unwrap_or_default();
+    let mcp_params: Option<Value> = attrs
+        .get("tool_parameters")
+        .filter(|_| raw_name == "mcp_tool")
+        .and_then(|text| serde_json::from_str(text).ok());
+    let mcp_name = mcp_params.as_ref().and_then(|params| {
+        let server = params.get("mcp_server_name")?.as_str()?;
+        let tool = params.get("mcp_tool_name")?.as_str()?;
+        Some(format!("mcp__{server}__{tool}"))
+    });
     Some(ToolCallRow {
         source: DataSource::Otlp,
         tool_use_id: tool_use_id.clone(),
         ts: fields.ts.clone(),
         session_id: fields.session_id.clone(),
         agent: attrs.get("agent.name").cloned().unwrap_or_default(),
-        tool_name: attrs.get("tool_name").cloned().unwrap_or_default(),
+        tool_name: mcp_name.unwrap_or(raw_name),
         duration_ms: read_i64_attr(attrs, "duration_ms"),
         is_error: attrs.get("success").map(String::as_str) == Some("false"),
         error_kind: attrs.get("error_type").cloned().unwrap_or_default(),

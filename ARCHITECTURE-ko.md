@@ -82,7 +82,7 @@ claude-monitor/
 │   │   └── tests.rs : 색인, 집계, 리포트 흐름과 예약 시각
 │   ├── inventory/
 │   │   ├── mod.rs : 훅·MCP·에이전트·스킬·env 키 목록 형태, doctor 진입
-│   │   ├── load.rs : settings.json, .claude.json, 에이전트·스킬 머리글 읽기, 값 제외
+│   │   ├── load.rs : settings.json, 플러그인 hooks.json, .claude.json, 에이전트·스킬 머리글 읽기, 값 제외
 │   │   ├── doctor.rs : 데이터 폴더, 포트, 중계 대상, 훅 등록, 허용 URL, 텔레메트리, 게이트웨이, projects 폴더 점검
 │   │   └── tests.rs : fixture Claude 홈을 쓴 목록·진단 테스트
 │   ├── power/

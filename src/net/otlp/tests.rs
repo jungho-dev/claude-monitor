@@ -1167,3 +1167,63 @@ async fn otlp_server_stores_and_emits_otel_events() {
     server.abort();
     let _ = server.await;
 }
+
+// 17. MCP 가림 이름 복원 ------------------------------------------------------
+#[test]
+fn map_logs_payload_restores_mcp_tool_name() {
+    // 1. tool_parameters 있음·없음·깨짐
+    let records = vec![
+        otel_record(
+            "sess-m",
+            "tool_result",
+            1,
+            "2026-11-26T01:00:00Z",
+            vec![
+                text_attr("tool_use_id", "toolu_M1"),
+                text_attr("tool_name", "mcp_tool"),
+                text_attr(
+                    "tool_parameters",
+                    r#"{"mcp_server_name":"rust-fs-mcp","mcp_tool_name":"file-read"}"#,
+                ),
+            ],
+        ),
+        otel_record(
+            "sess-m",
+            "tool_result",
+            2,
+            "2026-11-26T01:00:01Z",
+            vec![
+                text_attr("tool_use_id", "toolu_M2"),
+                text_attr("tool_name", "mcp_tool"),
+            ],
+        ),
+        otel_record(
+            "sess-m",
+            "tool_result",
+            3,
+            "2026-11-26T01:00:02Z",
+            vec![
+                text_attr("tool_use_id", "toolu_M3"),
+                text_attr("tool_name", "mcp_tool"),
+                text_attr("tool_parameters", "{broken"),
+            ],
+        ),
+    ];
+    let envelope = json!({
+        "resourceLogs": [{ "scopeLogs": [{ "logRecords": records }] }]
+    });
+    let payload = serde_json::to_vec(&envelope).expect("직렬화");
+
+    // 2. 실제 이름 조립, 없거나 깨지면 가림 이름 유지
+    let mapping = map_logs_payload(&payload).expect("변환");
+    let names: Vec<&str> = mapping
+        .batch
+        .tool_calls
+        .iter()
+        .map(|row| row.tool_name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        ["mcp__rust-fs-mcp__file-read", "mcp_tool", "mcp_tool"]
+    );
+}
