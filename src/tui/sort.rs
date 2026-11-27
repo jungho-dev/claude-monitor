@@ -134,6 +134,8 @@ pub fn sort_spec(card: CardId) -> Option<SortSpec> {
                 SortKind::Number,
                 SortKind::Number,
                 SortKind::Number,
+                SortKind::Number,
+                SortKind::Number,
             ],
             default: SortState {
                 column: 5,
@@ -150,6 +152,7 @@ pub fn sort_spec(card: CardId) -> Option<SortSpec> {
                 SortKind::Number,
                 SortKind::Number,
                 SortKind::Number,
+                SortKind::Number,
             ],
             default: SortState {
                 column: 4,
@@ -159,6 +162,7 @@ pub fn sort_spec(card: CardId) -> Option<SortSpec> {
         CardId::ModelTable => SortSpec {
             kinds: &[
                 SortKind::Text,
+                SortKind::Number,
                 SortKind::Number,
                 SortKind::Number,
                 SortKind::Number,
@@ -263,6 +267,8 @@ pub fn sort_spec(card: CardId) -> Option<SortSpec> {
                 SortKind::Number,
                 SortKind::Number,
                 SortKind::Number,
+                SortKind::Number,
+                SortKind::Number,
             ],
             default: SortState {
                 column: 9,
@@ -291,6 +297,8 @@ pub fn sort_spec(card: CardId) -> Option<SortSpec> {
                 SortKind::Number,
                 SortKind::Number,
                 SortKind::Text,
+                SortKind::Number,
+                SortKind::Number,
                 SortKind::Number,
                 SortKind::Number,
                 SortKind::Number,
@@ -339,13 +347,22 @@ pub fn compare_display_text(left: &str, right: &str) -> Ordering {
 // 4. 열별 비교 (타입별) -------------------------------------------------------
 // 숫자·시간은 값 비교, 없는 값은 가장 작게, 문자열은 표시 문자열 기준
 pub fn compare_tool_row(left: &ToolLatencyRow, right: &ToolLatencyRow, column: usize) -> Ordering {
+    // 오류율 (호출 0 이면 0)
+    let error_rate = |row: &ToolLatencyRow| {
+        if row.calls == 0 {
+            return 0.0;
+        }
+        row.errors as f64 / row.calls as f64
+    };
     match column {
         0 => compare_display_text(&short_tool(&left.tool_name), &short_tool(&right.tool_name)),
         1 => left.calls.cmp(&right.calls),
         2 => left.errors.cmp(&right.errors),
-        3 => left.p50_ms.cmp(&right.p50_ms),
-        4 => left.p90_ms.cmp(&right.p90_ms),
+        3 => left.avg_ms.cmp(&right.avg_ms),
+        4 => left.max_ms.cmp(&right.max_ms),
         5 => left.total_ms.cmp(&right.total_ms),
+        6 => error_rate(left).total_cmp(&error_rate(right)),
+        7 => left.total_ms.cmp(&right.total_ms),
         _ => Ordering::Equal,
     }
 }
@@ -368,14 +385,26 @@ pub fn compare_hook_row(left: &HookStatRow, right: &HookStatRow, column: usize) 
         2 => outcome_rank(&left.outcome).cmp(&outcome_rank(&right.outcome)),
         3 => compare_display_text(&left.detail, &right.detail),
         4 => left.count.cmp(&right.count),
-        5 => left.p50_ms.cmp(&right.p50_ms),
-        6 => left.p90_ms.cmp(&right.p90_ms),
+        5 => left.avg_ms.cmp(&right.avg_ms),
+        6 => left.total_ms.cmp(&right.total_ms),
         7 => left.saved_ms.cmp(&right.saved_ms),
+        8 => left.count.cmp(&right.count),
         _ => Ordering::Equal,
     }
 }
 
 pub fn compare_model_row(left: &ModelStatsRow, right: &ModelStatsRow, column: usize) -> Ordering {
+    // 요청당 토큰 (입력 + 출력 + 캐시 읽기 + 캐시 생성, 요청 0 이면 0)
+    let tokens_per_request = |row: &ModelStatsRow| {
+        if row.requests == 0 {
+            return 0.0;
+        }
+        let tokens = row.input_tokens
+            + row.output_tokens
+            + row.cache_read_tokens
+            + row.cache_creation_tokens;
+        tokens as f64 / row.requests as f64
+    };
     match column {
         0 => compare_display_text(short_model(&left.model), short_model(&right.model)),
         1 => left.requests.cmp(&right.requests),
@@ -386,10 +415,11 @@ pub fn compare_model_row(left: &ModelStatsRow, right: &ModelStatsRow, column: us
         6 => left.cache_read_tokens.cmp(&right.cache_read_tokens),
         7 => left.cache_creation_tokens.cmp(&right.cache_creation_tokens),
         8 => left.cache_hit_ratio.total_cmp(&right.cache_hit_ratio),
-        9 => left.wait_p50_ms.cmp(&right.wait_p50_ms),
-        10 => left.wait_p90_ms.cmp(&right.wait_p90_ms),
+        9 => left.wait_avg_ms.cmp(&right.wait_avg_ms),
+        10 => left.wait_total_ms.cmp(&right.wait_total_ms),
         11 => left.cost_usd_estimate.total_cmp(&right.cost_usd_estimate),
         12 => left.last_ts.cmp(&right.last_ts),
+        13 => tokens_per_request(left).total_cmp(&tokens_per_request(right)),
         _ => Ordering::Equal,
     }
 }
@@ -404,8 +434,8 @@ pub fn compare_agent_row(left: &AgentStatsRow, right: &AgentStatsRow, column: us
         5 => left.output_tokens.cmp(&right.output_tokens),
         6 => left.cache_read_tokens.cmp(&right.cache_read_tokens),
         7 => left.cost_usd_estimate.total_cmp(&right.cost_usd_estimate),
-        8 => left.wait_p50_ms.cmp(&right.wait_p50_ms),
-        9 => left.wait_p90_ms.cmp(&right.wait_p90_ms),
+        8 => left.wait_avg_ms.cmp(&right.wait_avg_ms),
+        9 => left.wait_total_ms.cmp(&right.wait_total_ms),
         10 => left.tool_calls.cmp(&right.tool_calls),
         11 => left.tool_errors.cmp(&right.tool_errors),
         12 => compare_display_text(short_model(&left.top_model), short_model(&right.top_model)),
@@ -433,12 +463,24 @@ pub fn compare_cache_break_row(
     }
 }
 
-// 프로젝트 열: 프로젝트, 브랜치, 요청, 세션, 입력, 출력, 캐시읽기, 캐시생성 5분, 캐시생성 1시간, 비용, 최근
+// 프로젝트 열: 프로젝트, 브랜치, 요청, 세션, 입력, 출력, 캐시읽기, 캐시생성 5분, 캐시생성 1시간, 비용, 최근, 대기 합계, 요청당 토큰
 pub fn compare_project_row(
     left: &ProjectStatsRow,
     right: &ProjectStatsRow,
     column: usize,
 ) -> Ordering {
+    // 요청당 토큰 (입력 + 출력 + 캐시 읽기 + 캐시 생성 5분·1시간, 요청 0 이면 0)
+    let tokens_per_request = |row: &ProjectStatsRow| {
+        if row.requests == 0 {
+            return 0.0;
+        }
+        let tokens = row.input_tokens
+            + row.output_tokens
+            + row.cache_read_tokens
+            + row.cache_creation_5m_tokens
+            + row.cache_creation_1h_tokens;
+        tokens as f64 / row.requests as f64
+    };
     match column {
         0 => compare_display_text(&left.project, &right.project),
         1 => compare_display_text(&left.git_branch, &right.git_branch),
@@ -455,6 +497,8 @@ pub fn compare_project_row(
             .cmp(&right.cache_creation_1h_tokens),
         9 => left.cost_usd_estimate.total_cmp(&right.cost_usd_estimate),
         10 => left.last_ts.cmp(&right.last_ts),
+        11 => left.wait_total_ms.cmp(&right.wait_total_ms),
+        12 => tokens_per_request(left).total_cmp(&tokens_per_request(right)),
         _ => Ordering::Equal,
     }
 }
@@ -476,7 +520,7 @@ pub fn compare_attribution_row(
     }
 }
 
-// 스킬 열: 이름, 설치, 호출, 오류, 세션, 주 호출, 비용(OTel), 설명 길이, 최근
+// 스킬 열: 이름, 설치, 호출, 오류, 세션, 주 호출, 비용(OTel), 설명 길이, 최근, 입력(OTel), 출력(OTel)
 pub fn compare_skill_row(left: &SkillRow, right: &SkillRow, column: usize) -> Ordering {
     match column {
         0 => compare_display_text(&left.name, &right.name),
@@ -491,6 +535,8 @@ pub fn compare_skill_row(left: &SkillRow, right: &SkillRow, column: usize) -> Or
             .total_cmp(&right.cost_usd.unwrap_or(-1.0)),
         7 => left.description_chars.cmp(&right.description_chars),
         8 => left.last_ts.cmp(&right.last_ts),
+        9 => left.input_tokens.cmp(&right.input_tokens),
+        10 => left.output_tokens.cmp(&right.output_tokens),
         _ => Ordering::Equal,
     }
 }
@@ -595,11 +641,11 @@ pub fn compare_doctor_finding(
 mod tests {
     use super::*;
 
-    fn tool_row(name: &str, calls: u64, p50: Option<i64>) -> ToolLatencyRow {
+    fn tool_row(name: &str, calls: u64, avg: Option<i64>) -> ToolLatencyRow {
         ToolLatencyRow {
             tool_name: name.to_string(),
             calls,
-            p50_ms: p50,
+            avg_ms: avg,
             ..ToolLatencyRow::default()
         }
     }
@@ -626,6 +672,8 @@ mod tests {
                 (3, true),
                 (4, true),
                 (5, true),
+                (6, true),
+                (7, true),
                 (0, false),
                 (1, true)
             ]
@@ -858,14 +906,14 @@ mod tests {
         let low = ModelStatsRow {
             model: "claude-b".to_string(),
             cost_usd_estimate: 1.5,
-            wait_p50_ms: None,
+            wait_avg_ms: None,
             cache_hit_ratio: 0.2,
             ..ModelStatsRow::default()
         };
         let high = ModelStatsRow {
             model: "claude-A".to_string(),
             cost_usd_estimate: 12.0,
-            wait_p50_ms: Some(300),
+            wait_avg_ms: Some(300),
             cache_hit_ratio: 0.9,
             ..ModelStatsRow::default()
         };
@@ -898,6 +946,167 @@ mod tests {
         };
         assert_eq!(compare_agent_row(&first, &second, 10), Ordering::Less);
         assert_eq!(compare_agent_row(&first, &second, 0), Ordering::Less);
+    }
+
+    #[test]
+    fn replaced_and_appended_columns_order_by_their_fields() {
+        // 1. 도구: 평균, 최대, 오류율, 시간 비중 (호출 0 은 오류율 0)
+        let tool_low = ToolLatencyRow {
+            calls: 10,
+            errors: 1,
+            avg_ms: Some(5),
+            max_ms: None,
+            total_ms: 50,
+            ..ToolLatencyRow::default()
+        };
+        let tool_high = ToolLatencyRow {
+            calls: 4,
+            errors: 2,
+            avg_ms: Some(90),
+            max_ms: Some(400),
+            total_ms: 360,
+            ..ToolLatencyRow::default()
+        };
+        for column in [3, 4, 6, 7] {
+            assert_eq!(
+                compare_tool_row(&tool_low, &tool_high, column),
+                Ordering::Less,
+                "tool {column}"
+            );
+        }
+        let tool_idle = ToolLatencyRow::default();
+        assert_eq!(compare_tool_row(&tool_idle, &tool_low, 6), Ordering::Less);
+
+        // 2. 훅: 평균, 합계, 절약, 건수 비중
+        let hook_low = HookStatRow {
+            count: 1,
+            avg_ms: None,
+            total_ms: 10,
+            saved_ms: 0,
+            ..HookStatRow::default()
+        };
+        let hook_high = HookStatRow {
+            count: 7,
+            avg_ms: Some(30),
+            total_ms: 210,
+            saved_ms: 500,
+            ..HookStatRow::default()
+        };
+        for column in [5, 6, 7, 8] {
+            assert_eq!(
+                compare_hook_row(&hook_low, &hook_high, column),
+                Ordering::Less,
+                "hook {column}"
+            );
+        }
+
+        // 3. 모델: 평균 대기, 대기 합계, 요청당 토큰 (요청 0 은 0)
+        let model_low = ModelStatsRow {
+            requests: 10,
+            input_tokens: 100,
+            output_tokens: 100,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            wait_avg_ms: Some(100),
+            wait_total_ms: 1_000,
+            ..ModelStatsRow::default()
+        };
+        let model_high = ModelStatsRow {
+            requests: 2,
+            input_tokens: 10,
+            output_tokens: 10,
+            cache_read_tokens: 500,
+            cache_creation_tokens: 80,
+            wait_avg_ms: Some(900),
+            wait_total_ms: 1_800,
+            ..ModelStatsRow::default()
+        };
+        for column in [9, 10, 13] {
+            assert_eq!(
+                compare_model_row(&model_low, &model_high, column),
+                Ordering::Less,
+                "model {column}"
+            );
+        }
+        assert_eq!(
+            compare_model_row(&ModelStatsRow::default(), &model_low, 13),
+            Ordering::Less
+        );
+
+        // 4. 에이전트: 평균 대기, 대기 합계
+        let agent_low = AgentStatsRow {
+            wait_avg_ms: None,
+            wait_total_ms: 0,
+            ..AgentStatsRow::default()
+        };
+        let agent_high = AgentStatsRow {
+            wait_avg_ms: Some(40),
+            wait_total_ms: 400,
+            ..AgentStatsRow::default()
+        };
+        for column in [8, 9] {
+            assert_eq!(
+                compare_agent_row(&agent_low, &agent_high, column),
+                Ordering::Less,
+                "agent {column}"
+            );
+        }
+
+        // 5. 프로젝트: 대기 합계, 요청당 토큰 (캐시 생성 5분·1시간 포함)
+        let project_low = ProjectStatsRow {
+            requests: 4,
+            input_tokens: 40,
+            output_tokens: 40,
+            wait_total_ms: 200,
+            ..ProjectStatsRow::default()
+        };
+        let project_high = ProjectStatsRow {
+            requests: 1,
+            input_tokens: 10,
+            output_tokens: 10,
+            cache_creation_5m_tokens: 5,
+            cache_creation_1h_tokens: 5,
+            wait_total_ms: 900,
+            ..ProjectStatsRow::default()
+        };
+        for column in [11, 12] {
+            assert_eq!(
+                compare_project_row(&project_low, &project_high, column),
+                Ordering::Less,
+                "project {column}"
+            );
+        }
+
+        // 6. 스킬: OTel 입력, OTel 출력
+        let skill_low = SkillRow {
+            input_tokens: None,
+            output_tokens: Some(5),
+            ..SkillRow::default()
+        };
+        let skill_high = SkillRow {
+            input_tokens: Some(300),
+            output_tokens: Some(70),
+            ..SkillRow::default()
+        };
+        for column in [9, 10] {
+            assert_eq!(
+                compare_skill_row(&skill_low, &skill_high, column),
+                Ordering::Less,
+                "skill {column}"
+            );
+        }
+
+        // 7. 열 개수 (도구 8, 훅 9, 모델 14, 에이전트 14, 프로젝트 13, 스킬 11)
+        for (card, count) in [
+            (CardId::ToolTable, 8),
+            (CardId::HookTable, 9),
+            (CardId::ModelTable, 14),
+            (CardId::AgentTable, 14),
+            (CardId::ProjectTable, 13),
+            (CardId::SkillTable, 11),
+        ] {
+            assert_eq!(sort_spec(card).unwrap().kinds.len(), count, "{card:?}");
+        }
     }
 
     #[test]

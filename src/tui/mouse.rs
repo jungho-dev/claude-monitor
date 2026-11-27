@@ -5,7 +5,7 @@ use crate::tui::cards::{
     CardPress, ColumnDrag, MAX_TABLE_COLUMNS, ScrollDrag, scroll_for_thumb, scroll_thumb,
 };
 use crate::tui::i18n::{self, Msg};
-use crate::tui::layout::{SplitAxis, SplitDrag};
+use crate::tui::layout::{SplitAxis, SplitDrag, SplitGroup};
 use crate::tui::sort::SortChange;
 use crate::tui::state::{AppState, ToastLevel, UiCommand};
 use crate::tui::tab_move::TabDrag;
@@ -64,8 +64,8 @@ impl AppState {
                 save_request(saved)
             }
             MouseEventKind::Drag(MouseButton::Left) => {
-                if self.card_move.is_some() {
-                    self.preview_card_move(position);
+                if self.grid_move.is_some() {
+                    self.preview_grid_move(position);
                 } else if self.tab_drag.is_some() {
                     self.preview_tab_move(position);
                 } else if let Some(press) = self.card_press {
@@ -261,26 +261,31 @@ impl AppState {
         }
 
         // 3. 카드 제목 글자 누름: 카드 포커스 후 길게 누름 대기 (카드 경계 잡기보다 우선, 이동 모드는 tick 이 진입)
-        // 순서를 바꿀 수 있는 그룹이 이번 프레임에 그려진 카드만, 나머지 테두리는 계속 크기 조절
+        // 이번 프레임 격자 줄에 그려진 카드만, 나머지 테두리는 계속 크기 조절
         let title_card = self
             .hit_areas
             .title_hits
             .iter()
             .find(|hit| hit.rect.contains(position))
             .map(|hit| hit.card);
-        if let Some(card) = title_card
-            && let Some((group, index)) = card.reorder_slot()
-            && self
-                .hit_areas
-                .slot_groups
+        let grid_title = title_card.and_then(|card| {
+            self.hit_areas
+                .grid_lines
                 .iter()
-                .any(|slots| slots.group == group)
-        {
+                .filter(|line| line.tab == self.tab)
+                .find_map(|line| {
+                    line.cards
+                        .iter()
+                        .position(|(placed, _)| *placed == card)
+                        .map(|column| (card, line.row, column))
+                })
+        });
+        if let Some((card, row, column)) = grid_title {
             self.focused_card = Some((self.tab, card));
             self.card_press = Some(CardPress {
                 card,
-                group,
-                index,
+                group: SplitGroup::GridCols(self.tab, row as u8),
+                index: column,
                 started: now,
                 cell: position,
             });
@@ -510,6 +515,7 @@ impl AppState {
 mod tests {
     use super::*;
     use crate::tui::cards::{CardId, ColumnHit, HeaderHit, ScrollHit, UiAction};
+    use crate::tui::layout::grid::default_rows;
     use crate::tui::layout::{CardLayout, SplitGroup};
     use crate::tui::sort::{SortKind, SortState};
     use crate::tui::state::ActiveTab;
@@ -1183,7 +1189,7 @@ mod tests {
         draw(&mut state, 100, 30);
         let before = card_rect(&state, CardId::ToolDetail);
         let hit = state.hit_areas.split_hits[0];
-        assert_eq!(hit.group, SplitGroup::ToolsRows);
+        assert_eq!(hit.group, SplitGroup::GridRows(ActiveTab::Tools, 2));
 
         // 누르면 드래그 시작
         click(&mut state, hit.grab.x + 4, hit.grab.y);
@@ -1737,14 +1743,17 @@ mod tests {
         (rect.x + 1, rect.y)
     }
 
-    fn slot_rects(state: &AppState, group: SplitGroup) -> Vec<Rect> {
-        state
+    // 설정 탭의 이번 프레임 격자 줄 영역
+    fn settings_lines(state: &AppState) -> Vec<Rect> {
+        let lines: Vec<Rect> = state
             .hit_areas
-            .slot_groups
+            .grid_lines
             .iter()
-            .find(|slots| slots.group == group)
-            .map(|slots| slots.slots.clone())
-            .unwrap_or_else(|| panic!("{group:?} 칸 배치 없음"))
+            .filter(|line| line.tab == ActiveTab::Settings)
+            .map(|line| line.rect)
+            .collect();
+        assert_eq!(lines.len(), 4, "설정 격자 줄");
+        lines
     }
 
     fn after(base: Instant, millis: u64) -> Instant {
@@ -1772,9 +1781,23 @@ mod tests {
         )
     }
 
+    // 위에서 아래 카드 번호 (기본 격자 순번)
     fn settings_order(state: &AppState) -> [u8; 4] {
-        let order = state.card_layout.order_of(SplitGroup::SettingsRows);
-        [order[0], order[1], order[2], order[3]]
+        let cards = [
+            CardId::SettingsHooks,
+            CardId::SettingsMcp,
+            CardId::SettingsAgents,
+            CardId::SettingsDoctor,
+        ];
+        let grid = state.card_layout.grid_of(ActiveTab::Settings);
+        let placed: Vec<u8> = grid
+            .rows
+            .iter()
+            .flatten()
+            .flatten()
+            .map(|card| cards.iter().position(|known| known == card).unwrap() as u8)
+            .collect();
+        [placed[0], placed[1], placed[2], placed[3]]
     }
 
     #[test]
@@ -1824,9 +1847,13 @@ mod tests {
         assert!(state.tick(after(base, 400)));
         let moving = state.card_move.expect("이동 모드");
         assert_eq!(moving.card, CardId::SettingsMcp);
-        assert_eq!((moving.group, moving.index), (SplitGroup::SettingsRows, 1));
-        assert_eq!(moving.target, 1);
-        assert_eq!(moving.baseline[..4], [0, 1, 2, 3]);
+        let grid_move = state.grid_move.as_ref().expect("격자 이동");
+        assert_eq!(
+            (grid_move.tab, grid_move.card),
+            (ActiveTab::Settings, CardId::SettingsMcp)
+        );
+        assert_eq!(grid_move.baseline, default_rows(ActiveTab::Settings));
+        assert_eq!(grid_move.lines.len(), 4);
         assert!(state.card_press.is_none());
         assert_eq!(state.press_remaining(after(base, 401)), None);
         // 이미 진입했으면 상태 변화 없음
@@ -1838,7 +1865,7 @@ mod tests {
         let mut state = settings_state();
         let base = Instant::now();
         let title = title_pos(&state, CardId::SettingsMcp);
-        let slots = slot_rects(&state, SplitGroup::SettingsRows);
+        let slots = settings_lines(&state);
         press_at(&mut state, title, base);
 
         drag_at(&mut state, title.0, slots[3].y + 1, after(base, 100));
@@ -1864,26 +1891,26 @@ mod tests {
     fn dragging_in_move_mode_previews_insertion_and_release_commits_and_saves() {
         let mut state = settings_state();
         let base = Instant::now();
-        let slots = slot_rects(&state, SplitGroup::SettingsRows);
+        let slots = settings_lines(&state);
         let title = title_pos(&state, CardId::SettingsHooks);
         press_at(&mut state, title, base);
         assert!(state.tick(after(base, 400)));
 
-        // 둘째 칸 -> 셋째 칸 -> 되돌아 첫 칸: 삽입 이동이라 사이 카드가 밀림
-        drag_at(&mut state, 20, slots[2].y + 1, after(base, 450));
+        // 줄 아래 테두리는 그 줄 다음 새 줄, 자기 카드 안은 제자리
+        drag_at(&mut state, 20, slots[2].bottom() - 1, after(base, 450));
         assert_eq!(settings_order(&state), [1, 2, 0, 3]);
-        assert_eq!(state.card_move.unwrap().target, 2);
-        drag_at(&mut state, 20, slots[1].y + 1, after(base, 460));
+        drag_at(&mut state, 20, slots[1].bottom() - 1, after(base, 460));
         assert_eq!(settings_order(&state), [1, 0, 2, 3]);
         drag_at(&mut state, 20, slots[0].y + 1, after(base, 470));
         assert_eq!(settings_order(&state), [0, 1, 2, 3]);
 
-        // 칸 밖(앱 바)은 마지막 목표 유지
-        drag_at(&mut state, 20, slots[3].y + 1, after(base, 480));
+        // 줄 밖(앱 바)은 제자리
+        drag_at(&mut state, 20, slots[3].bottom() - 1, after(base, 480));
         assert_eq!(settings_order(&state), [1, 2, 3, 0]);
         drag_at(&mut state, 20, 0, after(base, 490));
+        assert_eq!(settings_order(&state), [0, 1, 2, 3]);
+        drag_at(&mut state, 20, slots[3].bottom() - 1, after(base, 492));
         assert_eq!(settings_order(&state), [1, 2, 3, 0]);
-        assert_eq!(state.card_move.unwrap().target, 3);
 
         // 휠은 이동 중 무시 (순서·이동 모드 그대로)
         state.handle_mouse_event_at(
@@ -1904,17 +1931,21 @@ mod tests {
         assert_eq!(toast.text, "카드 위치 변경 (l 기본 배치)");
         assert_eq!(toast.level, ToastLevel::Info);
 
-        // 다음 프레임: 위 카드가 마지막 칸 영역에 그려짐
+        // 다음 프레임: 위 카드가 맨 아래 줄
+        assert!(state.grid_move.is_none());
         draw(&mut state, 110, 36);
-        assert_eq!(card_rect(&state, CardId::SettingsHooks), slots[3]);
-        assert_eq!(card_rect(&state, CardId::SettingsMcp), slots[0]);
+        assert!(
+            card_rect(&state, CardId::SettingsHooks).y
+                > card_rect(&state, CardId::SettingsDoctor).y
+        );
+        assert_eq!(card_rect(&state, CardId::SettingsMcp).y, slots[0].y);
     }
 
     #[test]
     fn releasing_on_the_original_slot_changes_nothing_and_requests_no_save() {
         let mut state = settings_state();
         let base = Instant::now();
-        let slots = slot_rects(&state, SplitGroup::SettingsRows);
+        let slots = settings_lines(&state);
         let title = title_pos(&state, CardId::SettingsAgents);
         press_at(&mut state, title, base);
         state.tick(after(base, 400));
@@ -1933,33 +1964,35 @@ mod tests {
     fn first_event_after_the_hold_time_starts_the_move_even_without_a_tick() {
         let mut state = settings_state();
         let base = Instant::now();
-        let slots = slot_rects(&state, SplitGroup::SettingsRows);
+        let slots = settings_lines(&state);
         let title = title_pos(&state, CardId::SettingsHooks);
         press_at(&mut state, title, base);
 
         // 이벤트 루프가 tick 을 못 돌렸어도 450ms 에 온 드래그는 이동으로 처리
-        drag_at(&mut state, 20, slots[1].y + 1, after(base, 450));
+        drag_at(&mut state, 20, slots[1].bottom() - 1, after(base, 450));
         assert!(state.card_press.is_none());
         assert_eq!(settings_order(&state), [1, 0, 2, 3]);
         assert_eq!(
-            up_at(&mut state, 20, slots[1].y + 1, after(base, 460)),
+            up_at(&mut state, 20, slots[1].bottom() - 1, after(base, 460)),
             UiCommand::SaveState
         );
+        assert!(state.grid_move.is_none());
     }
 
     #[test]
     fn escape_restores_the_order_from_before_the_press() {
         let mut state = settings_state();
         let base = Instant::now();
-        let slots = slot_rects(&state, SplitGroup::SettingsRows);
+        let slots = settings_lines(&state);
         let title = title_pos(&state, CardId::SettingsHooks);
         press_at(&mut state, title, base);
         state.tick(after(base, 400));
-        drag_at(&mut state, 20, slots[3].y + 1, after(base, 420));
+        drag_at(&mut state, 20, slots[3].bottom() - 1, after(base, 420));
         assert_eq!(settings_order(&state), [1, 2, 3, 0]);
 
         state.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(state.card_move.is_none());
+        assert!(state.grid_move.is_none());
         assert_eq!(state.card_layout, CardLayout::default());
         assert!(!state.should_quit);
 
@@ -1989,19 +2022,20 @@ mod tests {
     fn a_lost_button_release_is_committed_by_the_first_moved_event_and_saved() {
         let mut state = settings_state();
         let base = Instant::now();
-        let slots = slot_rects(&state, SplitGroup::SettingsRows);
+        let slots = settings_lines(&state);
         let title = title_pos(&state, CardId::SettingsHooks);
         press_at(&mut state, title, base);
         state.tick(after(base, 400));
-        drag_at(&mut state, 20, slots[2].y + 1, after(base, 420));
+        drag_at(&mut state, 20, slots[2].bottom() - 1, after(base, 420));
         assert_eq!(settings_order(&state), [1, 2, 0, 3]);
 
-        // 창 밖에서 놓아 Up 이 오지 않은 경우: 버튼 없는 움직임 = 뗌, 미리보기 순서를 그대로 확정
+        // 창 밖에서 놓아 Up 이 오지 않은 경우: 버튼 없는 움직임 = 뗄, 미리보기 격자를 그대로 확정
         assert_eq!(
             moved_at(&mut state, 5, 5, after(base, 430)),
             UiCommand::SaveState
         );
         assert!(state.card_move.is_none());
+        assert!(state.grid_move.is_none());
         assert_eq!(settings_order(&state), [1, 2, 0, 3]);
         let toast = state.toast.as_ref().unwrap();
         assert_eq!(toast.text, "카드 위치 변경 (l 기본 배치)");
@@ -2016,7 +2050,7 @@ mod tests {
     fn moved_in_move_mode_without_a_change_commits_nothing_and_requests_no_save() {
         let mut state = settings_state();
         let base = Instant::now();
-        let slots = slot_rects(&state, SplitGroup::SettingsRows);
+        let slots = settings_lines(&state);
         let title = title_pos(&state, CardId::SettingsAgents);
         press_at(&mut state, title, base);
         state.tick(after(base, 400));
@@ -2037,11 +2071,11 @@ mod tests {
     fn a_new_press_in_move_mode_commits_the_preview_like_a_release() {
         let mut state = settings_state();
         let base = Instant::now();
-        let slots = slot_rects(&state, SplitGroup::SettingsRows);
+        let slots = settings_lines(&state);
         let title = title_pos(&state, CardId::SettingsHooks);
         press_at(&mut state, title, base);
         state.tick(after(base, 400));
-        drag_at(&mut state, 20, slots[3].y + 1, after(base, 420));
+        drag_at(&mut state, 20, slots[3].bottom() - 1, after(base, 420));
         assert_eq!(settings_order(&state), [1, 2, 3, 0]);
 
         // Up 이 오지 않고 새 누름이 오면 확정(알림·저장), 그 누름은 확정에 쓰이고 새 대기를 만들지 않음
@@ -2050,6 +2084,7 @@ mod tests {
             UiCommand::SaveState
         );
         assert!(state.card_move.is_none());
+        assert!(state.grid_move.is_none());
         assert!(state.card_press.is_none());
         assert_eq!(settings_order(&state), [1, 2, 3, 0]);
         assert_eq!(
@@ -2124,7 +2159,11 @@ mod tests {
             assert!(state.card_move.is_some(), "{code:?}");
             assert!(!state.should_quit, "{code:?}");
             assert_eq!(state.tab, ActiveTab::Settings, "{code:?}");
-            assert_eq!(state.card_layout, CardLayout::default(), "{code:?}");
+            assert_eq!(
+                state.card_layout.grid_of(ActiveTab::Settings),
+                default_rows(ActiveTab::Settings),
+                "{code:?}"
+            );
 
             // 다음 버튼 없는 움직임이 놓은 것으로 보고 끝냄 (순서 그대로라 저장 없음)
             assert_eq!(
@@ -2205,7 +2244,7 @@ mod tests {
             .hit_areas
             .split_hits
             .iter()
-            .find(|hit| hit.group == SplitGroup::SettingsRows && hit.index == 0)
+            .find(|hit| hit.group == SplitGroup::GridRows(ActiveTab::Settings, 4) && hit.index == 0)
             .copied()
             .unwrap();
         let title = title_pos(&state, CardId::SettingsMcp);
@@ -2222,36 +2261,31 @@ mod tests {
         assert!(state.card_press.is_none());
         assert_eq!(
             state.split_drag.map(|drag| (drag.group, drag.index)),
-            Some((SplitGroup::SettingsRows, 0))
+            Some((SplitGroup::GridRows(ActiveTab::Settings, 4), 0))
         );
     }
 
     #[test]
-    fn title_without_a_drawn_slot_group_falls_back_to_a_normal_click() {
-        // 이벤트 패널이 준비되지 않으면 피드는 안내 카드(칸 분할 없음)
+    fn title_outside_the_drawn_grid_and_slot_groups_falls_back_to_a_normal_click() {
+        // 격자 개요: 안내 카드인 피드 제목도 길게 누름 대기
         let mut state = sample_state_with_snapshot();
         state.snapshot.events = crate::tui::state::Panel::Pending;
         draw(&mut state, 130, 40);
-        assert!(
-            state
-                .hit_areas
-                .slot_groups
-                .iter()
-                .all(|slots| slots.group != SplitGroup::OverviewFeedCols)
-        );
+        let base = Instant::now();
         let title = title_pos(&state, CardId::EventFeed);
-        press_at(&mut state, title, Instant::now());
-        assert!(state.card_press.is_none());
-        // 기존 동작 그대로: 아래 카드의 위 테두리는 줄 경계 크기 조절 잡기
+        press_at(&mut state, title, base);
         assert_eq!(
-            state.split_drag.map(|drag| drag.group),
-            Some(SplitGroup::OverviewRows)
+            state.card_press.map(|press| press.card),
+            Some(CardId::EventFeed)
         );
-        state.split_drag = None;
+        assert!(state.split_drag.is_none());
+        up_at(&mut state, title.0, title.1, after(base, 50));
 
-        // 순서 대상이 아닌 서버 상태 카드 제목도 일반 클릭
+        // 격자 줄·칸 배치에 없는 제목: 일반 클릭
+        draw(&mut state, 130, 40);
+        state.hit_areas.grid_lines.clear();
         let status = title_pos(&state, CardId::ServerStatus);
-        press_at(&mut state, status, Instant::now());
+        press_at(&mut state, status, after(base, 100));
         assert!(state.card_press.is_none());
         assert_eq!(
             state.focused_card,
@@ -2274,9 +2308,9 @@ mod tests {
         assert!(
             state
                 .hit_areas
-                .slot_groups
+                .grid_lines
                 .iter()
-                .all(|slots| slots.group != SplitGroup::ToolsRows)
+                .all(|line| line.tab != ActiveTab::Tools)
         );
         for code in [KeyCode::Up, KeyCode::Down, KeyCode::Left, KeyCode::Right] {
             assert_eq!(state.handle_key_event(shift_press(code)), UiCommand::None);
@@ -2284,14 +2318,22 @@ mod tests {
         assert_eq!(state.card_layout, CardLayout::default());
         assert!(state.toast.is_none());
 
-        // 이벤트 패널이 준비되지 않아 피드가 안내 카드인 개요 탭도 같음
+        // 격자로 그린 개요 탭: 안내 카드인 피드도 줄 안 이동
         let mut feed = sample_state_with_snapshot();
         feed.snapshot.events = crate::tui::state::Panel::Pending;
         draw(&mut feed, 130, 40);
         assert_eq!(feed.focused_card_id(), CardId::EventFeed);
-        for code in [KeyCode::Left, KeyCode::Right] {
-            assert_eq!(feed.handle_key_event(shift_press(code)), UiCommand::None);
-        }
+        assert_eq!(
+            feed.handle_key_event(shift_press(KeyCode::Left)),
+            UiCommand::None
+        );
+        assert_eq!(feed.card_layout, CardLayout::default());
+        assert!(feed.toast.is_none());
+        // 이벤트가 없어 상세 카드가 그려지지 않으면 교환할 이웃이 없음
+        assert_eq!(
+            feed.handle_key_event(shift_press(KeyCode::Right)),
+            UiCommand::None
+        );
         assert_eq!(feed.card_layout, CardLayout::default());
         assert!(feed.toast.is_none());
 
@@ -2302,17 +2344,17 @@ mod tests {
         assert!(
             drawn
                 .hit_areas
-                .slot_groups
+                .grid_lines
                 .iter()
-                .any(|slots| slots.group == SplitGroup::ToolsRows)
+                .any(|line| line.tab == ActiveTab::Tools)
         );
         assert_eq!(
             drawn.handle_key_event(shift_press(KeyCode::Down)),
             UiCommand::SaveState
         );
         assert_eq!(
-            drawn.card_layout.order_of(SplitGroup::ToolsRows)[..2],
-            [1, 0]
+            drawn.card_layout.grid_of(ActiveTab::Tools).rows[0][..2],
+            [Some(CardId::ToolDetail), Some(CardId::ToolTable)]
         );
     }
 
@@ -2356,17 +2398,15 @@ mod tests {
         click(&mut state, hit.grab.x + 4, hit.grab.y);
         drag_to(&mut state, hit.grab.x + 4, hit.grab.y - 2);
         assert!(state.split_drag.is_some_and(|drag| drag.moved));
-        let ratios = state.card_layout.custom_ratios(SplitGroup::ToolsRows);
-        assert!(ratios.is_some());
-        state.split_hover = Some((SplitGroup::ToolsRows, 0));
+        let rows = SplitGroup::GridRows(ActiveTab::Tools, 2);
+        let ratios = state.card_layout.grid_ratio_entries();
+        assert!(ratios.iter().any(|(key, _)| key == "tools_rows_2"));
+        state.split_hover = Some((rows, 0));
 
         assert_eq!(state.handle_resize(), UiCommand::SaveState);
         assert!(state.split_drag.is_none());
         assert!(state.split_hover.is_none());
-        assert_eq!(
-            state.card_layout.custom_ratios(SplitGroup::ToolsRows),
-            ratios
-        );
+        assert_eq!(state.card_layout.grid_ratio_entries(), ratios);
     }
 
     #[test]
@@ -2404,15 +2444,16 @@ mod tests {
     fn resize_cancels_a_card_move_and_restores_the_order_without_saving() {
         let mut state = settings_state();
         let base = Instant::now();
-        let slots = slot_rects(&state, SplitGroup::SettingsRows);
+        let slots = settings_lines(&state);
         let title = title_pos(&state, CardId::SettingsHooks);
         press_at(&mut state, title, base);
         state.tick(after(base, 400));
-        drag_at(&mut state, 20, slots[3].y + 1, after(base, 420));
+        drag_at(&mut state, 20, slots[3].bottom() - 1, after(base, 420));
         assert_eq!(settings_order(&state), [1, 2, 3, 0]);
 
         assert_eq!(state.handle_resize(), UiCommand::None);
         assert!(state.card_move.is_none());
+        assert!(state.grid_move.is_none());
         assert_eq!(state.card_layout, CardLayout::default());
     }
 

@@ -4,11 +4,11 @@
 use crate::store::metrics::{AttributionDimension, MetricAttributionRow};
 use crate::store::query::ProjectStatsRow;
 use crate::tui::cards::CardId;
-use crate::tui::format::{format_clock_time, format_compact, format_count};
+use crate::tui::format::{format_clock_time, format_compact, format_count, format_duration_ms};
 use crate::tui::i18n::{self, Lang, Msg};
-use crate::tui::layout::{SplitAxis, SplitGroup};
+use crate::tui::layout::grid::{CardSlot, SlotHeight};
 use crate::tui::sort::{compare_attribution_row, compare_project_row, sort_rows};
-use crate::tui::state::{AppState, DashboardSnapshot, Panel};
+use crate::tui::state::{ActiveTab, AppState, DashboardSnapshot, Panel};
 use crate::tui::theme;
 use crate::tui::views::common::{
     CardTable, ColumnFit, ColumnSpec, PanelNote, TableCell, TextCard, panel_message,
@@ -21,15 +21,15 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::text::{Line, Span};
 
-// 상세 카드 항목 줄 수와 기본 높이 (항목 8줄 + 모델 구역 제목과 한 줄 + 테두리 2줄, 나머지 분포는 스크롤)
-const PROJECT_DETAIL_LINES: usize = 8;
+// 상세 카드 항목 줄 수와 기본 높이 (항목 11줄 + 모델 구역 제목과 한 줄 + 테두리 2줄, 나머지 분포는 스크롤)
+const PROJECT_DETAIL_LINES: usize = 11;
 const DETAIL_BORDER_ROWS: u16 = 2;
 const PROJECT_DETAIL_HEIGHT: u16 = PROJECT_DETAIL_LINES as u16 + 2 + DETAIL_BORDER_ROWS;
 // 세션별 비용 구역의 세션 id 앞부분 길이
 const SESSION_ID_PREFIX: usize = 8;
 
 // 프로젝트 표 열 (정렬 열 번호와 순서 일치: sort.rs)
-pub const PROJECT_COLUMNS: [ColumnSpec; 11] = [
+pub const PROJECT_COLUMNS: [ColumnSpec; 13] = [
     (Msg::ColProject, 14, ColumnFit::Shrink, Alignment::Left),
     (Msg::ColBranch, 12, ColumnFit::Grow, Alignment::Left),
     (Msg::ColRequests, 6, ColumnFit::Fixed, Alignment::Right),
@@ -41,6 +41,8 @@ pub const PROJECT_COLUMNS: [ColumnSpec; 11] = [
     (Msg::ColCacheWrite1h, 8, ColumnFit::Fixed, Alignment::Right),
     (Msg::ColCostEst, 8, ColumnFit::Fixed, Alignment::Right),
     (Msg::ColLast, 8, ColumnFit::Fixed, Alignment::Right),
+    (Msg::ColTotalWait, 8, ColumnFit::Fixed, Alignment::Right),
+    (Msg::ColTokPerReq, 8, ColumnFit::Fixed, Alignment::Right),
 ];
 
 // 귀속 표 열
@@ -73,18 +75,53 @@ pub fn render_projects_tab(frame: &mut Frame, area: Rect, state: &mut AppState) 
     if render_db_gate(frame, state, area) {
         return;
     }
-    let table_cut = (u32::from(area.height) * 40 / 100) as u16;
-    // 낮은 화면에서도 귀속 표가 머리글과 한 행(4줄)은 갖도록 상세 카드가 먼저 줄어듦
-    let detail_cut =
-        table_cut + PROJECT_DETAIL_HEIGHT.min(area.height.saturating_sub(table_cut + 4));
-    let panes = state.card_layout.split_cards(
-        &mut state.hit_areas,
-        SplitGroup::ProjectsRows,
-        SplitAxis::Rows,
-        area,
-        &[table_cut, detail_cut],
-        &[5, 4, 3],
-    );
+    let table_height = (u32::from(area.height) * 40 / 100) as u16;
+    // 낮은 화면에서도 귀속 표가 머리글과 한 행(4줄)은 갖도록 상세 카드가 먼저 줄어듦 (표는 최소 4줄)
+    let detail_height =
+        PROJECT_DETAIL_HEIGHT.min(area.height.saturating_sub(table_height.max(4) + 4));
+    let slots = [
+        CardSlot {
+            card: CardId::ProjectTable,
+            min_w: 24,
+            min_h: 4,
+            height: SlotHeight::Fixed(table_height),
+            weight: 3,
+            rank: 0,
+            reserve: 0,
+        },
+        CardSlot {
+            card: CardId::ProjectDetail,
+            min_w: 20,
+            min_h: 4,
+            height: SlotHeight::Fixed(detail_height),
+            weight: 2,
+            rank: 0,
+            reserve: 0,
+        },
+        CardSlot {
+            card: CardId::AttributionTable,
+            min_w: 24,
+            min_h: 4,
+            height: SlotHeight::Fill,
+            weight: 3,
+            rank: 0,
+            reserve: 0,
+        },
+    ];
+    let layout = state.card_layout;
+    let placed = layout.arrange_tab(&mut state.hit_areas, ActiveTab::Projects, area, &slots);
+    let table_area = placed
+        .iter()
+        .find(|(card, _)| *card == CardId::ProjectTable)
+        .map(|(_, rect)| *rect);
+    let detail_area = placed
+        .iter()
+        .find(|(card, _)| *card == CardId::ProjectDetail)
+        .map(|(_, rect)| *rect);
+    let attribution_area = placed
+        .iter()
+        .find(|(card, _)| *card == CardId::AttributionTable)
+        .map(|(_, rect)| *rect);
 
     // 1. 프로젝트·브랜치 표
     let projects: Option<Vec<ProjectStatsRow>> = match &state.snapshot.projects {
@@ -105,8 +142,9 @@ pub fn render_projects_tab(frame: &mut Frame, area: Rect, state: &mut AppState) 
             requests: sorted.iter().map(|row| row.requests).sum(),
             cost: sorted.iter().map(|row| row.cost_usd_estimate).sum(),
         });
-    match &projects {
-        Some(sorted) => {
+    match (&projects, table_area) {
+        (_, None) => {}
+        (Some(sorted), Some(table_area)) => {
             let cost_total = project_totals.cost;
             let rows: Vec<Vec<TableCell>> = sorted
                 .iter()
@@ -117,6 +155,22 @@ pub fn render_projects_tab(frame: &mut Frame, area: Rect, state: &mut AppState) 
                         } else {
                             vec![Span::raw(text.to_string())]
                         }
+                    };
+                    let wait_total = if row.wait_total_ms == 0 {
+                        vec![Span::styled("-", theme::STYLE_DIM)]
+                    } else {
+                        vec![Span::raw(format_duration_ms(row.wait_total_ms))]
+                    };
+                    let total_tokens = row.input_tokens
+                        + row.output_tokens
+                        + row.cache_read_tokens
+                        + row.cache_creation_5m_tokens
+                        + row.cache_creation_1h_tokens;
+                    let tokens_per_request = if row.requests == 0 {
+                        vec![Span::styled("-", theme::STYLE_DIM)]
+                    } else {
+                        let requests = i64::try_from(row.requests).unwrap_or(i64::MAX);
+                        vec![Span::raw(format_compact(total_tokens / requests))]
                     };
                     vec![
                         text_or_dash(&row.project),
@@ -137,13 +191,15 @@ pub fn render_projects_tab(frame: &mut Frame, area: Rect, state: &mut AppState) 
                             format_clock_time(&row.last_ts),
                             theme::STYLE_DIM,
                         )],
+                        wait_total,
+                        tokens_per_request,
                     ]
                 })
                 .collect();
             render_card_table(
                 frame,
                 state,
-                panes[0],
+                table_area,
                 CardTable {
                     card: CardId::ProjectTable,
                     title: i18n::project_table_title(state.lang, sorted.len(), cost_total),
@@ -154,10 +210,10 @@ pub fn render_projects_tab(frame: &mut Frame, area: Rect, state: &mut AppState) 
                 },
             );
         }
-        None => {
+        (None, Some(table_area)) => {
             let note = panel_message(state.lang, &state.snapshot.projects).unwrap_or_default();
             let title = i18n::text(state.lang, Msg::TitleProjectStatsPending);
-            render_notice_card(frame, state, CardId::ProjectTable, panes[0], title, note);
+            render_notice_card(frame, state, CardId::ProjectTable, table_area, title, note);
         }
     }
 
@@ -166,17 +222,19 @@ pub fn render_projects_tab(frame: &mut Frame, area: Rect, state: &mut AppState) 
     let selected_project = projects.as_ref().and_then(|sorted| sorted.get(selected));
     let (detail_title, detail_lines) =
         build_project_detail(state.lang, selected_project, project_totals);
-    render_text_card(
-        frame,
-        state,
-        panes[1],
-        TextCard {
-            card: CardId::ProjectDetail,
-            title: detail_title,
-            hint: String::new(),
-            lines: detail_lines,
-        },
-    );
+    if let Some(detail_area) = detail_area {
+        render_text_card(
+            frame,
+            state,
+            detail_area,
+            TextCard {
+                card: CardId::ProjectDetail,
+                title: detail_title,
+                hint: String::new(),
+                lines: detail_lines,
+            },
+        );
+    }
 
     // 3. 귀속 표 (d 키로 차원 순환, 지표가 없으면 OTel 수집 안내)
     let lang = state.lang;
@@ -193,8 +251,9 @@ pub fn render_projects_tab(frame: &mut Frame, area: Rect, state: &mut AppState) 
         },
     );
     let attribution = attribution_rows(&state.snapshot, dimension).filter(|rows| !rows.is_empty());
-    match attribution {
-        Some(rows) => {
+    match (attribution, attribution_area) {
+        (_, None) => {}
+        (Some(rows), Some(attribution_area)) => {
             let mut sorted = rows.to_vec();
             sort_rows(
                 &mut sorted,
@@ -217,7 +276,7 @@ pub fn render_projects_tab(frame: &mut Frame, area: Rect, state: &mut AppState) 
             render_card_table(
                 frame,
                 state,
-                panes[2],
+                attribution_area,
                 CardTable {
                     card: CardId::AttributionTable,
                     title: i18n::attribution_title(lang, dimension_label, sorted.len()),
@@ -228,7 +287,7 @@ pub fn render_projects_tab(frame: &mut Frame, area: Rect, state: &mut AppState) 
                 },
             );
         }
-        None => {
+        (None, Some(attribution_area)) => {
             let note = match &state.snapshot.attribution {
                 Panel::Ready(sets) => {
                     // 다른 차원에는 행이 있으면 이 차원만 빈 것, 모두 비면 OTel 지표 자체가 없음
@@ -251,7 +310,7 @@ pub fn render_projects_tab(frame: &mut Frame, area: Rect, state: &mut AppState) 
                 frame,
                 state,
                 CardId::AttributionTable,
-                panes[2],
+                attribution_area,
                 &title,
                 note,
             );
@@ -260,7 +319,8 @@ pub fn render_projects_tab(frame: &mut Frame, area: Rect, state: &mut AppState) 
 }
 
 // 3. 프로젝트 상세 ------------------------------------------------------------
-// 제목(프로젝트·브랜치)과 항목 줄 (요청·세션, 입출력, 캐시 읽기·생성, 추정 비용, 요청·세션당 비용, 구간 점유, 처음·마지막 요청)
+// 제목(프로젝트·브랜치)과 항목 줄 (요청·세션, 입출력, 캐시 읽기·생성, 추정 비용, 요청·세션당 비용, 구간 점유, 처음·마지막 요청,
+// 대기 평균·최대, 대기 합계, 토큰 합계·요청당)
 // 이어서 모델·에이전트·세션별 비용 구역
 fn build_project_detail(
     lang: Lang,
@@ -275,6 +335,18 @@ fn build_project_detail(
                 theme::STYLE_DIM,
             ))],
         );
+    };
+    let wait_avg = row.wait_avg_ms.map_or("-".to_string(), format_duration_ms);
+    let wait_max = row.wait_max_ms.map_or("-".to_string(), format_duration_ms);
+    let total_tokens = row.input_tokens
+        + row.output_tokens
+        + row.cache_read_tokens
+        + row.cache_creation_5m_tokens
+        + row.cache_creation_1h_tokens;
+    let tokens_per_request = if row.requests == 0 {
+        "-".to_string()
+    } else {
+        format_compact(total_tokens / i64::try_from(row.requests).unwrap_or(i64::MAX))
     };
     let pairs: [(&str, String); PROJECT_DETAIL_LINES] = [
         (
@@ -330,6 +402,22 @@ fn build_project_detail(
             i18n::text(lang, Msg::DetailFirstLast),
             first_last(&row.first_ts, &row.last_ts),
         ),
+        (
+            i18n::text(lang, Msg::WaitAvgMax),
+            format!("{wait_avg} / {wait_max}"),
+        ),
+        (
+            i18n::text(lang, Msg::WaitTotal),
+            if row.wait_total_ms == 0 {
+                "-".to_string()
+            } else {
+                format_duration_ms(row.wait_total_ms)
+            },
+        ),
+        (
+            i18n::text(lang, Msg::DetailTokensPerReq),
+            format!("{} / {tokens_per_request}", format_compact(total_tokens)),
+        ),
     ];
     let mut lines: Vec<Line<'static>> = pairs
         .into_iter()
@@ -377,8 +465,10 @@ fn build_project_detail(
 mod tests {
     use super::*;
     use crate::tui::cards::{ColumnHit, HeaderHit};
+    use crate::tui::layout::SplitGroup;
+    use crate::tui::layout::grid::{TabGrid, default_rows};
     use crate::tui::sort::{SortKind, SortState, sort_spec};
-    use crate::tui::state::{ATTRIBUTION_DIMENSIONS, ActiveTab, UiCommand};
+    use crate::tui::state::{ATTRIBUTION_DIMENSIONS, UiCommand};
     use crate::tui::test_support::sample_state_with_tables;
     use crate::tui::views::detail::DETAIL_LABEL_WIDTH;
     use crate::tui::views::render_frame;
@@ -487,6 +577,16 @@ mod tests {
         }
     }
 
+    fn grid_from(rows: &[&[CardId]]) -> TabGrid {
+        let mut grid = TabGrid::default();
+        for (row, cards) in rows.iter().enumerate() {
+            for (column, card) in cards.iter().enumerate() {
+                grid.rows[row][column] = Some(*card);
+            }
+        }
+        grid
+    }
+
     #[test]
     fn the_projects_tab_draws_its_three_cards_in_both_languages_at_the_size_matrix() {
         for lang in BOTH {
@@ -519,16 +619,87 @@ mod tests {
                 assert!(text.contains(project_title), "{case}\n{text}");
                 assert!(text.contains(attribution_title), "{case}\n{text}");
                 assert_eq!(state.hit_areas.tab_rects.len(), 9, "{case}");
-                // 폭이 모자라면 글자 열이 먼저 줄고 숫자는 유지됨 (100열), 넓으면 이름 전체가 보임 (130열)
+                // 폭이 모자라면 글자 열이 먼저 줄고 숫자는 유지됨 (100열, 130열은 열세 열 전부에 이름 앞부분)
+                // 이름 전체는 200열 검사 (wait_and_tokens_per_request_columns_...)
                 if width >= 100 {
                     assert!(text.contains("frontend-tui"), "{case}");
                     assert!(text.contains("$8.40"), "{case}");
                 }
                 if width >= 130 {
-                    assert!(text.contains("claude-monitor"), "{case}");
-                    assert!(text.contains("feature/projects-tab"), "{case}");
+                    assert!(text.contains("claude-moni"), "{case}");
+                    assert!(text.contains("feature/pr"), "{case}\n{text}");
+                    assert!(text.contains("8.0K"), "{case}\n{text}");
                 }
             }
+        }
+    }
+
+    // 기본 격자: 카드 한 장이 한 줄, 높이는 지금의 공식, 줄 경계 드래그 영역 둘
+    #[test]
+    fn the_projects_cards_tile_the_body_with_the_default_heights_at_the_size_matrix() {
+        let expected = [
+            (60, 16, [4, 4, 4]),
+            (100, 30, [10, 12, 4]),
+            (130, 40, [14, 15, 7]),
+        ];
+        let cards = [
+            CardId::ProjectTable,
+            CardId::ProjectDetail,
+            CardId::AttributionTable,
+        ];
+        for lang in BOTH {
+            for (width, height, heights) in expected {
+                let case = format!("{lang:?} {width}x{height}");
+                let mut state = projects_state(lang);
+                draw(&mut state, width, height);
+                let mut top = 2;
+                for (card, card_height) in cards.iter().zip(heights) {
+                    let rect = card_rect(&state, *card);
+                    assert_eq!(
+                        (rect.x, rect.y, rect.width, rect.height),
+                        (0, top, width, card_height),
+                        "{case} {card:?}"
+                    );
+                    top += rect.height;
+                }
+                assert_eq!(top, height - 2, "{case}");
+                let row_hits = state
+                    .hit_areas
+                    .split_hits
+                    .iter()
+                    .filter(|hit| hit.group == SplitGroup::GridRows(ActiveTab::Projects, 3))
+                    .count();
+                assert_eq!(row_hits, 2, "{case}");
+            }
+        }
+    }
+
+    // 격자 한 줄에 두 장을 두면 같은 y 에 나란히
+    #[test]
+    fn two_project_cards_in_one_grid_row_share_a_line_at_130_columns() {
+        let pairs = [
+            [CardId::ProjectTable, CardId::ProjectDetail],
+            [CardId::ProjectDetail, CardId::AttributionTable],
+        ];
+        for [left, right] in pairs {
+            let rest: Vec<CardId> = [
+                CardId::ProjectTable,
+                CardId::ProjectDetail,
+                CardId::AttributionTable,
+            ]
+            .into_iter()
+            .filter(|card| *card != left && *card != right)
+            .collect();
+            let mut state = projects_state(Lang::En);
+            state
+                .card_layout
+                .set_grid(ActiveTab::Projects, grid_from(&[&[left, right], &rest]));
+            draw(&mut state, 130, 40);
+            let left_rect = card_rect(&state, left);
+            let right_rect = card_rect(&state, right);
+            assert_eq!(left_rect.y, right_rect.y, "{left:?} {right:?}");
+            assert!(left_rect.right() < right_rect.x, "{left:?} {right:?}");
+            assert!(!card_rect(&state, rest[0]).intersects(left_rect));
         }
     }
 
@@ -755,9 +926,25 @@ mod tests {
             state.column_widths[card as usize][1] = Some(21);
         }
         state.column_widths[CardId::ModelTable as usize][1] = Some(21);
-        state
-            .card_layout
-            .set_order(SplitGroup::ProjectsRows, [2, 0, 1, 3, 4, 5]);
+        // 격자 줄 순서와 줄 높이 비율을 바꾼 뒤 l
+        let tab_key = ActiveTab::Projects.tab_key();
+        state.card_layout.set_grid(
+            ActiveTab::Projects,
+            grid_from(&[
+                &[CardId::AttributionTable],
+                &[CardId::ProjectTable],
+                &[CardId::ProjectDetail],
+            ]),
+        );
+        assert!(
+            state
+                .card_layout
+                .restore_grid_ratios(&format!("{tab_key}_rows_3"), &[3_000, 6_000])
+        );
+        assert_ne!(
+            state.card_layout.grid_of(ActiveTab::Projects),
+            default_rows(ActiveTab::Projects)
+        );
         assert_eq!(press(&mut state, 'l'), UiCommand::SaveState);
         for card in PROJECT_CARDS {
             assert!(
@@ -768,8 +955,16 @@ mod tests {
             );
         }
         assert_eq!(
-            state.card_layout.custom_order(SplitGroup::ProjectsRows),
-            None
+            state.card_layout.grid_of(ActiveTab::Projects),
+            default_rows(ActiveTab::Projects)
+        );
+        let prefix = format!("{tab_key}_");
+        assert!(
+            state
+                .card_layout
+                .grid_ratio_entries()
+                .iter()
+                .all(|(key, _)| !key.starts_with(&prefix))
         );
         // 다른 탭의 열 폭은 그대로, 언어도 그대로
         assert_eq!(
@@ -903,6 +1098,9 @@ mod tests {
             cache_creation_5m_tokens: 300_000,
             cache_creation_1h_tokens: 50_000,
             cost_usd_estimate: 12.345,
+            wait_avg_ms: Some(1_500),
+            wait_max_ms: Some(65_000),
+            wait_total_ms: 7_380_000,
             last_ts: "2026-11-15T01:00:00Z".to_string(),
             ..ProjectStatsRow::default()
         };
@@ -944,6 +1142,17 @@ mod tests {
                 text.iter().any(|line| line.contains("300.0K / 50.0K")),
                 "{text:?}"
             );
+            // 대기 평균·최대, 대기 합계, 토큰 합계·요청당 (항목 끝 세 줄)
+            let new_lines = [
+                (Msg::WaitAvgMax, "1.5s / 1m 05s"),
+                (Msg::WaitTotal, "2h 03m"),
+                (Msg::DetailTokensPerReq, "M / 9.8K"),
+            ];
+            for (offset, (msg, value)) in new_lines.into_iter().enumerate() {
+                let line = &text[PROJECT_DETAIL_LINES - 3 + offset];
+                assert!(line.starts_with(i18n::text(lang, msg)), "{lang:?} {line}");
+                assert!(line.contains(value), "{lang:?} {line}");
+            }
             // 항목 이름은 이름 칸 안에서 한 칸 이상 비움
             for msg in [Msg::ProjectCounts, Msg::ProjectCache] {
                 assert!(
@@ -958,11 +1167,102 @@ mod tests {
             project: "solo".to_string(),
             ..ProjectStatsRow::default()
         };
-        let (title, _) = build_project_detail(Lang::En, Some(&nameless), window);
+        let (title, nameless_lines) = build_project_detail(Lang::En, Some(&nameless), window);
         assert_eq!(title, "Project detail · solo");
+        // 대기·요청이 없으면 값 자리에 -
+        let tail: Vec<String> = nameless_lines[PROJECT_DETAIL_LINES - 3..PROJECT_DETAIL_LINES]
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(tail[0].ends_with("- / -"), "{tail:?}");
+        assert!(tail[1].ends_with('-'), "{tail:?}");
+        assert!(tail[2].ends_with("0 / -"), "{tail:?}");
         let (empty_title, empty_lines) = build_project_detail(Lang::Ko, None, window);
         assert_eq!(empty_title, "프로젝트 상세");
         assert_eq!(empty_lines.len(), 1);
+    }
+
+    #[test]
+    fn wait_and_tokens_per_request_columns_and_detail_lines_render_and_hide_right_first() {
+        for lang in BOTH {
+            let wait_label = i18n::text(lang, Msg::ColTotalWait);
+            let per_req_label = i18n::text(lang, Msg::ColTokPerReq);
+            for (width, height) in [(60, 16), (100, 30), (130, 40), (200, 40)] {
+                let case = format!("{lang:?} {width}x{height}");
+                let mut state = projects_state(lang);
+                if let Panel::Ready(rows) = &mut state.snapshot.projects {
+                    rows[0].wait_total_ms = 125_000;
+                }
+                let buffer = draw(&mut state, width, height);
+                let rect = card_rect(&state, CardId::ProjectTable);
+                let header = row_text(&buffer, rect.y + 1);
+
+                // 보이는 열은 항상 앞쪽부터 이어짐 (오른쪽 열이 먼저 숨음), 프로젝트 열은 남음
+                let shown: Vec<usize> = header_hits(&state, CardId::ProjectTable)
+                    .iter()
+                    .map(|hit| hit.column)
+                    .collect();
+                let prefix: Vec<usize> = (0..shown.len()).collect();
+                assert_eq!(shown, prefix, "{case}");
+                assert!(shown.contains(&0), "{case}: {header}");
+                assert_eq!(
+                    header.contains(wait_label),
+                    shown.contains(&11),
+                    "{case}: {header}"
+                );
+                assert_eq!(
+                    header.contains(per_req_label),
+                    shown.contains(&12),
+                    "{case}: {header}"
+                );
+                if width == 60 {
+                    assert!(shown.len() < PROJECT_COLUMNS.len(), "{case}");
+                    assert!(!header.contains(per_req_label), "{case}: {header}");
+                }
+                if width < 200 {
+                    continue;
+                }
+
+                // 넓은 화면: 열세 개 전부, 첫 행은 대기 합계 2m 05s, 요청당 토큰 7.8M / 900
+                assert_eq!(shown.len(), PROJECT_COLUMNS.len(), "{case}");
+                let first = row_text(&buffer, rect.y + 2);
+                for value in [
+                    "claude-monitor",
+                    "main",
+                    "900",
+                    "1.2M",
+                    "300.0K",
+                    "6.0M",
+                    "$8.40",
+                    "2m 05s",
+                    "8.7K",
+                ] {
+                    assert!(first.contains(value), "{case} {value}: {first}");
+                }
+                // 대기가 없는 둘째 행은 대기 합계가 흐린 -, 요청당 토큰은 3.21M / 400
+                let second = row_text(&buffer, rect.y + 3);
+                assert!(second.contains("feature/projects-tab"), "{case}: {second}");
+                assert!(second.contains("8.0K"), "{case}: {second}");
+                let dash = header_hits(&state, CardId::ProjectTable)[11].rect;
+                let dash_cells: Vec<_> = (dash.x..dash.right())
+                    .filter_map(|x| buffer.cell((x, rect.y + 3)))
+                    .filter(|cell| cell.symbol() == "-")
+                    .collect();
+                assert_eq!(dash_cells.len(), 1, "{case}: {second}");
+                assert_eq!(dash_cells[0].fg, theme::FG_DIM, "{case}");
+            }
+
+            // 기본 상세 높이에 새 세 줄이 보임 (130x40)
+            let mut state = projects_state(lang);
+            let text = screen_text(&draw(&mut state, 130, 40));
+            for msg in [Msg::WaitAvgMax, Msg::WaitTotal, Msg::DetailTokensPerReq] {
+                assert!(
+                    text.contains(i18n::text(lang, msg)),
+                    "{lang:?} {msg:?}\n{text}"
+                );
+            }
+            assert!(text.contains("7.8M / 8.7K"), "{lang:?}\n{text}");
+        }
     }
 
     #[test]

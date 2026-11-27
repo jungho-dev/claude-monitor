@@ -746,6 +746,18 @@ async fn admin_week_report_routes_round_trip_and_reject_bad_input() {
         text.contains("2026-W02 (2026-01-05 ~ 2026-01-11)"),
         "{text}"
     );
+    assert!(text.contains("Weekly Agent Report"), "{text}");
+
+    // 3-1. lang 으로 본문 언어 지정 (설정은 en): ko 는 한국어 본문으로 덮어씀, 모르는 값은 400
+    let korean_path = "/api/report?week=2026-W02&lang=ko";
+    let (status, _, text) = send_raw("POST", port, korean_path, &token, b"").await;
+    assert_eq!(status, 200, "{text}");
+    let (_, _, text) = send_raw("GET", port, "/api/report?week=2026-W02", &[], b"").await;
+    assert!(!text.contains("Weekly Agent Report"), "{text}");
+    assert!(text.contains("2026-W02"), "{text}");
+    let french_path = "/api/report?week=2026-W02&lang=fr";
+    let (status, _, _) = send_raw("POST", port, french_path, &token, b"").await;
+    assert_eq!(status, 400);
 
     // 4. 없는 주와 일일 키 분리
     let (status, _, _) = send_raw("GET", port, "/api/report?week=2026-W03", &[], b"").await;

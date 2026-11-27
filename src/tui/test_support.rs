@@ -11,12 +11,10 @@ use crate::core::model::{
 use crate::inventory::{AgentEntry, DoctorFinding, HookEntry, Inventory, McpEntry, SkillEntry};
 use crate::store::limits::LimitSnapshot;
 use crate::store::metrics::{AttributionDimension, MetricAttributionRow};
-use crate::store::otel_events::CompactionStat;
 use crate::store::query::{
     AgentRunSummary, AgentStatsRow, CacheBreakRow, HookStatRow, MinuteBucket, ModelStatsRow,
     OverviewStats, ProjectStatsRow, SkillStatsRow, ToolLatencyRow, UsageShare,
 };
-use crate::store::ratelimit::RatelimitSnapshotRow;
 use crate::tui::i18n::Lang;
 use crate::tui::state::{AppState, DashboardSnapshot, DbState, LimitsData, Panel};
 use chrono::{DateTime, Duration, NaiveDate, SecondsFormat, TimeZone, Utc};
@@ -160,6 +158,8 @@ pub fn sample_state_with_tables() -> AppState {
             p50_ms: Some(85),
             p90_ms: Some(1_900),
             total_ms: 96_000,
+            avg_ms: Some(85),
+            max_ms: Some(1_900),
         },
         ToolLatencyRow {
             tool_name: "Read".to_string(),
@@ -168,6 +168,8 @@ pub fn sample_state_with_tables() -> AppState {
             p50_ms: Some(12),
             p90_ms: Some(40),
             total_ms: 21_000,
+            avg_ms: Some(12),
+            max_ms: Some(40),
         },
         ToolLatencyRow {
             tool_name: "Edit".to_string(),
@@ -176,6 +178,8 @@ pub fn sample_state_with_tables() -> AppState {
             p50_ms: None,
             p90_ms: None,
             total_ms: 4_000,
+            avg_ms: None,
+            max_ms: None,
         },
     ]);
     state.snapshot.hooks = Panel::Ready(vec![
@@ -188,6 +192,9 @@ pub fn sample_state_with_tables() -> AppState {
             p50_ms: Some(3),
             p90_ms: Some(9),
             saved_ms: 189_000,
+            avg_ms: Some(3),
+            max_ms: Some(9),
+            total_ms: 135,
         },
         HookStatRow {
             route: "pretool".to_string(),
@@ -198,6 +205,9 @@ pub fn sample_state_with_tables() -> AppState {
             p50_ms: Some(4),
             p90_ms: Some(6),
             saved_ms: 0,
+            avg_ms: Some(4),
+            max_ms: Some(6),
+            total_ms: 12,
         },
     ]);
     state.snapshot.model_stats = Panel::Ready(vec![
@@ -215,6 +225,9 @@ pub fn sample_state_with_tables() -> AppState {
             cache_hit_ratio: 0.842,
             wait_p50_ms: Some(1_200),
             wait_p90_ms: Some(3_400),
+            wait_avg_ms: Some(1_200),
+            wait_max_ms: Some(3_400),
+            wait_total_ms: 1_080_000,
             cost_usd_estimate: 12.345,
             last_ts: "2026-11-15T01:00:00Z".to_string(),
             first_ts: "2026-11-14T22:00:00Z".to_string(),
@@ -237,6 +250,9 @@ pub fn sample_state_with_tables() -> AppState {
             cache_hit_ratio: 0.9,
             wait_p50_ms: Some(300),
             wait_p90_ms: None,
+            wait_avg_ms: Some(300),
+            wait_max_ms: None,
+            wait_total_ms: 450_000,
             cost_usd_estimate: 0.75,
             last_ts: "2026-11-15T01:30:00Z".to_string(),
             first_ts: "2026-11-14T23:00:00Z".to_string(),
@@ -264,6 +280,9 @@ pub fn sample_state_with_tables() -> AppState {
             cache_hit_ratio: 0.85,
             wait_p50_ms: Some(1_100),
             wait_p90_ms: Some(3_000),
+            wait_avg_ms: Some(1_100),
+            wait_max_ms: Some(3_000),
+            wait_total_ms: 770_000,
             cost_usd_estimate: 9.5,
             tool_calls: 500,
             tool_errors: 4,
@@ -305,6 +324,9 @@ pub fn sample_state_with_tables() -> AppState {
             cache_hit_ratio: 0.8,
             wait_p50_ms: Some(400),
             wait_p90_ms: None,
+            wait_avg_ms: Some(400),
+            wait_max_ms: None,
+            wait_total_ms: 680_000,
             cost_usd_estimate: 3.6,
             tool_calls: 380,
             tool_errors: 0,
@@ -339,6 +361,9 @@ pub fn sample_state_with_tables() -> AppState {
             cache_creation_5m_tokens: 200_000,
             cache_creation_1h_tokens: 100_000,
             cost_usd_estimate: 8.4,
+            wait_avg_ms: None,
+            wait_max_ms: None,
+            wait_total_ms: 0,
             last_ts: "2026-11-15T01:30:00Z".to_string(),
             first_ts: "2026-11-14T22:00:00Z".to_string(),
             models: vec![usage_share(
@@ -607,8 +632,8 @@ pub fn fixed_limits_now() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 11, 19, 10, 0, 0).unwrap()
 }
 
-// now 기준: 5시간 창 2시간 경과 70% (한 시간 전 50%, 리셋 3시간 뒤), 7일 창 하루 경과 35%,
-// 컨텍스트 62%에 컴팩션 2회, 캡시 4분 12초 남음 (적중 82%, 미스 9/50), API 키 요청 480/500·토큰 80K/100K
+// now 기준: 5시간 창 70% (리셋 3시간 뒤), 7일 창 35%, 컨텍스트 62%,
+// 캐시 4분 12초 남음 (적중 82%, 미스 9/50), 스냅샷은 12초 전
 pub fn sample_limits_data(now: DateTime<Utc>) -> LimitsData {
     let stamp = |offset_secs: i64| {
         (now + Duration::seconds(offset_secs)).to_rfc3339_opts(SecondsFormat::Millis, true)
@@ -641,24 +666,7 @@ pub fn sample_limits_data(now: DateTime<Utc>) -> LimitsData {
         ..earlier.clone()
     };
     LimitsData {
-        latest: Some(latest.clone()),
-        history: vec![earlier, latest],
-        api_key: Some(RatelimitSnapshotRow {
-            ts: stamp(-30),
-            requests_limit: Some(500),
-            requests_remaining: Some(480),
-            requests_reset: Some(stamp(720)),
-            tokens_limit: Some(100_000),
-            tokens_remaining: Some(80_000),
-            ..RatelimitSnapshotRow::default()
-        }),
-        compaction: Some(CompactionStat {
-            session_id: "sess-1".to_string(),
-            count: 2,
-            ..CompactionStat::default()
-        }),
-        estimate_5h: None,
-        estimate_7d: None,
+        latest: Some(latest),
     }
 }
 

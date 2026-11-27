@@ -783,12 +783,20 @@ mod tests {
             .expect("같은 묶음");
         assert_eq!(same_group.count, 2);
         assert_eq!(same_group.p50_ms, Some(40));
+        assert_eq!(
+            (same_group.avg_ms, same_group.max_ms, same_group.total_ms),
+            (Some(40), Some(40), 40)
+        );
         let other_group = stats
             .iter()
             .find(|row| row.route == "pretool-chain")
             .expect("다른 묶음");
         assert_eq!(other_group.count, 0);
         assert_eq!(other_group.p50_ms, Some(25));
+        assert_eq!(
+            (other_group.avg_ms, other_group.max_ms, other_group.total_ms),
+            (Some(25), Some(25), 25)
+        );
         drop(store);
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -2,18 +2,15 @@
 //! 개요 탭: 서버 상태 카드, KPI 카드, 절약 카드, 분당 추이, 실시간 이벤트 피드와 이벤트 상세.
 
 use crate::core::model::{LiveEvent, PortStatus};
-use crate::store::limits::LimitSnapshot;
 use crate::store::query::MinuteBucket;
-use crate::store::ratelimit::RatelimitSnapshotRow;
 use crate::tui::cards::CardId;
-use crate::tui::format::{
-    fit_display, format_compact, format_count, format_duration_ms, pad_left_display,
-};
-use crate::tui::i18n::{self, Lang, Msg};
-use crate::tui::layout::{SplitAxis, SplitGroup};
+use crate::tui::format::{format_compact, format_count, format_duration_ms};
+use crate::tui::i18n::{self, Msg};
+use crate::tui::layout::grid::{CardSlot, SlotHeight};
 use crate::tui::sort::{compare_event_row, sort_rows};
-use crate::tui::state::{AppState, DbState, LimitsData, Panel};
+use crate::tui::state::{ActiveTab, AppState, DbState, Panel};
 use crate::tui::theme;
+use crate::tui::views::charts::{render_activity_chart, render_token_mix, render_top_tools};
 use crate::tui::views::common::{
     CardTable, PanelNote, TableCell, TextCard, clip_spans_to_width, interactive_card,
     pack_spans_to_width, panel_message, render_card_table, render_db_gate, render_notice_card,
@@ -22,57 +19,38 @@ use crate::tui::views::common::{
 use crate::tui::views::feed::{
     FEED_COLUMNS, build_event_context_lines, build_event_detail_lines, build_feed_row,
 };
-use chrono::{DateTime, Local, NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Gauge, Padding, Paragraph, Sparkline, Wrap};
+use ratatui::widgets::{Gauge, Padding, Paragraph, Sparkline};
 
 const SPARK_MINUTES: usize = 60;
-const CACHE_CARD_INDEX: usize = 2;
 const HEADER_HEIGHT: u16 = 4;
 const KPI_HEIGHT: u16 = 4;
 const TREND_HEIGHT: u16 = 5;
-// 본문이 이 높이 이상이면 추이 줄을 한 줄 키워 한도 카드에 API 키 줄까지 넣음
+// 본문이 이 높이 이상이면 추이 줄을 한 줄 키움
 const TALL_LAYOUT_MIN_HEIGHT: u16 = 24;
 const TREND_HEIGHT_TALL: u16 = 6;
-// 분당 추이 카드가 읽을 수 있는 최소 폭 (이 밑으로 내려가면 두 추이 카드를 숨김)
-const TREND_MIN_WIDTH: u16 = 12;
-// 한도 카드: 공식 스냅샷이 이 시간(초)보다 오래되면 흐리게, 막대·퍼센트 색 기준(%)
+// 모델 탭 캐시 카드: 공식 스냅샷이 이 시간(초)보다 오래되면 흐리게
 pub(crate) const LIMIT_STALE_SECS: i64 = 1_800;
-const LIMIT_WARN_PCT: f64 = 80.0;
-const LIMIT_CRIT_PCT: f64 = 95.0;
-// 한도 창 길이(초), 페이스 판정 허용 차(%p), 소진 예상 계산에 필요한 최소 기록 간격·되돌아볼 길이(초)
-const FIVE_HOUR_SECS: i64 = 5 * 3_600;
-const SEVEN_DAY_SECS: i64 = 7 * 86_400;
-const PACE_TOLERANCE_PCT: f64 = 5.0;
-const PROJECTION_MIN_SPAN_SECS: i64 = 300;
-const PROJECTION_LOOKBACK_SECS: i64 = 3 * 3_600;
-// 한도 줄 열 폭: 이름 칸, 퍼센트, 막대 최소·최대
-const LIMIT_LABEL_WIDTH: usize = 3;
-const LIMIT_PCT_WIDTH: usize = 4;
-const BAR_MIN_WIDTH: usize = 4;
-const BAR_MAX_WIDTH: usize = 10;
-// 최소 막대로 리셋·페이스·소진 예상까지 다 담는 줄 폭 (이보다 넓으면 막대가 길어짐)
-const LIMIT_FULL_ROW_WIDTH: usize = 42;
-// 추이 줄까지 넣을 수 있는 최소 본문 높이
-const FULL_LAYOUT_MIN_HEIGHT: u16 = 18;
 // 이 폭 이상 카드만 안쪽 가로 여백 1열
 const KPI_PADDING_MIN_WIDTH: u16 = 12;
-// 절약 카드 항목 이름 폭과 값 열 폭
-const SAVINGS_LABEL_WIDTH: usize = 14;
-const SAVINGS_VALUE_WIDTH: usize = 9;
-const KPI_CARD_IDS: [CardId; 6] = [
-    CardId::KpiRequests,
-    CardId::KpiTokens,
-    CardId::KpiCache,
-    CardId::KpiWait,
-    CardId::KpiTools,
-    CardId::KpiHooks,
+// 차트 줄 높이 범위 (상태·KPI·추이 줄 아래 남는 높이의 40%)
+const CHART_HEIGHT_MIN: u16 = 9;
+const CHART_HEIGHT_MAX: u16 = 14;
+// KPI 카드별 (카드, 제목, 짧은 제목)
+const KPI_TITLES: [(CardId, Msg, Msg); 5] = [
+    (CardId::KpiRequests, Msg::KpiRequests, Msg::KpiRequestsShort),
+    (CardId::KpiTokens, Msg::KpiTokens, Msg::KpiTokensShort),
+    (CardId::KpiCache, Msg::KpiCache, Msg::KpiCacheShort),
+    (CardId::KpiTools, Msg::KpiTools, Msg::KpiToolsShort),
+    (CardId::KpiHooks, Msg::KpiHooks, Msg::KpiHooksShort),
 ];
 
 // 1. 개요 탭 ------------------------------------------------------------------
+// 탭 격자 배치 (카드는 어느 줄로든 옮길 수 있음), 카드마다 받은 영역에 그림
 pub fn render_overview_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
     // 1. DB 없음: 상태 카드만 남기고 아래 전체를 빈 상태로
     if !matches!(state.snapshot.db_state, DbState::Open) {
@@ -89,43 +67,109 @@ pub fn render_overview_tab(frame: &mut Frame, area: Rect, state: &mut AppState) 
         return;
     }
 
-    // 2. 카드 줄 분할 (낮은 화면은 추이 줄 생략), 줄 경계는 드래그로 조절
-    let header_cut = HEADER_HEIGHT;
-    let kpi_cut = HEADER_HEIGHT + KPI_HEIGHT;
-    let (header_area, kpi_area, trend_area, feed_area) = if area.height >= FULL_LAYOUT_MIN_HEIGHT {
-        let trend_height = if area.height >= TALL_LAYOUT_MIN_HEIGHT {
-            TREND_HEIGHT_TALL
-        } else {
-            TREND_HEIGHT
-        };
-        let rows = state.card_layout.split_cards(
-            &mut state.hit_areas,
-            SplitGroup::OverviewRows,
-            SplitAxis::Rows,
-            area,
-            &[header_cut, kpi_cut, kpi_cut + trend_height],
-            &[4, 4, 5, 3],
-        );
-        (rows[0], rows[1], Some(rows[2]), rows[3])
+    // 2. 카드 조건 (추이 rank 2·차트 rank 3 줄은 높이가 모자라면 먼저 숨김, 상세는 이벤트가 있을 때만)
+    let trend_height = if area.height >= TALL_LAYOUT_MIN_HEIGHT {
+        TREND_HEIGHT_TALL
     } else {
-        let rows = state.card_layout.split_cards(
-            &mut state.hit_areas,
-            SplitGroup::OverviewCompactRows,
-            SplitAxis::Rows,
-            area,
-            &[header_cut, kpi_cut],
-            &[3, 3, 3],
-        );
-        (rows[0], rows[1], None, rows[2])
+        TREND_HEIGHT
     };
-
-    // 3. 줄별 카드
-    render_status_header(frame, state, header_area);
-    render_kpi_cards(frame, state, kpi_area);
-    if let Some(trend_area) = trend_area {
-        render_savings_and_trends(frame, state, trend_area);
+    let feed_height = area
+        .height
+        .saturating_sub(HEADER_HEIGHT + KPI_HEIGHT + trend_height);
+    let chart_height = (feed_height * 2 / 5).clamp(CHART_HEIGHT_MIN, CHART_HEIGHT_MAX);
+    let fixed_cards: [(CardId, u16, u16, u16, u16, u8, u16); 12] = [
+        (CardId::ServerStatus, 20, 3, HEADER_HEIGHT, 1, 0, 0),
+        (CardId::KpiRequests, 8, 3, KPI_HEIGHT, 10, 0, 0),
+        (CardId::KpiTokens, 8, 3, KPI_HEIGHT, 10, 0, 0),
+        (CardId::KpiCache, 8, 3, KPI_HEIGHT, 10, 0, 0),
+        (CardId::KpiTools, 8, 3, KPI_HEIGHT, 10, 0, 0),
+        (CardId::KpiHooks, 8, 3, KPI_HEIGHT, 10, 0, 0),
+        (CardId::SavingsEffect, 8, 3, KPI_HEIGHT, 11, 0, 0),
+        (CardId::TrendRequests, 16, 5, trend_height, 1, 2, 5),
+        (CardId::TrendTokens, 16, 5, trend_height, 1, 2, 5),
+        (CardId::ChartActivity, 28, 6, chart_height, 38, 3, 9),
+        (CardId::ChartTokens, 27, 6, chart_height, 32, 3, 9),
+        (CardId::ChartTools, 21, 6, chart_height, 30, 3, 9),
+    ];
+    let mut slots: Vec<CardSlot> = Vec::with_capacity(fixed_cards.len() + 2);
+    for (card, min_w, min_h, rows, weight, rank, reserve) in fixed_cards {
+        slots.push(CardSlot {
+            card,
+            min_w,
+            min_h,
+            height: SlotHeight::Fixed(rows),
+            weight,
+            rank,
+            reserve,
+        });
     }
-    render_feed_row(frame, state, feed_area);
+    slots.push(CardSlot {
+        card: CardId::EventFeed,
+        min_w: 24,
+        min_h: 3,
+        height: SlotHeight::Fill,
+        weight: 7,
+        rank: 0,
+        reserve: 0,
+    });
+    if matches!(&state.snapshot.events, Panel::Ready(rows) if !rows.is_empty()) {
+        slots.push(CardSlot {
+            card: CardId::EventDetail,
+            min_w: 20,
+            min_h: 3,
+            height: SlotHeight::Fill,
+            weight: 3,
+            rank: 0,
+            reserve: 0,
+        });
+    }
+
+    // 3. 격자 배치 (줄·카드 경계 드래그와 줄 적중 영역은 arrange_tab 이 등록)
+    let layout = state.card_layout;
+    let placed = layout.arrange_tab(&mut state.hit_areas, ActiveTab::Overview, area, &slots);
+
+    // 4. 카드별 그리기 (보이는 카드만)
+    for (card, rect) in placed {
+        match card {
+            CardId::ServerStatus => render_status_header(frame, state, rect),
+            CardId::KpiRequests
+            | CardId::KpiTokens
+            | CardId::KpiCache
+            | CardId::KpiTools
+            | CardId::KpiHooks => render_kpi_card(frame, state, card, rect),
+            CardId::SavingsEffect => render_savings_card(frame, state, rect),
+            CardId::TrendRequests | CardId::TrendTokens => {
+                render_trend_card(frame, state, card, rect);
+            }
+            CardId::ChartActivity => render_activity_chart(frame, state, rect),
+            CardId::ChartTokens => render_token_mix(frame, state, rect),
+            CardId::ChartTools => render_top_tools(frame, state, rect),
+            CardId::EventFeed => render_event_feed(frame, state, rect),
+            CardId::EventDetail => render_event_detail(frame, state, rect),
+            CardId::Gate
+            | CardId::ToolTable
+            | CardId::ToolDetail
+            | CardId::HookTable
+            | CardId::HookDetail
+            | CardId::ModelTable
+            | CardId::ModelDetail
+            | CardId::CacheBreaks
+            | CardId::AgentTable
+            | CardId::AgentDetail
+            | CardId::SettingsHooks
+            | CardId::SettingsMcp
+            | CardId::SettingsAgents
+            | CardId::SettingsDoctor
+            | CardId::ReportBody
+            | CardId::ReportOutline
+            | CardId::ProjectTable
+            | CardId::ProjectDetail
+            | CardId::AttributionTable
+            | CardId::CacheTimer
+            | CardId::SkillTable
+            | CardId::SkillDetail => {}
+        }
+    }
 }
 
 // 2. 서버 상태 카드 -----------------------------------------------------------
@@ -270,22 +314,32 @@ fn render_status_header(frame: &mut Frame, state: &mut AppState, area: Rect) {
 }
 
 // 3. KPI 카드 -----------------------------------------------------------------
-// 값 줄은 숫자 굵게·라벨 흐리게, 폭이 모자라면 짧은 형태로, 보조 줄은 흐리게
-fn render_kpi_cards(frame: &mut Frame, state: &mut AppState, area: Rect) {
-    // 1. 집계 준비 확인
+// 값 줄은 숫자 굵게·라벨 흐리게, 폭이 모자라면 짧은 형태로, 보조 줄은 흐리게 (캐시 카드는 게이지)
+fn render_kpi_card(frame: &mut Frame, state: &mut AppState, card: CardId, area: Rect) {
+    // 1. 제목 (카드 폭이 모자라면 짧은 제목)
     let lang = state.lang;
     let word = |msg: Msg| i18n::text(lang, msg);
+    let Some((_, full_msg, short_msg)) = KPI_TITLES.iter().find(|(kpi, _, _)| *kpi == card) else {
+        return;
+    };
+    let full_title = word(*full_msg);
+    let title = if Span::raw(full_title).width() + 4 <= usize::from(area.width) {
+        full_title
+    } else {
+        word(*short_msg)
+    };
+
+    // 2. 집계 준비 확인 (준비 전·실패는 이 카드 영역의 안내 카드)
     let overview = match &state.snapshot.overview {
         Panel::Ready(stats) => stats.clone(),
         other => {
             let note = panel_message(lang, other).unwrap_or_default();
-            let title = word(Msg::TitleSummary);
-            render_notice_card(frame, state, CardId::KpiRequests, area, title, note);
+            render_notice_card(frame, state, card, area, title, note);
             return;
         }
     };
 
-    // 2. 카드 내용 (제목, 짧은 제목, 값 줄 후보(긴 형태부터), 보조 줄)
+    // 3. 카드 내용 (값 줄 후보는 긴 형태부터, 보조 줄)
     let strong = theme::STYLE_STRONG;
     let dim = theme::STYLE_DIM;
     let faint = theme::STYLE_FAINT;
@@ -308,6 +362,8 @@ fn render_kpi_cards(frame: &mut Frame, state: &mut AppState, area: Rect) {
         theme::STYLE_DIM
     };
     let error_style = error_base.add_modifier(Modifier::BOLD);
+    let deny_style = theme::STYLE_CRIT.add_modifier(Modifier::BOLD);
+    let rewrite_style = theme::STYLE_OK.add_modifier(Modifier::BOLD);
     let rewrite_share = if hook_denials + hook_rewrites > 0 {
         format!(
             "{:.0}%",
@@ -318,16 +374,9 @@ fn render_kpi_cards(frame: &mut Frame, state: &mut AppState, area: Rect) {
     };
     let input_text = format_compact(overview.input_tokens);
     let output_text = format_compact(overview.output_tokens);
-    let wait_p50 = overview
-        .model_wait_p50_ms
-        .map_or("-".to_string(), format_duration_ms);
-    let wait_p90 = overview
-        .model_wait_p90_ms
-        .map_or("-".to_string(), format_duration_ms);
-    let cards: [(&str, &str, Vec<Line<'static>>, Vec<Line<'static>>); 6] = [
+    let contents: [(CardId, Vec<Line<'static>>, Vec<Line<'static>>); 5] = [
         (
-            word(Msg::KpiRequests),
-            word(Msg::KpiRequestsShort),
+            CardId::KpiRequests,
             vec![Line::from(vec![
                 Span::styled(
                     format_count(i64::try_from(overview.api_requests).unwrap_or(i64::MAX)),
@@ -341,8 +390,7 @@ fn render_kpi_cards(frame: &mut Frame, state: &mut AppState, area: Rect) {
             ))],
         ),
         (
-            word(Msg::KpiTokens),
-            word(Msg::KpiTokensShort),
+            CardId::KpiTokens,
             vec![
                 Line::from(vec![
                     Span::styled(format!("{} ", word(Msg::KpiInput)), dim),
@@ -382,8 +430,7 @@ fn render_kpi_cards(frame: &mut Frame, state: &mut AppState, area: Rect) {
             ],
         ),
         (
-            word(Msg::KpiCache),
-            word(Msg::KpiCacheShort),
+            CardId::KpiCache,
             vec![Line::from("")],
             vec![Line::from(Span::styled(
                 i18n::cache_read_detail(lang, &format_compact(overview.cache_read_tokens)),
@@ -391,35 +438,7 @@ fn render_kpi_cards(frame: &mut Frame, state: &mut AppState, area: Rect) {
             ))],
         ),
         (
-            word(Msg::KpiWait),
-            word(Msg::KpiWaitShort),
-            vec![
-                Line::from(vec![
-                    Span::styled("p50 ", dim),
-                    Span::styled(wait_p50.clone(), strong),
-                    Span::raw("  "),
-                    Span::styled("p90 ", dim),
-                    Span::styled(wait_p90.clone(), strong),
-                ]),
-                Line::from(vec![
-                    Span::styled(wait_p50.clone(), strong),
-                    Span::styled(" / ", faint),
-                    Span::styled(wait_p90.clone(), strong),
-                ]),
-                Line::from(vec![
-                    Span::styled(wait_p50, strong),
-                    Span::styled("/", faint),
-                    Span::styled(wait_p90, strong),
-                ]),
-            ],
-            vec![
-                Line::from(Span::styled(word(Msg::KpiWaitDetail), dim)),
-                Line::from(Span::styled(word(Msg::KpiWaitDetailShort), dim)),
-            ],
-        ),
-        (
-            word(Msg::KpiTools),
-            word(Msg::KpiToolsShort),
+            CardId::KpiTools,
             vec![
                 Line::from(vec![
                     Span::styled(format!("{} ", word(Msg::KpiCalls)), dim),
@@ -445,43 +464,24 @@ fn render_kpi_cards(frame: &mut Frame, state: &mut AppState, area: Rect) {
             ))],
         ),
         (
-            word(Msg::KpiHooks),
-            word(Msg::KpiHooksShort),
+            CardId::KpiHooks,
             vec![
                 Line::from(vec![
                     Span::styled(format!("{} ", word(Msg::KpiDeny)), dim),
-                    Span::styled(
-                        format_count(hook_denials),
-                        theme::STYLE_CRIT.add_modifier(Modifier::BOLD),
-                    ),
+                    Span::styled(format_count(hook_denials), deny_style),
                     Span::raw("  "),
                     Span::styled(format!("{} ", word(Msg::KpiRewrite)), dim),
-                    Span::styled(
-                        format_count(hook_rewrites),
-                        theme::STYLE_OK.add_modifier(Modifier::BOLD),
-                    ),
+                    Span::styled(format_count(hook_rewrites), rewrite_style),
                 ]),
                 Line::from(vec![
-                    Span::styled(
-                        format_count(hook_denials),
-                        theme::STYLE_CRIT.add_modifier(Modifier::BOLD),
-                    ),
+                    Span::styled(format_count(hook_denials), deny_style),
                     Span::styled(" / ", faint),
-                    Span::styled(
-                        format_count(hook_rewrites),
-                        theme::STYLE_OK.add_modifier(Modifier::BOLD),
-                    ),
+                    Span::styled(format_count(hook_rewrites), rewrite_style),
                 ]),
                 Line::from(vec![
-                    Span::styled(
-                        format_count(hook_denials),
-                        theme::STYLE_CRIT.add_modifier(Modifier::BOLD),
-                    ),
+                    Span::styled(format_count(hook_denials), deny_style),
                     Span::styled("/", faint),
-                    Span::styled(
-                        format_count(hook_rewrites),
-                        theme::STYLE_OK.add_modifier(Modifier::BOLD),
-                    ),
+                    Span::styled(format_count(hook_rewrites), rewrite_style),
                 ]),
             ],
             vec![
@@ -496,371 +496,234 @@ fn render_kpi_cards(frame: &mut Frame, state: &mut AppState, area: Rect) {
             ],
         ),
     ];
-
-    // 3. 카드 분할 (기본 균등 6칸, 카드 사이 경계 드래그)
-    let default_columns = Layout::horizontal([Constraint::Fill(1); 6])
-        .spacing(1)
-        .split(area);
-    let default_cuts: Vec<u16> = default_columns[..5]
-        .iter()
-        .map(|column| column.right() - area.x)
-        .collect();
-    let columns = state.card_layout.split_cards(
-        &mut state.hit_areas,
-        SplitGroup::OverviewKpiCols,
-        SplitAxis::Columns,
-        area,
-        &default_cuts,
-        &[8; 6],
-    );
+    let Some((_, value_lines, detail_lines)) =
+        contents.into_iter().find(|(kpi, _, _)| *kpi == card)
+    else {
+        return;
+    };
 
     // 4. 카드 그리기 (캐시 카드는 게이지, 줄은 폭에 맞는 첫 후보)
-    let pick_fit = |variants: Vec<Line<'static>>, width: usize| -> Line<'static> {
-        // 4-1. 폭에 맞는 첫 후보
-        let last = variants.len() - 1;
-        let chosen = variants
-            .into_iter()
-            .enumerate()
-            .find(|(position, line)| line.width() <= width || *position == last)
-            .map(|(_, line)| line)
-            .unwrap_or_default();
-        let mut spans = chosen.spans;
-        let mut used: usize = spans.iter().map(Span::width).sum();
-        if used <= width {
-            return Line::from(spans);
-        }
-
-        // 4-2. 넘침 말줄임 (뒤 조각부터 덜어냄)
-        while spans.len() > 1 && used + 1 > width {
-            if let Some(tail) = spans.pop() {
-                used -= tail.width();
-            }
-        }
-        let tail_style = spans.last().map_or(Style::default(), |span| span.style);
-        spans.push(Span::styled("…", tail_style));
-        Line::from(clip_spans_to_width(spans, width))
-    };
-    for (index, (full_title, short_title, value_lines, detail_lines)) in
-        cards.into_iter().enumerate()
-    {
-        let pane = columns[index];
-        // 카드 폭이 모자라면 짧은 제목
-        let title = if Span::raw(full_title).width() + 4 <= pane.width as usize {
-            full_title
-        } else {
-            short_title
-        };
-        let mut block = interactive_card(
-            state,
-            KPI_CARD_IDS[index],
-            pane,
-            title,
-            "",
-            theme::BORDER_DIM,
-        );
-        if pane.width >= KPI_PADDING_MIN_WIDTH {
-            block = block.padding(Padding::horizontal(1));
-        }
-        let inner = block.inner(pane);
-        frame.render_widget(block, pane);
-        if inner.height < 2 {
-            continue;
-        }
-        let first_row = Rect::new(inner.x, inner.y, inner.width, 1);
-        let second_row = Rect::new(inner.x, inner.y + 1, inner.width, 1);
-        if index == CACHE_CARD_INDEX {
-            let ratio = overview.cache_hit_ratio.clamp(0.0, 1.0);
-            let gauge_color = if ratio >= 0.8 {
-                theme::COLOR_OK
-            } else if ratio >= 0.5 {
-                theme::COLOR_WARN
-            } else {
-                theme::COLOR_CRIT
-            };
-            let gauge = Gauge::default()
-                .ratio(ratio)
-                .label(Span::styled(
-                    format!("{:.1}%", ratio * 100.0),
-                    Style::new().add_modifier(Modifier::BOLD),
-                ))
-                .gauge_style(Style::default().fg(gauge_color).bg(theme::GAUGE_TRACK));
-            frame.render_widget(gauge, first_row);
-        } else {
-            let value_line = pick_fit(value_lines, inner.width as usize);
-            frame.render_widget(Paragraph::new(value_line), first_row);
-        }
-        let detail_line = pick_fit(detail_lines, inner.width as usize);
-        frame.render_widget(Paragraph::new(detail_line), second_row);
+    let mut block = interactive_card(state, card, area, title, "", theme::BORDER_DIM);
+    if area.width >= KPI_PADDING_MIN_WIDTH {
+        block = block.padding(Padding::horizontal(1));
     }
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height < 2 {
+        return;
+    }
+    let first_row = Rect::new(inner.x, inner.y, inner.width, 1);
+    let second_row = Rect::new(inner.x, inner.y + 1, inner.width, 1);
+    if card == CardId::KpiCache {
+        let ratio = overview.cache_hit_ratio.clamp(0.0, 1.0);
+        let gauge_color = if ratio >= 0.8 {
+            theme::COLOR_OK
+        } else if ratio >= 0.5 {
+            theme::COLOR_WARN
+        } else {
+            theme::COLOR_CRIT
+        };
+        let gauge = Gauge::default()
+            .ratio(ratio)
+            .label(Span::styled(
+                format!("{:.1}%", ratio * 100.0),
+                Style::new().add_modifier(Modifier::BOLD),
+            ))
+            .gauge_style(Style::default().fg(gauge_color).bg(theme::GAUGE_TRACK));
+        frame.render_widget(gauge, first_row);
+    } else {
+        let value_line = fit_variant_line(value_lines, inner.width as usize);
+        frame.render_widget(Paragraph::new(value_line), first_row);
+    }
+    let detail_line = fit_variant_line(detail_lines, inner.width as usize);
+    frame.render_widget(Paragraph::new(detail_line), second_row);
 }
 
-// 4. 절약 카드와 분당 추이 ----------------------------------------------------
-fn render_savings_and_trends(frame: &mut Frame, state: &mut AppState, area: Rect) {
+// 4. 절약 카드 ----------------------------------------------------------------
+// 오늘 절약 시간 대 거부 손실 추정: 1행 순효과, 2행 절약·손실 (긴 이름, 짧은 이름, 값만 순으로 폭에 맞춤)
+fn render_savings_card(frame: &mut Frame, state: &mut AppState, area: Rect) {
+    // 1. 제목 (카드 폭이 모자라면 짧은 제목)
     let lang = state.lang;
     let word = |msg: Msg| i18n::text(lang, msg);
-    // 1. 카드 분할 (오른쪽 끝 한도 카드 34~46열, 남는 폭에서 절약 30%를 31~40열로, 나머지 둘은 균등, 좋으면 한도 카드 폭을 먼저 지킴)
-    let width = u32::from(area.width);
-    let limits_width = (width * 38 / 100).clamp(38, 48).min(width * 45 / 100);
-    let rest = width.saturating_sub(limits_width + 1);
-    let first_cut = (rest * 30 / 100).clamp(28, 40).min(rest / 2);
-    let second_cut = first_cut + 1 + rest.saturating_sub(first_cut + 1) / 2;
-    // 추이 카드가 읽을 수 있는 최소 폭(TREND_MIN_WIDTH) 밑이면 두 추이 카드를 숨기고 한도·절약 카드가 폭을 나눔 (추이는 우선순위가 가장 낮음, 칸 위치와 무관)
-    let requests_width = second_cut.saturating_sub(first_cut + 1);
-    let tokens_width = rest.saturating_sub(second_cut + 1);
-    let trends_hidden = requests_width.min(tokens_width) < u32::from(TREND_MIN_WIDTH);
-    let group = SplitGroup::OverviewTrendCols;
-    let mut layout = state.card_layout;
-    let (cuts, slot_mins) = if trends_hidden {
-        layout.clear_ratios(group);
-        let wide_limits = (width * 50 / 100).clamp(38, 48).min(width * 55 / 100);
-        layout.visible_slot_plan(
-            group,
-            &[1, 2],
-            &[(width - wide_limits - 1) as u16, 0, 0, wide_limits as u16],
-            &[24, 16, 16, 28],
-            area.width,
-        )
+    let full_title = word(Msg::TitleSavings);
+    let title = if Span::raw(full_title).width() + 4 <= usize::from(area.width) {
+        full_title
     } else {
-        layout.visible_slot_plan(
-            group,
-            &[],
-            &[
-                first_cut as u16,
-                requests_width as u16,
-                tokens_width as u16,
-                limits_width as u16,
-            ],
-            &[24, 16, 16, 28],
-            area.width,
-        )
+        word(Msg::TitleSavingsShort)
     };
-    let panes = layout.split_cards(
-        &mut state.hit_areas,
-        group,
-        SplitAxis::Columns,
-        area,
-        &cuts,
-        &slot_mins,
-    );
-    render_limits_card(frame, state, panes[3]);
 
-    // 2. 오늘 절약 시간 대 거부 손실 추정
+    // 2. 오늘 집계 확인 (준비 전·실패는 이 카드 영역의 안내 카드)
     let today = match &state.snapshot.today {
-        Panel::Ready(stats) => Some(stats.clone()),
-        _ => None,
+        Panel::Ready(stats) => stats.clone(),
+        other => {
+            let note = panel_message(lang, other).unwrap_or_default();
+            render_notice_card(frame, state, CardId::SavingsEffect, area, title, note);
+            return;
+        }
     };
-    match today {
-        Some(today) => {
-            let net = today.saved_ms - today.lost_ms_estimate;
-            let net_style = if net >= 0 {
-                theme::STYLE_OK
-            } else {
-                theme::STYLE_CRIT
-            };
-            let block = interactive_card(
-                state,
-                CardId::SavingsEffect,
-                panes[0],
-                word(Msg::TitleSavings),
-                "",
-                theme::BORDER_DIM,
-            )
-            .padding(Padding::horizontal(1));
-            let inner = block.inner(panes[0]);
-            frame.render_widget(block, panes[0]);
-            let lines = vec![
-                Line::from(vec![
-                    Span::styled(
-                        fit_display(word(Msg::SavingsSaved), SAVINGS_LABEL_WIDTH),
-                        theme::STYLE_DIM,
-                    ),
-                    Span::styled(
-                        pad_left_display(
-                            &format!("+{}", format_duration_ms(today.saved_ms)),
-                            SAVINGS_VALUE_WIDTH,
-                        ),
-                        theme::STYLE_OK.add_modifier(Modifier::BOLD),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled(
-                        fit_display(word(Msg::SavingsLoss), SAVINGS_LABEL_WIDTH),
-                        theme::STYLE_DIM,
-                    ),
-                    Span::styled(
-                        pad_left_display(
-                            &format!("-{}", format_duration_ms(today.lost_ms_estimate)),
-                            SAVINGS_VALUE_WIDTH,
-                        ),
-                        theme::STYLE_CRIT.add_modifier(Modifier::BOLD),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled(
-                        fit_display(word(Msg::SavingsNet), SAVINGS_LABEL_WIDTH),
-                        theme::STYLE_TEXT,
-                    ),
-                    Span::styled(
-                        pad_left_display(
-                            &format!(
-                                "{}{}",
-                                if net >= 0 { "+" } else { "-" },
-                                format_duration_ms(net.abs())
-                            ),
-                            SAVINGS_VALUE_WIDTH,
-                        ),
-                        net_style.add_modifier(Modifier::BOLD),
-                    ),
-                ]),
-            ];
-            frame.render_widget(Paragraph::new(lines), inner);
-        }
-        None => {
-            let note = panel_message(lang, &state.snapshot.today).unwrap_or_default();
-            render_notice_card(
-                frame,
-                state,
-                CardId::SavingsEffect,
-                panes[0],
-                word(Msg::TitleSavings),
-                note,
-            );
-        }
+
+    // 3. 줄 후보 (순효과는 부호에 따라 녹색·적색, 절약 녹색, 손실 적색)
+    let net = today.saved_ms - today.lost_ms_estimate;
+    let net_style = if net >= 0 {
+        theme::STYLE_OK
+    } else {
+        theme::STYLE_CRIT
+    }
+    .add_modifier(Modifier::BOLD);
+    let net_sign = if net >= 0 { "+" } else { "-" };
+    let net_text = format!("{net_sign}{}", format_duration_ms(net.abs()));
+    let saved_text = format!("+{}", format_duration_ms(today.saved_ms));
+    let loss_text = format!("-{}", format_duration_ms(today.lost_ms_estimate));
+    let saved_style = theme::STYLE_OK.add_modifier(Modifier::BOLD);
+    let loss_style = theme::STYLE_CRIT.add_modifier(Modifier::BOLD);
+    let net_lines = vec![
+        Line::from(vec![
+            Span::styled(format!("{} ", word(Msg::SavingsNet)), theme::STYLE_TEXT),
+            Span::styled(net_text.clone(), net_style),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                format!("{} ", word(Msg::SavingsNetShort)),
+                theme::STYLE_TEXT,
+            ),
+            Span::styled(net_text.clone(), net_style),
+        ]),
+        Line::from(Span::styled(net_text, net_style)),
+    ];
+    let mut split_lines: Vec<Line<'static>> = Vec::with_capacity(4);
+    for (saved_label, loss_label) in [
+        (Msg::SavingsSaved, Msg::SavingsLoss),
+        (Msg::SavingsSavedShort, Msg::SavingsLossShort),
+    ] {
+        split_lines.push(Line::from(vec![
+            Span::styled(format!("{} ", word(saved_label)), theme::STYLE_DIM),
+            Span::styled(saved_text.clone(), saved_style),
+            Span::raw("  "),
+            Span::styled(format!("{} ", word(loss_label)), theme::STYLE_DIM),
+            Span::styled(loss_text.clone(), loss_style),
+        ]));
+    }
+    for separator in [" / ", "/"] {
+        split_lines.push(Line::from(vec![
+            Span::styled(saved_text.clone(), saved_style),
+            Span::styled(separator, theme::STYLE_FAINT),
+            Span::styled(loss_text.clone(), loss_style),
+        ]));
     }
 
-    // 2-1. 추이 카드를 숨긴 폭에서는 그리지 않고 경계 끌기 영역도 둔다 (숨긴 칸과 겹치는 경계를 잡아 비율이 사라지는 일 방지)
-    if trends_hidden {
-        state
-            .hit_areas
-            .split_hits
-            .retain(|hit| hit.group != SplitGroup::OverviewTrendCols);
+    // 4. 카드 그리기
+    let mut block = interactive_card(
+        state,
+        CardId::SavingsEffect,
+        area,
+        title,
+        "",
+        theme::BORDER_DIM,
+    );
+    if area.width >= KPI_PADDING_MIN_WIDTH {
+        block = block.padding(Padding::horizontal(1));
+    }
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.is_empty() {
         return;
     }
+    let width = usize::from(inner.width);
+    let lines = vec![
+        fit_variant_line(net_lines, width),
+        fit_variant_line(split_lines, width),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
 
-    // 3. 분당 추이가 준비되지 않으면 두 카드가 이웃한 칸일 때 하나의 안내 카드로 (사이 경계는 제거),
-    // 순서를 바꿔 떨어져 있으면 카드마다 안내 카드
+// 5. 분당 추이 카드 -----------------------------------------------------------
+// 분당 요청 또는 출력 토큰 스파크라인 (분마다 k칸, 지금이 오른쪽 끝), 준비 전은 카드마다 안내
+fn render_trend_card(frame: &mut Frame, state: &mut AppState, card: CardId, area: Rect) {
+    // 1. 카드 종류별 제목·계열 색
+    let lang = state.lang;
+    let word = |msg: Msg| i18n::text(lang, msg);
+    let tokens = card == CardId::TrendTokens;
+    let (title, color) = if tokens {
+        (word(Msg::TitleTokensPerMin), theme::CHART_TOKENS)
+    } else {
+        (word(Msg::TitleRequestsPerMin), theme::CHART_REQUESTS)
+    };
+
+    // 2. 분당 추이 준비 확인 (이 카드 영역의 안내 카드)
     if let Some(note) = panel_message(lang, &state.snapshot.minutes) {
-        let request_slot = state.card_layout.slot_of(SplitGroup::OverviewTrendCols, 1);
-        let token_slot = state.card_layout.slot_of(SplitGroup::OverviewTrendCols, 2);
-        match (request_slot, token_slot) {
-            (Some(request_slot), Some(token_slot)) if request_slot.abs_diff(token_slot) == 1 => {
-                let joint = request_slot.min(token_slot);
-                state.hit_areas.split_hits.retain(|hit| {
-                    !(hit.group == SplitGroup::OverviewTrendCols && hit.index == joint)
-                });
-                render_notice_card(
-                    frame,
-                    state,
-                    CardId::TrendRequests,
-                    panes[1].union(panes[2]),
-                    word(Msg::TitleTrend),
-                    note,
-                );
-            }
-            _ => {
-                render_notice_card(
-                    frame,
-                    state,
-                    CardId::TrendRequests,
-                    panes[1],
-                    word(Msg::TitleRequestsPerMin),
-                    note.clone(),
-                );
-                render_notice_card(
-                    frame,
-                    state,
-                    CardId::TrendTokens,
-                    panes[2],
-                    word(Msg::TitleTokensPerMin),
-                    note,
-                );
-            }
-        }
+        render_notice_card(frame, state, card, area, title, note);
         return;
     }
-
-    // 4. 분당 요청·출력 토큰 스파크라인 (분마다 k칸, 지금이 오른쪽 끝)
     let now = state.snapshot.taken_at.unwrap_or_else(Utc::now);
     let Panel::Ready(buckets) = &state.snapshot.minutes else {
         return;
     };
-    let request_series = build_minute_series(buckets, now, |bucket| bucket.api_requests);
-    let token_series = build_minute_series(buckets, now, |bucket| {
-        u64::try_from(bucket.output_tokens).unwrap_or(0)
-    });
-    let trends: [(CardId, &str, &Vec<u64>, Color, Rect); 2] = [
-        (
-            CardId::TrendRequests,
-            word(Msg::TitleRequestsPerMin),
-            &request_series,
-            theme::CHART_REQUESTS,
-            panes[1],
-        ),
-        (
-            CardId::TrendTokens,
-            word(Msg::TitleTokensPerMin),
-            &token_series,
-            theme::CHART_TOKENS,
-            panes[2],
-        ),
-    ];
-    for (card, title, series, color, rect) in trends {
-        let peak = series.iter().copied().max().unwrap_or(0);
-        let mut block = interactive_card(
-            state,
-            card,
-            rect,
-            &i18n::trend_title(lang, title, &format_compact(peak as i64)),
-            "",
-            theme::BORDER_DIM,
-        );
-        if rect.width >= 24 {
-            block = block
-                .title_bottom(
-                    Line::from(Span::styled(
-                        format!(" {} ", word(Msg::TrendMinutesAgo)),
-                        theme::STYLE_DIM,
-                    ))
-                    .left_aligned(),
-                )
-                .title_bottom(
-                    Line::from(Span::styled(
-                        format!(" {} ", word(Msg::TrendNow)),
-                        theme::STYLE_DIM,
-                    ))
-                    .right_aligned(),
-                );
-        }
-        let inner = block.inner(rect);
-        frame.render_widget(block, rect);
-        if inner.is_empty() {
-            continue;
-        }
-        let repeat = (usize::from(inner.width) / SPARK_MINUTES).max(1);
-        let tail = &series[series.len().saturating_sub(usize::from(inner.width))..];
-        let expanded: Vec<u64> = tail
-            .iter()
-            .flat_map(|value| std::iter::repeat_n(*value, repeat))
-            .collect();
-        let drawn_width = (expanded.len() as u16).min(inner.width);
-        let spark_area = Rect::new(
-            inner.right() - drawn_width,
-            inner.y,
-            drawn_width,
-            inner.height,
-        );
-        frame.render_widget(
-            Sparkline::default()
-                .data(expanded.iter())
-                .style(Style::default().fg(color)),
-            spark_area,
-        );
+    let series = if tokens {
+        build_minute_series(buckets, now, |bucket| {
+            u64::try_from(bucket.output_tokens).unwrap_or(0)
+        })
+    } else {
+        build_minute_series(buckets, now, |bucket| bucket.api_requests)
+    };
+
+    // 3. 카드 테두리 (제목에 분당 최대값, 넓으면 아래 테두리에 시간 양 끝)
+    let peak = series.iter().copied().max().unwrap_or(0);
+    let mut block = interactive_card(
+        state,
+        card,
+        area,
+        &i18n::trend_title(lang, title, &format_compact(peak as i64)),
+        "",
+        theme::BORDER_DIM,
+    );
+    if area.width >= 24 {
+        block = block
+            .title_bottom(
+                Line::from(Span::styled(
+                    format!(" {} ", word(Msg::TrendMinutesAgo)),
+                    theme::STYLE_DIM,
+                ))
+                .left_aligned(),
+            )
+            .title_bottom(
+                Line::from(Span::styled(
+                    format!(" {} ", word(Msg::TrendNow)),
+                    theme::STYLE_DIM,
+                ))
+                .right_aligned(),
+            );
     }
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.is_empty() {
+        return;
+    }
+
+    // 4. 스파크라인 (분마다 같은 칸 수, 오른쪽 정렬)
+    let repeat = (usize::from(inner.width) / SPARK_MINUTES).max(1);
+    let tail = &series[series.len().saturating_sub(usize::from(inner.width))..];
+    let expanded: Vec<u64> = tail
+        .iter()
+        .flat_map(|value| std::iter::repeat_n(*value, repeat))
+        .collect();
+    let drawn_width = (expanded.len() as u16).min(inner.width);
+    let spark_area = Rect::new(
+        inner.right() - drawn_width,
+        inner.y,
+        drawn_width,
+        inner.height,
+    );
+    frame.render_widget(
+        Sparkline::default()
+            .data(expanded.iter())
+            .style(Style::default().fg(color)),
+        spark_area,
+    );
 }
 
-// 5. 분 단위 시계열 -----------------------------------------------------------
+// 6. 분 단위 시계열 -----------------------------------------------------------
 // 분 문자열을 해석할 수 있으면 현재 분 기준 60칸에 배치, 아니면 조회 순서의 마지막 60개
-fn build_minute_series(
+pub(crate) fn build_minute_series(
     buckets: &[MinuteBucket],
     now: DateTime<Utc>,
     pick: fn(&MinuteBucket) -> u64,
@@ -889,9 +752,9 @@ fn build_minute_series(
     raw[raw.len().saturating_sub(SPARK_MINUTES)..].to_vec()
 }
 
-// 6. 이벤트 피드와 상세 -------------------------------------------------------
-// 피드는 고정 머리글과 열 격자, 상세는 선택 이벤트 항목과 같은 종류 맥락
-fn render_feed_row(frame: &mut Frame, state: &mut AppState, area: Rect) {
+// 7. 이벤트 피드 --------------------------------------------------------------
+// 고정 머리글과 열 격자 (열 폭은 다른 표 카드와 같은 규칙: 자연 폭, 끌어 정한 폭, 머리글 정렬)
+fn render_event_feed(frame: &mut Frame, state: &mut AppState, area: Rect) {
     // 1. 이벤트 준비 확인
     let lang = state.lang;
     let events = match &state.snapshot.events {
@@ -923,24 +786,7 @@ fn render_feed_row(frame: &mut Frame, state: &mut AppState, area: Rect) {
         return;
     }
 
-    // 2. 피드와 상세 분할 (상세는 30%를 36~56열로, 피드가 60열 미만이면 6 대 4)
-    let total_width = u32::from(area.width);
-    let detail_width = (total_width * 30 / 100).clamp(36, 56);
-    let feed_cut = if total_width.saturating_sub(detail_width + 1) < 60 {
-        total_width * 60 / 100
-    } else {
-        total_width - detail_width - 1
-    };
-    let columns = state.card_layout.split_cards(
-        &mut state.hit_areas,
-        SplitGroup::OverviewFeedCols,
-        SplitAxis::Columns,
-        area,
-        &[feed_cut as u16],
-        &[24, 20],
-    );
-
-    // 3. 피드 표 (정렬한 행, 열 폭은 다른 표 카드와 같은 규칙: 자연 폭, 끌어 정한 폭, 머리글 정렬)
+    // 2. 피드 표 (정렬한 행, 머리글 힌트는 종류별 건수)
     let feed_sort = state.card_sorts[CardId::EventFeed as usize];
     let mut sorted = events.clone();
     sort_rows(&mut sorted, feed_sort, compare_event_row);
@@ -960,7 +806,7 @@ fn render_feed_row(frame: &mut Frame, state: &mut AppState, area: Rect) {
     render_card_table(
         frame,
         state,
-        columns[0],
+        area,
         CardTable {
             card: CardId::EventFeed,
             title: i18n::live_events_title(lang, events.len()),
@@ -970,15 +816,34 @@ fn render_feed_row(frame: &mut Frame, state: &mut AppState, area: Rect) {
             aux_lines: Vec::new(),
         },
     );
+}
 
-    // 4. 선택 이벤트 상세 (남는 높이에 같은 종류 맥락, 맥락은 시각 내림차순 원본 기준)
+// 8. 이벤트 상세 --------------------------------------------------------------
+// 피드에서 선택한 이벤트 항목과 남는 높이에 같은 종류 맥락 (맥락은 시각 내림차순 원본 기준)
+fn render_event_detail(frame: &mut Frame, state: &mut AppState, area: Rect) {
+    // 1. 피드와 같은 정렬로 선택 이벤트 찾기 (이벤트가 없으면 그리지 않음)
+    let lang = state.lang;
+    let Panel::Ready(events) = &state.snapshot.events else {
+        return;
+    };
+    if events.is_empty() {
+        return;
+    }
+    let events = events.clone();
+    let mut sorted = events.clone();
+    sort_rows(
+        &mut sorted,
+        state.card_sorts[CardId::EventFeed as usize],
+        compare_event_row,
+    );
     let selected = state.card_views[CardId::EventFeed as usize]
         .selected
         .min(sorted.len() - 1);
-    let detail_inner_width = columns[1].width.saturating_sub(4) as usize;
+
+    // 2. 상세 줄과 맥락 줄
+    let detail_inner_width = area.width.saturating_sub(4) as usize;
     let mut detail_lines = build_event_detail_lines(lang, &sorted[selected], detail_inner_width);
-    let spare_rows =
-        usize::from(columns[1].height.saturating_sub(2)).saturating_sub(detail_lines.len());
+    let spare_rows = usize::from(area.height.saturating_sub(2)).saturating_sub(detail_lines.len());
     if spare_rows >= 4 {
         detail_lines.extend(build_event_context_lines(
             lang,
@@ -991,7 +856,7 @@ fn render_feed_row(frame: &mut Frame, state: &mut AppState, area: Rect) {
     render_text_card(
         frame,
         state,
-        columns[1],
+        area,
         TextCard {
             card: CardId::EventDetail,
             title: i18n::text(lang, Msg::TitleEventDetail).to_string(),
@@ -1001,326 +866,9 @@ fn render_feed_row(frame: &mut Frame, state: &mut AppState, area: Rect) {
     );
 }
 
-// 7. 한도 카드 ----------------------------------------------------------------
-// 좌우 폭에 맞춘 줄 목록과 테두리 우측 상단 문구 (출처·스냅샷 나이), empty = 보여 줄 없이 설정 안내만
-#[derive(Debug, Default)]
-struct LimitsView {
-    lines: Vec<Line<'static>>,
-    hint: String,
-    empty: bool,
-}
-
-// 한도 줄 하나의 입력 (pct 없으면 -, resets_at 에서 span_secs 를 뺀 시각이 창 시작, note = 맨 뒤 부가 문구)
-#[derive(Debug)]
-struct LimitRow {
-    label: Msg,
-    pct: Option<f64>,
-    resets_at: Option<i64>,
-    span_secs: i64,
-    exhaust_at: Option<i64>,
-    note: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Pace {
-    Ahead,
-    Steady,
-    Behind,
-}
-
-// 7-1. 카드 그리기 ------------------------------------------------------------
-// 공식 스냅샷이 있으면 막대·카운트다운·페이스·소진 예상, 없으면 로컬 토큰 추정, 둘 다 없으면 statusLine 설정 안내
-fn render_limits_card(frame: &mut Frame, state: &mut AppState, area: Rect) {
-    // 1. 보여 줄 계산 (준비되지 않은 패널은 안내 카드)
-    let lang = state.lang;
-    let title = i18n::text(lang, Msg::TitleLimits);
-    let now = state.now_utc().timestamp();
-    let inner_width = usize::from(area.width.saturating_sub(4));
-    let inner_height = usize::from(area.height.saturating_sub(2));
-    let view = match &state.snapshot.limits {
-        Panel::Ready(data) => build_limits_view(lang, data, now, inner_width, inner_height),
-        other => {
-            let note = panel_message(lang, other).unwrap_or_default();
-            render_notice_card(frame, state, CardId::LimitsCard, area, title, note);
-            return;
-        }
-    };
-
-    // 2. 카드 템두리와 본문 (설정 안내는 가운데 정렬·줄바꿈)
-    let block = interactive_card(
-        state,
-        CardId::LimitsCard,
-        area,
-        title,
-        &view.hint,
-        theme::BORDER_DIM,
-    )
-    .padding(Padding::horizontal(1));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.is_empty() {
-        return;
-    }
-    if view.empty {
-        let guide = vec![
-            Line::from(Span::styled(
-                i18n::text(lang, Msg::LimitsEmpty),
-                theme::STYLE_DIM,
-            )),
-            Line::from(Span::styled(
-                i18n::text(lang, Msg::LimitsEmptyHint),
-                theme::STYLE_DIM,
-            )),
-        ];
-        frame.render_widget(
-            Paragraph::new(guide)
-                .alignment(Alignment::Center)
-                .wrap(Wrap { trim: true }),
-            inner,
-        );
-        return;
-    }
-    frame.render_widget(Paragraph::new(view.lines).wrap(Wrap { trim: false }), inner);
-}
-
-// 7-2. 보여 줄 구성 -----------------------------------------------------------
-// 5시간·7일·컨텍스트·API 키 순서로 높이만큼 담음, 오래된 스냅샷(30분 초과)은 전부 흘리게
-// 스냅샷이 없으면 로컬 토큰 추정 두 줄(공식 퍼센트 아님)과 설정 안내, 추정도 없으면 empty
-fn build_limits_view(
-    lang: Lang,
-    data: &LimitsData,
-    now: i64,
-    width: usize,
-    height: usize,
-) -> LimitsView {
-    // 1. 공식 스냅샷 없음: 로컬 토큰 추정
-    let Some(latest) = &data.latest else {
-        let estimates = [
-            (Msg::LimitsLabelFiveHour, &data.estimate_5h),
-            (Msg::LimitsLabelSevenDay, &data.estimate_7d),
-        ];
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        for (label, estimate) in estimates {
-            let Some(stats) = estimate else {
-                continue;
-            };
-            let tokens = stats.input_tokens + stats.output_tokens;
-            if tokens <= 0 {
-                continue;
-            }
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!(
-                        "{} ",
-                        fit_display(i18n::text(lang, label), LIMIT_LABEL_WIDTH)
-                    ),
-                    theme::STYLE_DIM,
-                ),
-                Span::styled(
-                    format!("{} ", i18n::text(lang, Msg::LimitsEstimate)),
-                    theme::STYLE_DIM,
-                ),
-                Span::styled(format_compact(tokens), theme::STYLE_TEXT),
-                Span::styled(
-                    format!(" {}", i18n::text(lang, Msg::LimitsTokensUnit)),
-                    theme::STYLE_DIM,
-                ),
-            ]));
-        }
-        if lines.is_empty() {
-            return LimitsView {
-                empty: true,
-                ..LimitsView::default()
-            };
-        }
-        lines.push(Line::from(Span::styled(
-            i18n::text(lang, Msg::LimitsEmptyHint),
-            theme::STYLE_DIM,
-        )));
-        lines.truncate(height);
-        return LimitsView {
-            lines,
-            hint: i18n::text(lang, Msg::LimitsEstimate).to_string(),
-            empty: false,
-        };
-    };
-
-    // 2. 스냅샷 나이와 출처 문구 (너무 오래되면 흐림으로 보이고 소진 예상은 하지 않음)
-    let age = DateTime::parse_from_rfc3339(&latest.ts)
-        .ok()
-        .map(|stamp| (now - stamp.timestamp()).max(0));
-    let stale = age.is_some_and(|secs| secs > LIMIT_STALE_SECS);
-    let source = i18n::text(lang, Msg::LimitsOfficial);
-    let hint = match age {
-        Some(secs) => i18n::limits_hint(lang, source, &format_age(secs), stale),
-        None => source.to_string(),
-    };
-
-    // 3. 5시간·7일 줄 (같은 창의 스냅샷 기록으로 소진 예상)
-    let five_points = collect_window_points(
-        &data.history,
-        |snapshot| (snapshot.five_hour_pct, snapshot.five_hour_resets_at),
-        latest.five_hour_resets_at,
-    );
-    let seven_points = collect_window_points(
-        &data.history,
-        |snapshot| (snapshot.seven_day_pct, snapshot.seven_day_resets_at),
-        latest.seven_day_resets_at,
-    );
-    let exhaust_of = |points: &[(i64, f64)], resets_at: Option<i64>| {
-        resets_at
-            .filter(|_| !stale)
-            .and_then(|resets_at| project_exhaustion(points, resets_at, now))
-    };
-    let mut rows = vec![
-        LimitRow {
-            label: Msg::LimitsLabelFiveHour,
-            pct: latest.five_hour_pct,
-            resets_at: latest.five_hour_resets_at,
-            span_secs: FIVE_HOUR_SECS,
-            exhaust_at: exhaust_of(&five_points, latest.five_hour_resets_at),
-            note: None,
-        },
-        LimitRow {
-            label: Msg::LimitsLabelSevenDay,
-            pct: latest.seven_day_pct,
-            resets_at: latest.seven_day_resets_at,
-            span_secs: SEVEN_DAY_SECS,
-            exhaust_at: exhaust_of(&seven_points, latest.seven_day_resets_at),
-            note: None,
-        },
-    ];
-
-    // 4. 현재 세션 컨텍스트와 컴팩션 횟수 (기록이 현재 세션의 것일 때만 셈)
-    if latest.context_pct.is_some() {
-        let compactions = data
-            .compaction
-            .as_ref()
-            .filter(|stat| stat.session_id == latest.session_id)
-            .map_or(0, |stat| stat.count);
-        rows.push(LimitRow {
-            label: Msg::LimitsLabelContext,
-            pct: latest.context_pct,
-            resets_at: None,
-            span_secs: 0,
-            exhaust_at: None,
-            note: Some(i18n::limits_compactions(lang, compactions)),
-        });
-    }
-    let mut lines: Vec<Line<'static>> = rows
-        .iter()
-        .map(|row| build_limit_line(lang, row, now, width, stale))
-        .collect();
-
-    // 5. API 키 남은 양 (구간 안 헤더 기록이 있을 때)
-    if let Some(api_line) = data
-        .api_key
-        .as_ref()
-        .and_then(|row| build_api_key_line(lang, row, now, width, stale))
-    {
-        lines.push(api_line);
-    }
-    lines.truncate(height);
-    LimitsView {
-        lines,
-        hint,
-        empty: false,
-    }
-}
-
-// 7-3. 한도 줄 조립 -----------------------------------------------------------
-// 이름, 막대, 퍼센트, 그 뒤 부가 항목(리셋 카운트다운, 페이스, 소진 예상 시각, 부가 문구)
-// 폭이 모자라면 뒤 항목부터 통째로 덜어내고 막대는 4칸까지 줄임, 색은 퍼센트 숫자와 항상 짝 (dim = 모두 흐림)
-fn build_limit_line(
-    lang: Lang,
-    row: &LimitRow,
-    now: i64,
-    width: usize,
-    dim: bool,
-) -> Line<'static> {
-    // 1. 값 문구와 스타일
-    let tone = |style: Style| if dim { theme::STYLE_DIM } else { style };
-    let label = format!(
-        "{} ",
-        fit_display(i18n::text(lang, row.label), LIMIT_LABEL_WIDTH)
-    );
-    let pct_text = pad_left_display(
-        &row.pct.map_or("-".to_string(), |pct| format!("{pct:.0}%")),
-        LIMIT_PCT_WIDTH,
-    );
-    let pct_style = row
-        .pct
-        .map_or(theme::STYLE_DIM, |pct| limit_style(pct, dim));
-    let level_mark = row.pct.map_or("", limit_mark);
-    let live_reset = row.resets_at.filter(|resets_at| *resets_at > now);
-    let mut tails: Vec<(String, Style)> = Vec::new();
-    if row.resets_at.is_some() {
-        tails.push(match live_reset {
-            Some(resets_at) => (
-                i18n::limits_reset_in(lang, &format_countdown(resets_at - now)),
-                tone(theme::STYLE_TEXT),
-            ),
-            None => (
-                i18n::text(lang, Msg::LimitsResetDue).to_string(),
-                theme::STYLE_DIM,
-            ),
-        });
-    }
-    if let (Some(pct), Some(resets_at)) = (row.pct, live_reset) {
-        let (glyph, word, style) = match judge_pace(pct, resets_at, row.span_secs, now) {
-            Pace::Ahead => ("▲", Msg::LimitsPaceAhead, tone(theme::STYLE_WARN)),
-            Pace::Steady => ("●", Msg::LimitsPaceOn, theme::STYLE_DIM),
-            Pace::Behind => ("▼", Msg::LimitsPaceBehind, tone(theme::STYLE_OK)),
-        };
-        tails.push((format!("{glyph} {}", i18n::text(lang, word)), style));
-    }
-    if let Some(exhaust_at) = row.exhaust_at {
-        tails.push((
-            format!("→ {}", format_exhaustion_clock(exhaust_at, now)),
-            tone(theme::STYLE_WARN),
-        ));
-    }
-    if let Some(note) = &row.note {
-        tails.push((note.clone(), theme::STYLE_DIM));
-    }
-
-    // 2. 막대 폭은 모든 줄이 같아 세로로 정렬 (모든 항목이 들어갈 만큼 넓을 때만 늘어남), 항목은 앞에서부터 폭에 들어갈 때만 채택
-    let bar_width = (BAR_MIN_WIDTH + width.saturating_sub(LIMIT_FULL_ROW_WIDTH)).min(BAR_MAX_WIDTH);
-    let mut used =
-        Span::raw(label.as_str()).width() + bar_width + 1 + LIMIT_PCT_WIDTH + level_mark.len();
-    let mut shown: Vec<(String, Style)> = Vec::new();
-    for (text, style) in tails {
-        let needed = 2 + Span::raw(text.as_str()).width();
-        if used + needed > width {
-            break;
-        }
-        used += needed;
-        shown.push((text, style));
-    }
-
-    // 3. 조립 (막대 채움 색은 퍼센트 숫자와 같은 단계)
-    let mut spans = vec![Span::styled(label, theme::STYLE_DIM)];
-    spans.extend(build_bar(row.pct, bar_width, pct_style));
-    spans.push(Span::raw(" "));
-    spans.push(Span::styled(
-        pct_text,
-        pct_style.add_modifier(Modifier::BOLD),
-    ));
-    if !level_mark.is_empty() {
-        spans.push(Span::styled(
-            level_mark,
-            pct_style.add_modifier(Modifier::BOLD),
-        ));
-    }
-    for (text, style) in shown {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(text, style));
-    }
-    Line::from(clip_spans_to_width(spans, width))
-}
-
-// 막대: 채운 칸은 퍼센트 색, 빈 칸은 흐린 트랙, 0 보다 크면 최소 한 칸
-fn build_bar(pct: Option<f64>, width: usize, fill_style: Style) -> Vec<Span<'static>> {
+// 9. 막대 ---------------------------------------------------------------------
+// 채운 칸은 주어진 색, 빈 칸은 흐린 트랙, 0 보다 크면 최소 한 칸
+pub(crate) fn build_bar(pct: Option<f64>, width: usize, fill_style: Style) -> Vec<Span<'static>> {
     let ratio = pct.map_or(0.0, |value| value.clamp(0.0, 100.0) / 100.0);
     let mut filled = ((ratio * width as f64).round() as usize).min(width);
     if ratio > 0.0 && filled == 0 {
@@ -1332,153 +880,7 @@ fn build_bar(pct: Option<f64>, width: usize, fill_style: Style) -> Vec<Span<'sta
     ]
 }
 
-// 퍼센트 단계 색: 80 이상 경고, 95 이상 위험(굵게), 그 밖 정상 (dim 이면 흐림)
-fn limit_style(pct: f64, dim: bool) -> Style {
-    if dim {
-        theme::STYLE_DIM
-    } else if pct >= LIMIT_CRIT_PCT {
-        theme::STYLE_CRIT.add_modifier(Modifier::BOLD)
-    } else if pct >= LIMIT_WARN_PCT {
-        theme::STYLE_WARN
-    } else {
-        theme::STYLE_OK
-    }
-}
-
-// 퍼센트 단계 표식: 색을 못 봐도 단계가 보이도록 경고 " !", 위험 " !!" (정상은 없음, 기준은 limit_style 과 같음)
-fn limit_mark(pct: f64) -> &'static str {
-    if pct >= LIMIT_CRIT_PCT {
-        " !!"
-    } else if pct >= LIMIT_WARN_PCT {
-        " !"
-    } else {
-        ""
-    }
-}
-
-// 7-4. API 키 줄 --------------------------------------------------------------
-// 요청·토큰 남은 양/한도와 리셋까지 시간, 두 값이 모두 없으면 줄 없음 (남은 비율이 적을수록 경고·위험 색)
-fn build_api_key_line(
-    lang: Lang,
-    row: &RatelimitSnapshotRow,
-    now: i64,
-    width: usize,
-    dim: bool,
-) -> Option<Line<'static>> {
-    // 1. 요청·토큰 항목 (토큰은 통합 한도가 없으면 입력 토큰 한도)
-    let token_pair = if row.tokens_remaining.is_some() {
-        (row.tokens_remaining, row.tokens_limit)
-    } else {
-        (row.input_tokens_remaining, row.input_tokens_limit)
-    };
-    let mut items: Vec<Vec<Span<'static>>> = vec![vec![Span::styled(
-        format!(
-            "{} ",
-            fit_display(i18n::text(lang, Msg::LimitsLabelApiKey), LIMIT_LABEL_WIDTH)
-        ),
-        theme::STYLE_DIM,
-    )]];
-    let pairs = [
-        (
-            Msg::LimitsRequestsShort,
-            (row.requests_remaining, row.requests_limit),
-        ),
-        (Msg::LimitsTokensUnit, token_pair),
-    ];
-    for (unit, (remaining, limit)) in pairs {
-        let Some(remaining) = remaining else {
-            continue;
-        };
-        let used_pct = limit
-            .filter(|total| *total > 0)
-            .map_or(0.0, |total| 100.0 - remaining as f64 * 100.0 / total as f64);
-        let value = match limit {
-            Some(total) => format!("{}/{}", format_compact(remaining), format_compact(total)),
-            None => format_compact(remaining),
-        };
-        items.push(vec![
-            Span::styled(format!("{} ", i18n::text(lang, unit)), theme::STYLE_DIM),
-            Span::styled(
-                format!("{value}{}", limit_mark(used_pct)),
-                limit_style(used_pct, dim).add_modifier(Modifier::BOLD),
-            ),
-        ]);
-    }
-    if items.len() == 1 {
-        return None;
-    }
-
-    // 2. 요청 한도 리셋까지 (RFC 3339 해석이 되고 아직 안 지났을 때만)
-    let reset_secs = row
-        .requests_reset
-        .as_deref()
-        .and_then(|stamp| DateTime::parse_from_rfc3339(stamp).ok())
-        .map(|stamp| stamp.timestamp() - now)
-        .filter(|secs| *secs > 0);
-    if let Some(secs) = reset_secs {
-        items.push(vec![Span::styled(
-            i18n::limits_reset_in(lang, &format_countdown(secs)),
-            theme::STYLE_DIM,
-        )]);
-    }
-    Some(Line::from(pack_spans_to_width(items, &[2, 1], width)))
-}
-
-// 7-5. 페이스·소진 예상 계산 --------------------------------------------------
-// 창 경과 비율(%)과 사용률(%)의 차가 허용 범위 밖이면 빠름·느림, 안이면 적정
-fn judge_pace(pct: f64, resets_at: i64, span_secs: i64, now: i64) -> Pace {
-    let elapsed_pct =
-        ((now - (resets_at - span_secs)) as f64 * 100.0 / span_secs as f64).clamp(0.0, 100.0);
-    let gap = pct - elapsed_pct;
-    if gap > PACE_TOLERANCE_PCT {
-        Pace::Ahead
-    } else if gap < -PACE_TOLERANCE_PCT {
-        Pace::Behind
-    } else {
-        Pace::Steady
-    }
-}
-
-// 같은 한도 창(리셋 시각이 같음)의 (스냅샷 시각 초, 사용률) 기록, 오래된 순
-fn collect_window_points(
-    history: &[LimitSnapshot],
-    pick: fn(&LimitSnapshot) -> (Option<f64>, Option<i64>),
-    resets_at: Option<i64>,
-) -> Vec<(i64, f64)> {
-    let Some(resets_at) = resets_at else {
-        return Vec::new();
-    };
-    history
-        .iter()
-        .filter_map(|snapshot| {
-            let (pct, snapshot_resets_at) = pick(snapshot);
-            let stamp = DateTime::parse_from_rfc3339(&snapshot.ts).ok()?;
-            (snapshot_resets_at == Some(resets_at)).then_some((stamp.timestamp(), pct?))
-        })
-        .collect()
-}
-
-// 최근 기록의 선형 증가율로 100% 에 닿는 시각 (리셋 전에 닿을 때만, 기록 간격이 너무 짧거나 증가가 없으면 None)
-fn project_exhaustion(points: &[(i64, f64)], resets_at: i64, now: i64) -> Option<i64> {
-    let (last_at, last_pct) = *points.last()?;
-    if last_pct >= 100.0 {
-        return None;
-    }
-    let (first_at, first_pct) = points
-        .iter()
-        .copied()
-        .find(|(stamp, _)| *stamp >= last_at - PROJECTION_LOOKBACK_SECS)?;
-    let span = last_at - first_at;
-    let rise = last_pct - first_pct;
-    if span < PROJECTION_MIN_SPAN_SECS || rise <= 0.0 {
-        return None;
-    }
-    let remaining_secs = ((100.0 - last_pct) * span as f64 / rise) as i64;
-    let exhaust_at = (last_at + remaining_secs).max(now);
-    (exhaust_at < resets_at).then_some(exhaust_at)
-}
-
-// 7-6. 시간 표시 --------------------------------------------------------------
+// 10. 시간 표시 ---------------------------------------------------------------
 // 남은 시간: 1일 이상 일+시, 1시간 이상 시+분, 1분 이상 분+초, 그 밖 초 (단위 글자는 언어와 무관)
 pub(crate) fn format_countdown(secs: i64) -> String {
     let secs = secs.max(0);
@@ -1513,30 +915,105 @@ pub(crate) fn format_age(secs: i64) -> String {
     }
 }
 
-// 소진 예상 시각: 오늘이면 시:분, 아니면 월-일 시:분 (지역 시각)
-fn format_exhaustion_clock(exhaust_at: i64, now: i64) -> String {
-    let Some(exhaust) =
-        DateTime::from_timestamp(exhaust_at, 0).map(|stamp| stamp.with_timezone(&Local))
-    else {
-        return "--:--".to_string();
-    };
-    let same_day = DateTime::from_timestamp(now, 0)
-        .is_some_and(|stamp| stamp.with_timezone(&Local).date_naive() == exhaust.date_naive());
-    if same_day {
-        exhaust.format("%H:%M").to_string()
-    } else {
-        exhaust.format("%m-%d %H:%M").to_string()
+// 11. 폭 맞춤 줄 (내부) -------------------------------------------------------
+// 후보 중 폭에 맞는 첫 줄, 마지막 후보도 넘치면 뒤 조각부터 덜어내고 말줄임
+fn fit_variant_line(variants: Vec<Line<'static>>, width: usize) -> Line<'static> {
+    // 1. 폭에 맞는 첫 후보
+    let last = variants.len().saturating_sub(1);
+    let chosen = variants
+        .into_iter()
+        .enumerate()
+        .find(|(position, line)| line.width() <= width || *position == last)
+        .map(|(_, line)| line)
+        .unwrap_or_default();
+    let mut spans = chosen.spans;
+    let mut used: usize = spans.iter().map(Span::width).sum();
+    if used <= width {
+        return Line::from(spans);
     }
+
+    // 2. 넘침 말줄임 (뒤 조각부터 덜어냄)
+    while spans.len() > 1 && used + 1 > width {
+        if let Some(tail) = spans.pop() {
+            used -= tail.width();
+        }
+    }
+    let tail_style = spans.last().map_or(Style::default(), |span| span.style);
+    spans.push(Span::styled("…", tail_style));
+    Line::from(clip_spans_to_width(spans, width))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::i18n::Lang;
+    use crate::tui::layout::grid::{DropTarget, apply_drop, default_rows};
+    use crate::tui::test_support::sample_state_with_snapshot;
+    use crate::tui::views::render_frame;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+
+    // 최소 크기에서도 보이는 개요 카드, 중간 크기에 더해지는 추이, 큰 크기에 더해지는 차트
+    const BASE_CARDS: [CardId; 9] = [
+        CardId::ServerStatus,
+        CardId::KpiRequests,
+        CardId::KpiTokens,
+        CardId::KpiCache,
+        CardId::KpiTools,
+        CardId::KpiHooks,
+        CardId::SavingsEffect,
+        CardId::EventFeed,
+        CardId::EventDetail,
+    ];
+    const TREND_CARDS: [CardId; 2] = [CardId::TrendRequests, CardId::TrendTokens];
+    const CHART_CARDS: [CardId; 3] = [
+        CardId::ChartActivity,
+        CardId::ChartTokens,
+        CardId::ChartTools,
+    ];
 
     fn minute_label(now: DateTime<Utc>, minutes_ago: i64) -> String {
         (now - chrono::Duration::minutes(minutes_ago))
             .format("%Y-%m-%dT%H:%M")
             .to_string()
+    }
+
+    fn overview_state(lang: Lang) -> AppState {
+        let mut state = sample_state_with_snapshot();
+        state.lang = lang;
+        state
+    }
+
+    fn draw(state: &mut AppState, width: u16, height: u16) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| render_frame(frame, state)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    // 영역 한 줄의 글자 (넓은 글자 뒤 칸은 건너뜀)
+    fn line_text(buffer: &Buffer, y: u16, from: u16, to: u16) -> String {
+        let mut text = String::new();
+        let mut skip = 0usize;
+        for x in from..to {
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
+            let symbol = buffer.cell((x, y)).map_or(" ", |cell| cell.symbol());
+            skip = Span::raw(symbol).width().saturating_sub(1);
+            text.push_str(symbol);
+        }
+        text
+    }
+
+    fn card_rect(state: &AppState, card: CardId) -> Option<Rect> {
+        state
+            .hit_areas
+            .card_rects
+            .iter()
+            .find(|(drawn, _)| *drawn == card)
+            .map(|(_, rect)| *rect)
     }
 
     #[test]
@@ -1595,131 +1072,185 @@ mod tests {
         assert_eq!(format_age(3 * 86_400), "3d");
     }
 
+    // 60x16 은 상태·KPI 여섯 장(절약 포함)·피드 둘, 100x30 은 추이 둘 추가, 130x40 은 차트 셋까지
     #[test]
-    fn pace_compares_used_percent_with_elapsed_window_percent() {
-        let now = 1_000_000;
-        // 5시간 창의 40% 지점 (2시간 경과)
-        let resets_at = now + 3 * 3_600;
-        assert_eq!(
-            judge_pace(46.0, resets_at, FIVE_HOUR_SECS, now),
-            Pace::Ahead
-        );
-        assert_eq!(
-            judge_pace(45.0, resets_at, FIVE_HOUR_SECS, now),
-            Pace::Steady
-        );
-        assert_eq!(
-            judge_pace(35.0, resets_at, FIVE_HOUR_SECS, now),
-            Pace::Steady
-        );
-        assert_eq!(
-            judge_pace(34.0, resets_at, FIVE_HOUR_SECS, now),
-            Pace::Behind
-        );
-    }
-
-    #[test]
-    fn limit_colors_switch_at_80_and_95_and_dim_overrides_them() {
-        assert_eq!(limit_style(79.9, false), theme::STYLE_OK);
-        assert_eq!(limit_style(80.0, false), theme::STYLE_WARN);
-        assert_eq!(limit_style(94.9, false), theme::STYLE_WARN);
-        assert_eq!(
-            limit_style(95.0, false),
-            theme::STYLE_CRIT.add_modifier(Modifier::BOLD)
-        );
-        assert_eq!(limit_style(99.0, true), theme::STYLE_DIM);
-    }
-
-    // 색을 못 봐도 단계를 알 수 있도록 경고 " !"·위험 " !!" 표식이 퍼센트 뒤에 붙고 줄 폭은 넘지 않음
-    #[test]
-    fn limit_lines_carry_a_level_mark_next_to_the_percent_and_stay_within_the_width() {
-        assert_eq!(limit_mark(79.9), "");
-        assert_eq!(limit_mark(80.0), " !");
-        assert_eq!(limit_mark(94.9), " !");
-        assert_eq!(limit_mark(95.0), " !!");
-
-        let row = |pct: f64| LimitRow {
-            label: Msg::LimitsLabelFiveHour,
-            pct: Some(pct),
-            resets_at: Some(1_000_000 + 3_600),
-            span_secs: FIVE_HOUR_SECS,
-            exhaust_at: None,
-            note: None,
-        };
+    fn the_overview_grid_draws_disjoint_cards_inside_the_body_at_the_size_matrix() {
+        let wide: Vec<CardId> = TREND_CARDS.iter().chain(&CHART_CARDS).copied().collect();
         for lang in [Lang::En, Lang::Ko] {
-            for width in [28usize, 36, 60] {
-                for (pct, mark) in [(70.0, ""), (85.0, " !"), (97.0, " !!")] {
-                    let line = build_limit_line(lang, &row(pct), 1_000_000, width, false);
-                    let text: String = line
-                        .spans
-                        .iter()
-                        .map(|span| span.content.as_ref())
-                        .collect();
-                    let case = format!("{lang:?} {width} {pct} {text}");
-                    assert!(text.contains(&format!("{pct:.0}%{mark}")), "{case}");
-                    assert_eq!(text.contains('!'), !mark.is_empty(), "{case}");
-                    assert!(line.width() <= width, "{case}");
+            for (width, height, extra) in [
+                (60u16, 16u16, &[][..]),
+                (100, 30, &TREND_CARDS[..]),
+                (130, 40, &wide[..]),
+            ] {
+                let case = format!("{lang:?} {width}x{height}");
+                let mut state = overview_state(lang);
+                draw(&mut state, width, height);
+
+                // 보이는 카드 목록
+                let mut expected: Vec<CardId> = BASE_CARDS.iter().chain(extra).copied().collect();
+                let mut drawn: Vec<CardId> = state
+                    .hit_areas
+                    .card_rects
+                    .iter()
+                    .map(|(card, _)| *card)
+                    .collect();
+                expected.sort_by_key(|card| *card as usize);
+                drawn.sort_by_key(|card| *card as usize);
+                assert_eq!(drawn, expected, "{case}");
+
+                // 본문 안, 서로 겹치지 않음
+                let body = Rect::new(0, 2, width, height - 4);
+                let rects = &state.hit_areas.card_rects;
+                for (index, (card, rect)) in rects.iter().enumerate() {
+                    assert_eq!(body.union(*rect), body, "{case} {card:?}");
+                    for (other, other_rect) in &rects[index + 1..] {
+                        assert!(!rect.intersects(*other_rect), "{case} {card:?} {other:?}");
+                    }
+                }
+
+                // 절약 카드는 KPI 카드와 같은 줄, 같은 높이
+                let kpi = card_rect(&state, CardId::KpiRequests).unwrap();
+                for card in &BASE_CARDS[2..7] {
+                    let rect = card_rect(&state, *card).unwrap();
+                    assert_eq!(
+                        (rect.y, rect.height),
+                        (kpi.y, kpi.height),
+                        "{case} {card:?}"
+                    );
                 }
             }
         }
     }
 
     #[test]
-    fn projection_shows_only_when_the_linear_rate_reaches_100_before_the_reset() {
-        let now = 1_000_000;
-        let hour = 3_600;
-        // 한 시간에 20%p: 70% 에서 30%p 남아 한 시간 반 뒤 (리셋보다 이름)
-        let points = [(now - hour, 50.0), (now, 70.0)];
-        assert_eq!(
-            project_exhaustion(&points, now + 3 * hour, now),
-            Some(now + hour * 3 / 2)
-        );
-        // 리셋이 그보다 이르면 숨김
-        assert_eq!(project_exhaustion(&points, now + hour, now), None);
-        // 증가 없음, 감소, 기록 하나, 기록 간격 5분 미만, 이미 100% 는 숨김
-        let flat = [(now - hour, 70.0), (now, 70.0)];
-        assert_eq!(project_exhaustion(&flat, now + 3 * hour, now), None);
-        let falling = [(now - hour, 80.0), (now, 70.0)];
-        assert_eq!(project_exhaustion(&falling, now + 3 * hour, now), None);
-        assert_eq!(
-            project_exhaustion(&[(now, 70.0)], now + 3 * hour, now),
-            None
-        );
-        let brief = [(now - 120, 50.0), (now, 70.0)];
-        assert_eq!(project_exhaustion(&brief, now + 3 * hour, now), None);
-        let full = [(now - hour, 90.0), (now, 100.0)];
-        assert_eq!(project_exhaustion(&full, now + 3 * hour, now), None);
-        // 되돌아볼 길이 밖의 오래된 기록은 쓰지 않음 (최근 3시간 안 첫 기록부터)
-        let old_first = [(now - 10 * hour, 0.0), (now - hour, 50.0), (now, 70.0)];
-        assert_eq!(
-            project_exhaustion(&old_first, now + 3 * hour, now),
-            Some(now + hour * 3 / 2)
-        );
+    fn no_overview_row_shows_p50_p90_or_a_limits_title_in_either_language() {
+        for lang in [Lang::En, Lang::Ko] {
+            for (width, height) in [(60u16, 16u16), (100, 30), (130, 40)] {
+                let mut state = overview_state(lang);
+                let buffer = draw(&mut state, width, height);
+                for y in 0..height {
+                    let row = line_text(&buffer, y, 0, width);
+                    for needle in ["p50", "p90", "Limits", "Limit usage trend", "한도"] {
+                        assert!(
+                            !row.contains(needle),
+                            "{lang:?} {width}x{height} {needle}: {row}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
+    // 큰 화면은 1행 순효과·2행 절약·손실 값, 최소 화면은 이름 없는 가장 짧은 형태
     #[test]
-    fn window_points_keep_only_snapshots_of_the_same_reset_window() {
-        let snapshot = |ts: &str, pct: f64, resets_at: i64| LimitSnapshot {
-            ts: ts.to_string(),
-            five_hour_pct: Some(pct),
-            five_hour_resets_at: Some(resets_at),
-            ..LimitSnapshot::default()
-        };
-        let history = [
-            snapshot("2026-11-19T07:00:00Z", 10.0, 100),
-            snapshot("2026-11-19T08:00:00Z", 20.0, 200),
-            snapshot("2026-11-19T09:00:00Z", 30.0, 200),
-            snapshot("not a time", 40.0, 200),
-        ];
-        let points = collect_window_points(
-            &history,
-            |snapshot| (snapshot.five_hour_pct, snapshot.five_hour_resets_at),
-            Some(200),
-        );
-        assert_eq!(points.len(), 2);
-        assert_eq!(points[1].1, 30.0);
-        assert!(points[1].0 > points[0].0);
-        let none = collect_window_points(&history, |snapshot| (snapshot.five_hour_pct, None), None);
-        assert!(none.is_empty());
+    fn the_savings_card_shows_net_saved_and_loss_on_two_lines_and_its_shortest_form_at_minimum() {
+        let net = format!("+{}", format_duration_ms(189_000 - 12_600));
+        let saved = format!("+{}", format_duration_ms(189_000));
+        let loss = format!("-{}", format_duration_ms(12_600));
+        for lang in [Lang::En, Lang::Ko] {
+            let mut state = overview_state(lang);
+            let buffer = draw(&mut state, 130, 40);
+            let rect = card_rect(&state, CardId::SavingsEffect).unwrap();
+            assert_eq!(rect.height, 4, "{lang:?}");
+            let first = line_text(&buffer, rect.y + 1, rect.x + 1, rect.right() - 1);
+            let second = line_text(&buffer, rect.y + 2, rect.x + 1, rect.right() - 1);
+            assert!(first.contains(&net), "{lang:?}: {first}");
+            assert!(
+                second.contains(&saved) && second.contains(&loss),
+                "{lang:?}: {second}"
+            );
+            let net_x = (rect.x..rect.right())
+                .find(|x| buffer.cell((*x, rect.y + 1)).unwrap().symbol() == "+")
+                .unwrap();
+            assert_eq!(
+                buffer.cell((net_x, rect.y + 1)).unwrap().fg,
+                theme::COLOR_OK,
+                "{lang:?}"
+            );
+
+            let buffer = draw(&mut state, 60, 16);
+            let rect = card_rect(&state, CardId::SavingsEffect).unwrap();
+            let first = line_text(&buffer, rect.y + 1, rect.x + 1, rect.right() - 1);
+            let second = line_text(&buffer, rect.y + 2, rect.x + 1, rect.right() - 1);
+            assert!(first.trim_start().starts_with('+'), "{lang:?}: {first}");
+            assert!(second.trim_start().starts_with('+'), "{lang:?}: {second}");
+            for label in [
+                Msg::SavingsNetShort,
+                Msg::SavingsSaved,
+                Msg::SavingsSavedShort,
+                Msg::SavingsLossShort,
+            ] {
+                let word = i18n::text(lang, label);
+                assert!(
+                    !first.contains(word) && !second.contains(word),
+                    "{lang:?} {word}"
+                );
+            }
+        }
+    }
+
+    // 최소 폭의 합이 폭을 넘는 여섯 장 줄: 넘치는 카드는 다음 화면 줄의 왼쪽 끝으로 (카드를 빼지 않음)
+    #[test]
+    fn a_six_card_row_wraps_at_60_columns_instead_of_dropping_a_card() {
+        let base = default_rows(ActiveTab::Overview);
+        let lifted = apply_drop(
+            &base,
+            CardId::KpiHooks,
+            DropTarget::RowAbove(CardId::ServerStatus),
+        )
+        .unwrap();
+        let joined = apply_drop(
+            &lifted,
+            CardId::ServerStatus,
+            DropTarget::Before(CardId::KpiRequests),
+        )
+        .unwrap();
+        for lang in [Lang::En, Lang::Ko] {
+            let mut state = overview_state(lang);
+            state.card_layout.set_grid(ActiveTab::Overview, joined);
+            draw(&mut state, 60, 24);
+            for card in &BASE_CARDS[..7] {
+                assert!(card_rect(&state, *card).is_some(), "{lang:?} {card:?}");
+            }
+            let status = card_rect(&state, CardId::ServerStatus).unwrap();
+            let tools = card_rect(&state, CardId::KpiTools).unwrap();
+            let savings = card_rect(&state, CardId::SavingsEffect).unwrap();
+            assert_eq!(status.y, tools.y, "{lang:?}");
+            assert_eq!(savings.y, status.bottom(), "{lang:?}");
+            assert_eq!(savings.x, 0, "{lang:?}");
+        }
+    }
+
+    // 준비 전 패널: 카드마다 자기 영역의 안내 카드 (이웃 카드와 합치지 않음)
+    #[test]
+    fn pending_panels_show_a_notice_card_in_each_cards_own_rectangle() {
+        for lang in [Lang::En, Lang::Ko] {
+            let mut state = overview_state(lang);
+            state.snapshot.overview = Panel::Pending;
+            state.snapshot.today = Panel::Pending;
+            state.snapshot.minutes = Panel::Pending;
+            let buffer = draw(&mut state, 130, 40);
+            for card in BASE_CARDS[1..7].iter().chain(&TREND_CARDS) {
+                let count = state
+                    .hit_areas
+                    .card_rects
+                    .iter()
+                    .filter(|(drawn, _)| drawn == card)
+                    .count();
+                assert_eq!(count, 1, "{lang:?} {card:?}");
+                assert!(
+                    card_rect(&state, *card).unwrap().width < 70,
+                    "{lang:?} {card:?}"
+                );
+            }
+            for (card, title) in [
+                (CardId::TrendRequests, Msg::TitleRequestsPerMin),
+                (CardId::TrendTokens, Msg::TitleTokensPerMin),
+            ] {
+                let rect = card_rect(&state, card).unwrap();
+                let top = line_text(&buffer, rect.y, rect.x, rect.right());
+                assert!(top.contains(i18n::text(lang, title)), "{lang:?}: {top}");
+            }
+        }
     }
 }

@@ -1,6 +1,7 @@
 //! tui/views/mod.rs
 //! 화면 조립: 앱 바, 탭 바, 본문, 하단 버튼·안내, 카드 경계 손잡이, 도움말 겹침.
 
+pub mod charts;
 pub mod common;
 pub mod detail;
 pub mod feed;
@@ -693,8 +694,8 @@ mod tests {
         assert!(text.contains("요청"));
         assert!(text.contains("캐시 적중률"));
         assert!(text.contains("87.5%"));
-        assert!(text.contains("오늘 절약 시간"));
-        assert!(text.contains("거부 손실 추정"));
+        assert!(text.contains("훅 재작성 효과"));
+        assert!(text.contains("순효과"));
         assert!(text.contains("실시간 이벤트 (4건)"));
         assert!(text.contains("grep -> rg"));
         // 선택 이벤트 상세 카드
@@ -836,7 +837,10 @@ mod tests {
         assert!(rows[39].contains("? 전체 단축키"));
 
         // 포인터 맥락이 우선
-        state.split_hover = Some((crate::tui::layout::SplitGroup::OverviewRows, 0));
+        state.split_hover = Some((
+            crate::tui::layout::SplitGroup::GridRows(ActiveTab::Overview, 5),
+            0,
+        ));
         let rows = render_to_text(&mut state, 130, 40);
         assert!(rows[39].contains("드래그 카드 크기"));
         state.split_hover = None;
@@ -998,7 +1002,7 @@ mod tests {
         assert!(hooks_text.contains("정렬 횟수↓"));
 
         state.tab = ActiveTab::Models;
-        let models_text = render_to_text(&mut state, 100, 30).join("\n");
+        let models_text = render_to_text(&mut state, 130, 30).join("\n");
         assert!(models_text.contains("추정 (API 단가)"));
         assert!(models_text.contains("$12.35"));
         assert!(models_text.contains("TTL 만료"));
@@ -1425,6 +1429,8 @@ mod tests {
                 p50_ms: Some(12),
                 p90_ms: Some(3_456),
                 total_ms: 98_765_432,
+                avg_ms: Some(12),
+                max_ms: Some(3_456),
             },
             ToolLatencyRow {
                 tool_name: "Read".to_string(),
@@ -1454,6 +1460,9 @@ mod tests {
             p50_ms: Some(4),
             p90_ms: Some(9),
             saved_ms: 0,
+            avg_ms: Some(4),
+            max_ms: Some(9),
+            total_ms: 493_824,
         }]);
         state.tab = ActiveTab::Hooks;
         for width in [60, 70, 80, 100] {
@@ -1687,7 +1696,6 @@ mod tests {
 
     #[test]
     fn moved_card_in_move_mode_has_a_dashed_accent_border_and_a_moving_title() {
-        use crate::tui::layout::SplitGroup;
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
         let mut state = settings_state();
@@ -1755,14 +1763,14 @@ mod tests {
         );
         assert!(!hint_row.contains("정렬 열"), "{hint_row}");
 
-        // 이동 중 카드는 제목 영역을 길게 누르는 대상으로 다시 등록되고, 순서는 미리보기에 따라 바뀜
-        assert!(
-            state
-                .hit_areas
-                .slot_groups
-                .iter()
-                .any(|slots| slots.group == SplitGroup::SettingsRows)
-        );
+        // 이동 중에도 설정 탭 격자 줄은 그려져 놓을 자리를 판정할 수 있음
+        assert!(state.hit_areas.grid_lines.iter().any(|line| {
+            line.tab == ActiveTab::Settings
+                && line
+                    .cards
+                    .iter()
+                    .any(|(card, _)| *card == CardId::SettingsMcp)
+        }));
 
         // Esc 로 취소하면 다시 둥근 모서리
         state.handle_key_event(crossterm::event::KeyEvent::new(
@@ -1777,56 +1785,52 @@ mod tests {
     }
 
     #[test]
-    fn settings_reorder_draws_mcp_in_the_first_slot_and_keeps_slot_heights() {
-        use crate::tui::layout::{IDENTITY_ORDER, SplitGroup};
+    fn settings_grid_move_draws_mcp_on_the_first_line_and_hooks_below_it() {
+        use crate::tui::layout::grid::{DropTarget, apply_drop, default_rows};
 
         for (width, height) in [(110u16, 36u16), (MIN_WIDTH, MIN_HEIGHT)] {
             let mut state = settings_state();
             let before = buffer_of(&mut state, width, height);
-            let slots: Vec<Rect> = state
-                .hit_areas
-                .slot_groups
-                .iter()
-                .find(|slots| slots.group == SplitGroup::SettingsRows)
-                .map(|slots| slots.slots.clone())
-                .unwrap();
-            assert_eq!(slots.len(), 4);
-            // 기본 배치: 카드는 칸 순서대로
-            assert_eq!(card_rect_of(&state, CardId::SettingsHooks), slots[0]);
-            assert_eq!(card_rect_of(&state, CardId::SettingsMcp), slots[1]);
-            let heights: Vec<u16> = slots.iter().map(|slot| slot.height).collect();
-            assert!(row_text(&before, slots[0].y, width).contains("훅 등록"));
-
-            // MCP 서버(카드 1)를 첫 칸으로
-            state
-                .card_layout
-                .move_card_to_slot(SplitGroup::SettingsRows, &IDENTITY_ORDER, 1, 0);
-            let after = buffer_of(&mut state, width, height);
-            let reordered: Vec<Rect> = state
-                .hit_areas
-                .slot_groups
-                .iter()
-                .find(|slots| slots.group == SplitGroup::SettingsRows)
-                .map(|slots| slots.slots.clone())
-                .unwrap();
-            assert_eq!(reordered, slots, "{width}x{height}");
-            assert_eq!(
+            let first_line = |state: &AppState| {
                 state
                     .hit_areas
-                    .slot_groups
+                    .grid_lines
                     .iter()
-                    .find(|slots| slots.group == SplitGroup::SettingsRows)
-                    .map(|slots| slots.cards.clone()),
-                Some(vec![1, 0, 2, 3])
+                    .filter(|line| line.tab == ActiveTab::Settings)
+                    .map(|line| line.cards.iter().map(|(card, _)| *card).collect())
+                    .collect::<Vec<Vec<CardId>>>()
+            };
+            // 기본 격자: 네 카드가 한 줄씩, 훅 등록이 맨 위
+            let lines = first_line(&state);
+            assert_eq!(lines.len(), 4, "{width}x{height}");
+            assert_eq!(lines[0], [CardId::SettingsHooks], "{width}x{height}");
+            let hooks = card_rect_of(&state, CardId::SettingsHooks);
+            assert!(row_text(&before, hooks.y, width).contains("훅 등록"));
+
+            // MCP 서버를 맨 위 새 줄로
+            let moved = apply_drop(
+                &default_rows(ActiveTab::Settings),
+                CardId::SettingsMcp,
+                DropTarget::RowAbove(CardId::SettingsHooks),
+            )
+            .unwrap();
+            state.card_layout.set_grid(ActiveTab::Settings, moved);
+            let after = buffer_of(&mut state, width, height);
+            let lines = first_line(&state);
+            assert_eq!(
+                lines,
+                [
+                    vec![CardId::SettingsMcp],
+                    vec![CardId::SettingsHooks],
+                    vec![CardId::SettingsAgents],
+                    vec![CardId::SettingsDoctor],
+                ],
+                "{width}x{height}"
             );
-            assert_eq!(card_rect_of(&state, CardId::SettingsMcp), slots[0]);
-            assert_eq!(card_rect_of(&state, CardId::SettingsHooks), slots[1]);
-            assert_eq!(card_rect_of(&state, CardId::SettingsAgents), slots[2]);
-            assert_eq!(card_rect_of(&state, CardId::SettingsDoctor), slots[3]);
-            // 칸 높이는 그대로, 첫 칸 위 테두리에 MCP 서버 제목
-            let after_heights: Vec<u16> = slots.iter().map(|slot| slot.height).collect();
-            assert_eq!(after_heights, heights);
-            let first_row = row_text(&after, slots[0].y, width);
+            let mcp = card_rect_of(&state, CardId::SettingsMcp);
+            let hooks = card_rect_of(&state, CardId::SettingsHooks);
+            assert!(mcp.y < hooks.y, "{width}x{height}");
+            let first_row = row_text(&after, mcp.y, width);
             assert!(
                 first_row.contains("MCP 서버"),
                 "{width}x{height}: {first_row}"
@@ -1835,7 +1839,7 @@ mod tests {
                 !first_row.contains("훅 등록"),
                 "{width}x{height}: {first_row}"
             );
-            let second_row = row_text(&after, slots[1].y, width);
+            let second_row = row_text(&after, hooks.y, width);
             assert!(
                 second_row.contains("훅 등록"),
                 "{width}x{height}: {second_row}"
@@ -1844,57 +1848,51 @@ mod tests {
     }
 
     #[test]
-    fn every_card_group_renders_every_order_at_both_sizes_with_cards_in_their_slots() {
-        use crate::tui::layout::{IDENTITY_ORDER, MAX_SLOTS, insert_card_order};
+    fn every_grid_card_renders_at_every_drop_target_at_both_sizes_inside_its_line() {
+        use crate::tui::layout::grid::{DropTarget, apply_drop, default_rows};
 
-        // 순열 대신 모든 카드를 모든 칸으로 보내는 삽입 이동 (칸 수 제곱 가짓수)
+        // 격자의 모든 카드를 다른 모든 카드의 앞·뒤·위 새 줄·아래 새 줄로 옮긴 격자 목록
+        let mut cases = Vec::new();
         for tab in ActiveTab::ALL {
-            for group in tab.split_groups() {
-                if !group.is_reorderable() {
-                    continue;
+            let base = default_rows(tab);
+            let cards: Vec<CardId> = base.rows.iter().flatten().flatten().copied().collect();
+            let moves = cards
+                .iter()
+                .flat_map(|moving| cards.iter().map(move |anchor| (*moving, *anchor)));
+            for (moving, anchor) in moves {
+                for target in [
+                    DropTarget::Before(anchor),
+                    DropTarget::After(anchor),
+                    DropTarget::RowAbove(anchor),
+                    DropTarget::RowBelow(anchor),
+                ] {
+                    cases.extend(apply_drop(&base, moving, target).map(|grid| (tab, grid)));
                 }
-                let count = group.card_count();
-                for card in 0..count {
-                    for target in 0..count {
-                        let order: [u8; MAX_SLOTS] =
-                            insert_card_order(&IDENTITY_ORDER, count, card as u8, target);
-                        for (width, height) in [(110u16, 40u16), (MIN_WIDTH, MIN_HEIGHT)] {
-                            let mut state = sample_state_with_tables();
-                            state.tab = tab;
-                            state.card_layout.set_order(*group, order);
-                            render_to_text(&mut state, width, height);
+            }
+        }
 
-                            // 그려진 카드는 모두 놓인 칸의 영역과 같음
-                            let recorded = state
-                                .hit_areas
-                                .slot_groups
-                                .iter()
-                                .find(|slots| slots.group == *group);
-                            let Some(recorded) = recorded else {
-                                continue;
-                            };
-                            assert_eq!(recorded.cards.len(), count, "{group:?}");
-                            for (slot, placed) in recorded.cards.iter().enumerate() {
-                                assert_eq!(usize::from(order[slot]), *placed, "{group:?}");
-                            }
-                            for (drawn, rect) in &state.hit_areas.card_rects {
-                                let Some((owner, index)) = drawn.reorder_slot() else {
-                                    continue;
-                                };
-                                if owner != *group {
-                                    continue;
-                                }
-                                let slot = recorded
-                                    .cards
-                                    .iter()
-                                    .position(|placed| *placed == index)
-                                    .unwrap();
-                                assert_eq!(
-                                    *rect, recorded.slots[slot],
-                                    "{group:?} {drawn:?} {width}x{height} order {order:?}"
-                                );
-                            }
-                        }
+        // 그려진 격자 카드는 줄 영역 안에 있고 카드 영역은 격자가 준 영역과 같음
+        for (tab, grid) in cases {
+            for (width, height) in [(110u16, 40u16), (MIN_WIDTH, MIN_HEIGHT)] {
+                let mut state = sample_state_with_tables();
+                state.tab = tab;
+                state.card_layout.set_grid(tab, grid);
+                render_to_text(&mut state, width, height);
+                let placed = state
+                    .hit_areas
+                    .grid_lines
+                    .iter()
+                    .flat_map(|line| line.cards.iter().map(move |card| (line.rect, *card)));
+                for (line_rect, (card, rect)) in placed {
+                    let case = format!("{tab:?} {card:?} {width}x{height} {grid:?}");
+                    assert_eq!(line_rect.union(rect), line_rect, "{case}");
+                    let drawn = state
+                        .hit_areas
+                        .card_rects
+                        .iter()
+                        .find(|(drawn, _)| *drawn == card);
+                    if let Some((_, drawn_rect)) = drawn {
+                        assert_eq!(*drawn_rect, rect, "{case}");
                     }
                 }
             }
@@ -1902,33 +1900,32 @@ mod tests {
     }
 
     #[test]
-    fn pending_trend_notice_survives_cards_moved_apart_or_next_to_each_other() {
-        use crate::tui::layout::{IDENTITY_ORDER, SplitGroup};
+    fn pending_trend_cards_each_show_their_own_notice_side_by_side_or_apart() {
+        use crate::tui::layout::grid::{DropTarget, apply_drop, default_rows};
 
-        // 분당 추이가 준비되지 않은 개요: 이웃한 칸이면 하나의 안내 카드, 떨어지면 카드마다 안내
-        for (card, target, joined) in [(0usize, 0usize, true), (0, 2, true), (0, 1, false)] {
+        // 분당 추이가 준비되지 않은 개요: 이웃해도 떨어져도 카드마다 자기 제목의 안내 (합친 안내 카드 없음)
+        let base = default_rows(ActiveTab::Overview);
+        let apart = apply_drop(
+            &base,
+            CardId::TrendTokens,
+            DropTarget::RowBelow(CardId::TrendRequests),
+        )
+        .unwrap();
+        for grid in [base, apart] {
             let mut state = sample_state_with_snapshot();
             state.snapshot.minutes = Panel::Pending;
-            state.card_layout.move_card_to_slot(
-                SplitGroup::OverviewTrendCols,
-                &IDENTITY_ORDER,
-                card,
-                target,
-            );
+            state.card_layout.set_grid(ActiveTab::Overview, grid);
             let text = render_to_text(&mut state, 130, 40).join("\n");
-            assert_eq!(
-                text.contains("분당 추이"),
-                joined,
-                "{card}->{target}\n{text}"
-            );
-            assert_eq!(text.contains("분당 출력 토큰"), !joined, "{card}->{target}");
-            let cuts = state
+            assert!(text.contains("분당 요청"), "{text}");
+            assert!(text.contains("분당 출력 토큰"), "{text}");
+            assert!(!text.contains("분당 추이"), "{text}");
+            let notices = state
                 .hit_areas
-                .split_hits
+                .card_rects
                 .iter()
-                .filter(|hit| hit.group == SplitGroup::OverviewTrendCols)
+                .filter(|(card, _)| matches!(card, CardId::TrendRequests | CardId::TrendTokens))
                 .count();
-            assert_eq!(cuts, if joined { 2 } else { 3 }, "{card}->{target}");
+            assert_eq!(notices, 2);
         }
     }
 
@@ -1985,7 +1982,7 @@ mod tests {
             "serve running",
             "Gateway ON",
             "Cache hit rate",
-            "Saved today",
+            "Net effect",
             "Live events (4)",
             "Event detail",
             "[i] Reindex",

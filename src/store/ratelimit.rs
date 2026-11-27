@@ -127,18 +127,7 @@ impl Store {
         })
     }
 
-    // 4. 최신 스냅샷 (없으면 None)
-    pub fn latest_ratelimit_snapshot(&self) -> anyhow::Result<Option<RatelimitSnapshotRow>> {
-        self.with_conn(|conn| {
-            let mut statement = conn.prepare(&format!(
-                "SELECT {SNAPSHOT_COLUMNS} FROM ratelimit_snapshots ORDER BY ts DESC, id DESC LIMIT 1"
-            ))?;
-            let mut rows = statement.query_map([], map_snapshot_row)?;
-            rows.next().transpose()
-        })
-    }
-
-    // 5. 기준 시각 이후 스냅샷 (최신순, 최대 limit 건)
+    // 4. 기준 시각 이후 스냅샷 (최신순, 최대 limit 건)
     pub fn ratelimit_snapshots_since(
         &self,
         since_ts: &str,
@@ -163,13 +152,18 @@ mod tests {
     use crate::transcript::test_support::TempDirGuard;
     use chrono::{Duration, SecondsFormat, Utc};
 
-    // 1. 기록·최신·기준 시각 조회 ---------------------------------------------
+    // 1. 기록·기준 시각 조회 --------------------------------------------------
     #[test]
     fn ratelimit_snapshots_round_trip() {
         let config = build_test_config("rl-store");
         let _cleanup = TempDirGuard(config.data_dir.clone());
         let ctx = build_test_context(config);
-        assert_eq!(ctx.store.latest_ratelimit_snapshot().expect("조회"), None);
+        assert!(
+            ctx.store
+                .ratelimit_snapshots_since("", 10)
+                .expect("빈 조회")
+                .is_empty()
+        );
 
         let older = RatelimitSnapshotRow {
             ts: "2026-11-19T00:00:00.000Z".to_string(),
@@ -193,8 +187,6 @@ mod tests {
         ctx.store.insert_ratelimit_snapshot(&older).expect("기록 1");
         ctx.store.insert_ratelimit_snapshot(&newer).expect("기록 2");
 
-        let latest = ctx.store.latest_ratelimit_snapshot().expect("최신 조회");
-        assert_eq!(latest.as_ref(), Some(&newer));
         let since = ctx
             .store
             .ratelimit_snapshots_since("2026-11-19T00:00:01.000Z", 10)

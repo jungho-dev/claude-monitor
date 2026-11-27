@@ -1,24 +1,23 @@
 //! tui/state.rs
 //! TUI 화면 상태: 탭, 카드 포커스·배치·스크롤, 집계 구간, 패널 데이터, 키 입력 상태 전이.
 
-use crate::core::config::{AppConfig, TUI_STATE_FILE_NAME};
+use crate::core::config::{AppConfig, ReportLanguage, TUI_STATE_FILE_NAME};
 use crate::core::model::{LiveEvent, StatusSnapshot};
 use crate::inventory::{DoctorFinding, Inventory};
 use crate::report::week_start_of;
 use crate::store::limits::LimitSnapshot;
 use crate::store::metrics::{AttributionDimension, MetricAttributionRow};
-use crate::store::otel_events::CompactionStat;
 use crate::store::query::{
     AgentStatsRow, CacheBreakRow, HookStatRow, MinuteBucket, ModelStatsRow, OverviewStats,
     ProjectStatsRow, SkillStatsRow, ToolLatencyRow,
 };
-use crate::store::ratelimit::RatelimitSnapshotRow;
 use crate::tui::cards::{
     CARD_COUNT, CardId, CardKind, CardMove, CardPress, CardView, ColumnDrag, CursorMotion,
     MAX_TABLE_COLUMNS, ScrollDrag, UiAction, UiHitAreas,
 };
 use crate::tui::format::{outline_entries, prepare_report_markdown};
 use crate::tui::i18n::{self, Failure, Lang, Msg};
+use crate::tui::layout::grid::GridMove;
 use crate::tui::layout::{CardLayout, SplitDrag, SplitGroup};
 use crate::tui::poller::{AdminAction, AdminOutcome, live_event_key};
 use crate::tui::sort::{
@@ -152,27 +151,6 @@ impl ActiveTab {
             Self::Skills => &[CardId::SkillTable],
         }
     }
-
-    // 탭 안 카드 경계 그룹 (배치 초기화 대상)
-    pub fn split_groups(self) -> &'static [SplitGroup] {
-        match self {
-            Self::Overview => &[
-                SplitGroup::OverviewRows,
-                SplitGroup::OverviewCompactRows,
-                SplitGroup::OverviewKpiCols,
-                SplitGroup::OverviewTrendCols,
-                SplitGroup::OverviewFeedCols,
-            ],
-            Self::Tools => &[SplitGroup::ToolsRows],
-            Self::Hooks => &[SplitGroup::HooksRows],
-            Self::Models => &[SplitGroup::ModelsRows],
-            Self::Agents => &[SplitGroup::AgentsRows],
-            Self::Settings => &[SplitGroup::SettingsRows],
-            Self::Report => &[SplitGroup::ReportCols],
-            Self::Projects => &[SplitGroup::ProjectsRows],
-            Self::Skills => &[SplitGroup::SkillsRows],
-        }
-    }
 }
 
 // 2. 집계 구간 ----------------------------------------------------------------
@@ -252,16 +230,10 @@ pub struct DashboardSnapshot {
     pub limits: Panel<LimitsData>,
 }
 
-// 한도·캐시 카드 입력 (latest = 공식 최신 스냅샷, history = 소진 예상용 최근 스냅샷 오래된 순,
-// api_key = 구간 안 최신 레이트리밋 헤더, compaction = 최신 세션의 컴팩션, estimate_* = 로컬 토큰 집계)
+// 모델 탭 캐시 카드 입력 (latest = 공식 최신 스냅샷)
 #[derive(Debug, Clone, Default)]
 pub struct LimitsData {
     pub latest: Option<LimitSnapshot>,
-    pub history: Vec<LimitSnapshot>,
-    pub api_key: Option<RatelimitSnapshotRow>,
-    pub compaction: Option<CompactionStat>,
-    pub estimate_5h: Option<OverviewStats>,
-    pub estimate_7d: Option<OverviewStats>,
 }
 
 // 5. 알림 ---------------------------------------------------------------------
@@ -287,8 +259,10 @@ pub enum UiMessage {
         inventory: Box<Panel<Inventory>>,
         doctor: Panel<Vec<DoctorFinding>>,
     },
+    // language = 요청할 때의 화면 언어 (도착했을 때 화면 언어와 다르면 버림)
     Report {
         date: NaiveDate,
+        language: ReportLanguage,
         body: Panel<Option<String>>,
     },
     // 관리 요청 결과 (알림 문구는 화면 언어로 UI 스레드에서 만듦)
@@ -303,6 +277,7 @@ pub enum UiMessage {
     // 주간 리포트 본문 (week_start = 해당 주의 월요일)
     WeeklyReport {
         week_start: NaiveDate,
+        language: ReportLanguage,
         body: Panel<Option<String>>,
     },
     // 수집 스레드의 DB 스키마 갱신 실패 (detail = 번역하지 않는 오류 원문, 알림 문구는 UI 스레드가 만듦)
@@ -337,6 +312,8 @@ pub struct AppState {
     // 상태 파일(tui.toml) 경로, 시작할 때 한 번 정함 (new 는 데이터 폴더 기준, 실행 진입점이 홈 공용 폴더로 교체)
     pub state_file: PathBuf,
     pub lang: Lang,
+    // 리포트 본문을 마지막으로 적재 요청한 화면 언어 (리포트 탭에서 언어를 바꾸면 다시 적재)
+    pub report_lang: Lang,
     pub today: NaiveDate,
     pub tab: ActiveTab,
     // 탭 바 표시 순서 (번호 키·Tab 순환이 따름, tui.toml 로 저장·복원), 탭을 눌러 끄는 중
@@ -354,6 +331,8 @@ pub struct AppState {
     // 카드 제목을 누른 채 대기 중, 길게 눌러 진입한 카드 이동 중
     pub card_press: Option<CardPress>,
     pub card_move: Option<CardMove>,
+    // 격자로 그리는 탭의 카드 이동 중 (취소하면 baseline 으로 되돌림)
+    pub grid_move: Option<GridMove>,
     pub split_hover: Option<(SplitGroup, usize)>,
     // 카드별 끌어 정한 열 폭 (None 이면 자동 폭, tui.toml 로 저장·복원), 열 경계 드래그 중·마우스 아래 경계
     // last_column_click = 끌지 않고 뗀 직전 경계 클릭 (더블클릭 판정용)
@@ -401,6 +380,7 @@ impl AppState {
             state_file: config.data_dir.join(TUI_STATE_FILE_NAME),
             config,
             lang: Lang::default(),
+            report_lang: Lang::default(),
             today,
             tab: ActiveTab::Overview,
             tab_order: ActiveTab::ALL,
@@ -413,6 +393,7 @@ impl AppState {
             split_drag: None,
             card_press: None,
             card_move: None,
+            grid_move: None,
             split_hover: None,
             column_widths: [[None; MAX_TABLE_COLUMNS]; CARD_COUNT],
             column_drag: None,
@@ -669,7 +650,7 @@ impl AppState {
                 UiCommand::SetTopmost(self.always_on_top)
             }
             UiAction::ResetLayout => {
-                self.card_layout.reset_groups(self.tab.split_groups());
+                self.card_layout.reset_tab(self.tab);
                 for card in self.tab.table_cards() {
                     self.column_widths[*card as usize] = [None; MAX_TABLE_COLUMNS];
                 }
@@ -882,13 +863,24 @@ impl AppState {
                 self.inventory = *inventory;
                 self.doctor = doctor;
             }
-            UiMessage::Report { date, body } => {
-                if date == self.report_date && !self.report_weekly {
+            // 언어를 바꾸기 전에 요청한 본문이 늦게 도착하면 버림 (새 언어의 적재가 따로 온다)
+            UiMessage::Report {
+                date,
+                language,
+                body,
+            } => {
+                let current = language == self.lang.report_language();
+                if date == self.report_date && !self.report_weekly && current {
                     self.report = body;
                 }
             }
-            UiMessage::WeeklyReport { week_start, body } => {
-                if week_start == self.report_week && self.report_weekly {
+            UiMessage::WeeklyReport {
+                week_start,
+                language,
+                body,
+            } => {
+                let current = language == self.lang.report_language();
+                if week_start == self.report_week && self.report_weekly && current {
                     self.report = body;
                 }
             }
@@ -1065,7 +1057,6 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::cards::SlotGroupHit;
     use crate::tui::test_support::sample_config;
     use chrono::TimeZone;
     use crossterm::event::KeyEventKind;
@@ -1240,7 +1231,18 @@ mod tests {
         state.apply_ui_message(
             UiMessage::WeeklyReport {
                 week_start: this_week,
+                language: ReportLanguage::Ko,
                 body: Panel::Ready(Some("weekly".to_string())),
+            },
+            now,
+        );
+        assert!(matches!(state.report, Panel::Pending));
+        // 화면 언어(한국어)와 다른 언어로 요청했던 본문은 버림
+        state.apply_ui_message(
+            UiMessage::Report {
+                date: today,
+                language: ReportLanguage::En,
+                body: Panel::Ready(Some("late english".to_string())),
             },
             now,
         );
@@ -1248,6 +1250,7 @@ mod tests {
         state.apply_ui_message(
             UiMessage::Report {
                 date: today,
+                language: ReportLanguage::Ko,
                 body: Panel::Ready(Some("daily".to_string())),
             },
             now,
@@ -1259,6 +1262,7 @@ mod tests {
         state.apply_ui_message(
             UiMessage::Report {
                 date: today,
+                language: ReportLanguage::Ko,
                 body: Panel::Ready(Some("late daily".to_string())),
             },
             now,
@@ -1266,6 +1270,7 @@ mod tests {
         state.apply_ui_message(
             UiMessage::WeeklyReport {
                 week_start: NaiveDate::from_ymd_opt(2026, 11, 2).unwrap(),
+                language: ReportLanguage::Ko,
                 body: Panel::Ready(Some("other week".to_string())),
             },
             now,
@@ -1274,6 +1279,16 @@ mod tests {
         state.apply_ui_message(
             UiMessage::WeeklyReport {
                 week_start: this_week,
+                language: ReportLanguage::En,
+                body: Panel::Ready(Some("late english week".to_string())),
+            },
+            now,
+        );
+        assert!(matches!(state.report, Panel::Pending));
+        state.apply_ui_message(
+            UiMessage::WeeklyReport {
+                week_start: this_week,
+                language: ReportLanguage::Ko,
                 body: Panel::Ready(Some("weekly".to_string())),
             },
             now,
@@ -1420,6 +1435,8 @@ mod tests {
             ),
             (5, true)
         );
+        state.handle_key_event(press(KeyCode::Char('s')));
+        state.handle_key_event(press(KeyCode::Char('s')));
         state.handle_key_event(press(KeyCode::Char('s')));
         assert_eq!(
             (
@@ -1627,92 +1644,100 @@ mod tests {
 
     #[test]
     fn layout_reset_key_clears_only_current_tab_groups() {
-        use crate::tui::cards::UiHitAreas;
-        use crate::tui::layout::{IDENTITY_ORDER, SplitAxis};
-        use ratatui::layout::Rect;
+        use crate::tui::layout::grid::{DropTarget, apply_drop, default_rows};
 
         let mut state = sample_state();
-        let mut hit_areas = UiHitAreas::default();
-        let area = Rect::new(0, 0, 100, 30);
-        state.card_layout.split_cards(
-            &mut hit_areas,
-            SplitGroup::ToolsRows,
-            SplitAxis::Rows,
-            area,
-            &[20],
-            &[5, 3],
-        );
-        let hit = hit_areas.split_hits[0];
-        state.card_layout.drag_cut(&hit, 10);
-        state
-            .card_layout
-            .move_card_to_slot(SplitGroup::ToolsRows, &IDENTITY_ORDER, 0, 1);
+        let swapped = apply_drop(
+            &default_rows(ActiveTab::Tools),
+            CardId::ToolTable,
+            DropTarget::RowBelow(CardId::ToolDetail),
+        )
+        .unwrap();
+        state.card_layout.set_grid(ActiveTab::Tools, swapped);
         assert!(
             state
                 .card_layout
-                .has_custom_groups(&[SplitGroup::ToolsRows])
+                .restore_grid_ratios("tools_rows_2", &[6_000])
         );
+        let customized = state.card_layout;
+        assert_ne!(customized, CardLayout::default());
 
         // 개요 탭에서 초기화해도 도구 탭 배치는 유지 (저장 요청은 항상)
         assert_eq!(
             state.handle_key_event(press(KeyCode::Char('l'))),
             UiCommand::SaveState
         );
-        assert!(
-            state
-                .card_layout
-                .has_custom_groups(&[SplitGroup::ToolsRows])
-        );
+        assert_eq!(state.card_layout, customized);
         assert!(state.toast.is_some());
 
-        // 도구 탭에서는 경계 비율과 카드 순서가 함께 기본으로
+        // 도구 탭에서는 경계 비율과 격자가 함께 기본으로
         state.handle_key_event(press(KeyCode::Char('2')));
         assert_eq!(
             state.handle_key_event(press(KeyCode::Char('l'))),
             UiCommand::SaveState
         );
-        assert!(
-            !state
-                .card_layout
-                .has_custom_groups(&[SplitGroup::ToolsRows])
-        );
-        assert_eq!(
-            state.card_layout.order_of(SplitGroup::ToolsRows),
-            IDENTITY_ORDER
-        );
+        assert_eq!(state.card_layout, CardLayout::default());
     }
 
     fn shift_press(code: KeyCode) -> KeyEvent {
         KeyEvent::new_with_kind(code, KeyModifiers::SHIFT, KeyEventKind::Press)
     }
 
-    // 그리기 없이 모든 순서 그룹이 이번 프레임에 그려진 것으로 표시
-    fn mark_all_groups_drawn(state: &mut AppState) {
-        for group in SplitGroup::ALL {
-            state.hit_areas.slot_groups.push(SlotGroupHit {
-                group,
-                axis: group.axis(),
-                slots: Vec::new(),
-                cards: Vec::new(),
+    // 그리기 없이 탭 기본 격자의 카드가 이번 프레임에 그려진 것으로 표시 (영역은 쓰지 않음)
+    fn mark_grid_drawn(state: &mut AppState, tab: ActiveTab) {
+        use crate::tui::cards::GridLineHit;
+        use crate::tui::layout::grid::default_rows;
+        use ratatui::layout::Rect;
+
+        for (row, cells) in default_rows(tab).rows.iter().enumerate() {
+            let cards: Vec<(CardId, Rect)> = cells
+                .iter()
+                .flatten()
+                .map(|card| (*card, Rect::default()))
+                .collect();
+            if cards.is_empty() {
+                continue;
+            }
+            state.hit_areas.grid_lines.push(GridLineHit {
+                tab,
+                row,
+                rect: Rect::default(),
+                cards,
             });
         }
     }
 
+    // 탭 격자의 줄별 카드 (빈 줄 제외)
+    fn grid_rows_of(state: &AppState, tab: ActiveTab) -> Vec<Vec<CardId>> {
+        state
+            .card_layout
+            .grid_of(tab)
+            .rows
+            .iter()
+            .map(|cells| cells.iter().flatten().copied().collect::<Vec<CardId>>())
+            .filter(|row| !row.is_empty())
+            .collect()
+    }
+
     #[test]
-    fn shift_down_and_up_move_the_focused_card_within_a_rows_group() {
+    fn shift_down_and_up_move_the_focused_card_between_grid_rows() {
         let mut state = sample_state();
-        mark_all_groups_drawn(&mut state);
+        mark_grid_drawn(&mut state, ActiveTab::Settings);
         state.handle_key_event(press(KeyCode::Char('6')));
         assert_eq!(state.focused_card_id(), CardId::SettingsHooks);
 
-        // 첫 카드를 한 칸 아래로: 다음 카드가 한 칸 위로, 알림과 저장 요청
+        // 혼자인 첫 카드를 아래로: 아래 줄 끝에 합류, 알림과 저장 요청
         assert_eq!(
             state.handle_key_event(shift_press(KeyCode::Down)),
             UiCommand::SaveState
         );
         assert_eq!(
-            state.card_layout.order_of(SplitGroup::SettingsRows)[..4],
-            [1, 0, 2, 3]
+            grid_rows_of(&state, ActiveTab::Settings),
+            vec![
+                vec![CardId::SettingsMcp, CardId::SettingsHooks],
+                vec![CardId::SettingsAgents],
+                vec![CardId::SettingsDoctor],
+            ]
         );
         assert_eq!(
             state.toast.as_ref().map(|toast| toast.text.as_str()),
@@ -1720,7 +1745,7 @@ mod tests {
         );
         assert_eq!(state.toast.as_ref().unwrap().level, ToastLevel::Info);
 
-        // 위로 되돌리면 기본 배치와 같아짐, 맨 위에서 더 올리면 아무 일 없음
+        // 위로: 함께인 줄에서 위 새 줄 = 기본 배치, 맨 위 혼자면 아무 일 없음
         assert_eq!(
             state.handle_key_event(shift_press(KeyCode::Up)),
             UiCommand::SaveState
@@ -1732,14 +1757,14 @@ mod tests {
         );
         assert_eq!(state.card_layout, CardLayout::default());
 
-        // 세로 나열 그룹은 ←→ 를 받지 않음
+        // 이웃 없는 혼자인 카드는 ←→ 를 받지 않음
         assert_eq!(
             state.handle_key_event(shift_press(KeyCode::Right)),
             UiCommand::None
         );
         assert_eq!(state.card_layout, CardLayout::default());
 
-        // 마지막 카드 아래로는 이동 없음
+        // 마지막 카드 아래로는 이동 없음, 위로는 위 줄 끝에 합류
         state.focused_card = Some((ActiveTab::Settings, CardId::SettingsDoctor));
         assert_eq!(
             state.handle_key_event(shift_press(KeyCode::Down)),
@@ -1750,21 +1775,33 @@ mod tests {
             UiCommand::SaveState
         );
         assert_eq!(
-            state.card_layout.order_of(SplitGroup::SettingsRows)[..4],
-            [0, 1, 3, 2]
+            grid_rows_of(&state, ActiveTab::Settings),
+            vec![
+                vec![CardId::SettingsHooks],
+                vec![CardId::SettingsMcp],
+                vec![CardId::SettingsAgents, CardId::SettingsDoctor],
+            ]
         );
     }
 
     #[test]
     fn shift_left_and_right_move_cards_within_a_columns_group_and_keep_report_date_keys() {
+        use crate::tui::cards::GridLineHit;
+        use crate::tui::layout::grid::default_rows;
+        use ratatui::layout::Rect;
+
         let mut state = sample_state();
-        mark_all_groups_drawn(&mut state);
-        // 개요 탭 기본 포커스(이벤트 피드)는 가로 그룹: ←→ 만 받음
+        // 개요 탭 기본 포커스(이벤트 피드)는 격자 줄 4 의 첫 카드: ← 는 끝, → 는 상세와 교환
+        state.hit_areas.grid_lines.push(GridLineHit {
+            tab: ActiveTab::Overview,
+            row: 4,
+            rect: Rect::new(0, 20, 100, 10),
+            cards: vec![
+                (CardId::EventFeed, Rect::new(0, 20, 70, 10)),
+                (CardId::EventDetail, Rect::new(71, 20, 29, 10)),
+            ],
+        });
         assert_eq!(state.focused_card_id(), CardId::EventFeed);
-        assert_eq!(
-            state.handle_key_event(shift_press(KeyCode::Down)),
-            UiCommand::None
-        );
         assert_eq!(
             state.handle_key_event(shift_press(KeyCode::Left)),
             UiCommand::None
@@ -1773,17 +1810,15 @@ mod tests {
             state.handle_key_event(shift_press(KeyCode::Right)),
             UiCommand::SaveState
         );
+        let grid = state.card_layout.grid_of(ActiveTab::Overview);
         assert_eq!(
-            state.card_layout.order_of(SplitGroup::OverviewFeedCols)[..2],
-            [1, 0]
+            grid.rows[4][..2],
+            [Some(CardId::EventDetail), Some(CardId::EventFeed)]
         );
-        assert!(
-            !state
-                .card_layout
-                .has_custom_groups(&[SplitGroup::OverviewKpiCols])
-        );
+        assert_eq!(grid.rows[1], default_rows(ActiveTab::Overview).rows[1]);
 
         // 리포트 탭: Shift+←→ 는 카드 이동, 일반 ←→ 는 날짜 이동
+        mark_grid_drawn(&mut state, ActiveTab::Report);
         state.handle_key_event(press(KeyCode::Char('7')));
         assert_eq!(state.focused_card_id(), CardId::ReportBody);
         assert_eq!(
@@ -1791,8 +1826,8 @@ mod tests {
             UiCommand::SaveState
         );
         assert_eq!(
-            state.card_layout.order_of(SplitGroup::ReportCols)[..2],
-            [1, 0]
+            grid_rows_of(&state, ActiveTab::Report),
+            vec![vec![CardId::ReportBody, CardId::ReportOutline]]
         );
         let today = NaiveDate::from_ymd_opt(2026, 11, 15).unwrap();
         let yesterday = NaiveDate::from_ymd_opt(2026, 11, 14).unwrap();
@@ -1805,15 +1840,17 @@ mod tests {
             UiCommand::LoadReport(today)
         );
         assert_eq!(
-            state.card_layout.order_of(SplitGroup::ReportCols)[..2],
-            [1, 0]
+            grid_rows_of(&state, ActiveTab::Report),
+            vec![vec![CardId::ReportBody, CardId::ReportOutline]]
         );
     }
 
     #[test]
-    fn plain_arrows_still_scroll_and_cards_outside_reorder_groups_ignore_shift_arrows() {
+    fn plain_arrows_still_scroll_and_the_server_status_card_moves_like_any_other_card() {
+        use crate::tui::layout::grid::{DropTarget, apply_drop, default_rows};
+
         let mut state = sample_state();
-        mark_all_groups_drawn(&mut state);
+        mark_grid_drawn(&mut state, ActiveTab::Settings);
         state.handle_key_event(press(KeyCode::Char('6')));
         let hooks = CardId::SettingsHooks as usize;
         state.card_views[hooks].total = 30;
@@ -1825,41 +1862,58 @@ mod tests {
         state.handle_key_event(shift_press(KeyCode::Down));
         assert_eq!(state.card_views[hooks].scroll, 1);
         assert_eq!(
-            state.card_layout.order_of(SplitGroup::SettingsRows)[..2],
-            [1, 0]
+            grid_rows_of(&state, ActiveTab::Settings)[0],
+            [CardId::SettingsMcp, CardId::SettingsHooks]
         );
 
-        // 서버 상태 카드는 순서 대상이 아님
+        // 서버 상태 카드도 다른 카드처럼 이동 (아래 줄에 자리가 있으면 그 줄 끝에 합류)
         state.handle_key_event(press(KeyCode::Char('1')));
+        let roomy = apply_drop(
+            &default_rows(ActiveTab::Overview),
+            CardId::SavingsEffect,
+            DropTarget::After(CardId::TrendTokens),
+        )
+        .unwrap();
+        state.card_layout.set_grid(ActiveTab::Overview, roomy);
+        mark_grid_drawn(&mut state, ActiveTab::Overview);
         state.focused_card = Some((ActiveTab::Overview, CardId::ServerStatus));
-        let before = state.card_layout;
         assert_eq!(
             state.handle_key_event(shift_press(KeyCode::Down)),
-            UiCommand::None
+            UiCommand::SaveState
         );
-        assert_eq!(
-            state.handle_key_event(shift_press(KeyCode::Right)),
-            UiCommand::None
+        let rows = grid_rows_of(&state, ActiveTab::Overview);
+        assert_eq!(rows[0].len(), 6);
+        assert_eq!(rows[0].last(), Some(&CardId::ServerStatus));
+        assert!(
+            rows.iter()
+                .skip(1)
+                .all(|row| !row.contains(&CardId::ServerStatus))
         );
-        assert_eq!(state.card_layout, before);
     }
 
     #[test]
     fn esc_during_a_card_move_cancels_it_instead_of_quitting_and_other_keys_wait() {
         use crate::tui::cards::CardMove;
+        use crate::tui::layout::grid::{DropTarget, apply_drop};
 
         let mut state = sample_state();
         state.handle_key_event(press(KeyCode::Char('6')));
-        let baseline = state.card_layout.order_of(SplitGroup::SettingsRows);
-        state
-            .card_layout
-            .move_card_to_slot(SplitGroup::SettingsRows, &baseline, 0, 2);
+        let baseline = state.card_layout.begin_grid_move(ActiveTab::Settings);
+        let moved = apply_drop(
+            &baseline,
+            CardId::SettingsHooks,
+            DropTarget::After(CardId::SettingsAgents),
+        )
+        .unwrap();
+        state.card_layout.set_grid(ActiveTab::Settings, moved);
+        state.grid_move = Some(GridMove {
+            tab: ActiveTab::Settings,
+            card: CardId::SettingsHooks,
+            baseline,
+            lines: Vec::new(),
+        });
         state.card_move = Some(CardMove {
             card: CardId::SettingsHooks,
-            group: SplitGroup::SettingsRows,
-            index: 0,
-            baseline,
-            target: 2,
         });
 
         // 이동 중 일반 키는 무시, 탭도 바뀌지 않음
@@ -1870,10 +1924,11 @@ mod tests {
         assert_eq!(state.tab, ActiveTab::Settings);
         assert!(state.card_move.is_some());
 
-        // Esc: 종료하지 않고 누르기 전 순서로 복원
+        // Esc: 종료하지 않고 누르기 전 격자로 복원
         assert_eq!(state.handle_key_event(press(KeyCode::Esc)), UiCommand::None);
         assert!(!state.should_quit);
         assert!(state.card_move.is_none());
+        assert!(state.grid_move.is_none());
         assert_eq!(state.card_layout, CardLayout::default());
 
         // 이동이 끝나면 Esc 는 다시 종료
@@ -1884,30 +1939,38 @@ mod tests {
     #[test]
     fn switching_tabs_cancels_a_pending_press_and_a_card_move() {
         use crate::tui::cards::{CardMove, CardPress};
+        use crate::tui::layout::grid::{DropTarget, apply_drop};
 
         let mut state = sample_state();
         state.handle_key_event(press(KeyCode::Char('6')));
-        let baseline = state.card_layout.order_of(SplitGroup::SettingsRows);
-        state
-            .card_layout
-            .move_card_to_slot(SplitGroup::SettingsRows, &baseline, 0, 3);
+        let baseline = state.card_layout.begin_grid_move(ActiveTab::Settings);
+        let moved = apply_drop(
+            &baseline,
+            CardId::SettingsHooks,
+            DropTarget::RowBelow(CardId::SettingsDoctor),
+        )
+        .unwrap();
+        state.card_layout.set_grid(ActiveTab::Settings, moved);
+        state.grid_move = Some(GridMove {
+            tab: ActiveTab::Settings,
+            card: CardId::SettingsHooks,
+            baseline,
+            lines: Vec::new(),
+        });
         state.card_move = Some(CardMove {
             card: CardId::SettingsHooks,
-            group: SplitGroup::SettingsRows,
-            index: 0,
-            baseline,
-            target: 3,
         });
         state.card_press = Some(CardPress {
             card: CardId::SettingsMcp,
-            group: SplitGroup::SettingsRows,
-            index: 1,
+            group: SplitGroup::GridCols(ActiveTab::Settings, 1),
+            index: 0,
             started: Instant::now(),
             cell: ratatui::layout::Position::new(0, 0),
         });
 
         state.switch_tab(ActiveTab::Hooks);
         assert!(state.card_move.is_none());
+        assert!(state.grid_move.is_none());
         assert!(state.card_press.is_none());
         assert_eq!(state.card_layout, CardLayout::default());
     }

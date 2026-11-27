@@ -312,15 +312,15 @@ cargo uninstall claude-monitor
 ## Dashboard
 
 1. **Tabs**
-    - Eight tabs with keys `1`-`8`: overview, tools, hooks, models, agents, settings (`6`), report (`7`), and projects (`8`).
+    - Nine tabs with keys `1`-`9`: overview, tools, hooks, models, agents, settings (`6`), report (`7`), projects (`8`), and skills (`9`).
     - There is no gateway tab; gateway timing (first byte, first token, and total time, p50/p90) is available through `GET /api/gateway` and in the daily report, and the overview server-status card shows the gateway port as a status dot.
     - The dashboard reads `cm.sqlite` read-only on a background thread every 2 seconds, and the heavy panels (tools, hooks, model stats, agent stats, cache breaks) every 10 seconds; the first read, a window change, and `r` refresh them at once.
     - The screen is redrawn only when something changed, and at least once per second.
-    - When the tab labels do not fit, the tab bar first removes the gaps between tabs and then switches to numbered compact labels, so all eight tabs stay visible and clickable down to 60 columns.
-    - Screen text is English by default and switches to Korean with `L` (see Display language); the report text follows `[report] language` in `config.toml`.
+    - When the tab labels do not fit, the tab bar first removes the gaps between tabs and then switches to numbered compact labels, so all nine tabs stay visible and clickable down to 60 columns.
+    - Screen text is English by default and switches to Korean with `L` (see Display language); the report tab shows and generates reports in the display language, and the scheduled reports follow `[report] language` in `config.toml`.
     - At start the dashboard opens an existing database once with a write connection so an older schema is upgraded before the read-only reads begin; this runs on the poller thread before the first collection, a failure shows an error toast, and it never creates a database.
 2. **Keys**
-    - `1`-`8`, `Tab`, `Shift-Tab`: switch tab; the number is the position in the tab bar (see Tab order)
+    - `1`-`9`, `Tab`, `Shift-Tab`: switch tab; the number is the position in the tab bar (see Tab order)
     - `<`, `>`: move the current tab one slot left or right (see Tab order)
     - `Up`, `Down`, `PgUp`, `PgDn`, `Home`, `End`: scroll
     - `w`: cycle the window through today (from local midnight, the default), 1 hour, 24 hours, and 7 days
@@ -333,8 +333,8 @@ cargo uninstall claude-monitor
     - `g` and `i` go through the admin API and need a running `serve`
     - `!`: force restart, only while `serve` runs another build: stops that `serve` (asks for UAC approval when it runs elevated), starts `serve` from the latest exe on disk, and reruns the TUI from that exe with the same arguments
     - `t`: toggle always-on-top
-    - `Shift+Up`, `Shift+Down`, `Shift+Left`, `Shift+Right`: move the focused card one slot (see Card order)
-    - `l`: reset the card sizes, card order, and dragged column widths of the current tab
+    - `Shift+Up`, `Shift+Down`, `Shift+Left`, `Shift+Right`: move the focused card (see Card order)
+    - `l`: restore the default card arrangement, the card sizes, and the dragged column widths of the current tab
     - `L` (Shift+l): switch the display language between English and Korean
     - `r`: refresh, `?`: help, `q`, `Esc`, `Ctrl+C`: quit
 3. **Mouse**
@@ -353,15 +353,20 @@ cargo uninstall claude-monitor
     - The settings tab shows hooks, MCP servers, agents, and diagnostics as table cards with the same header sort and draggable columns; the allow list, load warnings, and the skill and env summary continue below the table rows as auxiliary lines in the same scroll, and a diagnostic's fix hint stays in its message cell.
     - A card only one row high shows its first body row instead of the header, and the sort stays reachable with `s` and `S`.
     - The top-most state has its own purple fill on the app-bar `Pinned` badge and the `[t] Pin ON` chip, together with the words; the warn color is reserved for stale and warning states.
-    - The overview has a limits card at the right end of the trend row (hidden on short screens): the label says `official` when the numbers come from the status line and `estimate` when only local token sums exist, followed by the 5-hour and 7-day bars with a reset countdown, a pace mark (ahead, on track, or behind the even burn rate), the projected exhaustion time, the context percentage, the compaction count, and the remaining requests and tokens of an API key when the gateway saw `anthropic-ratelimit-*` headers.
-    - A status line snapshot older than 30 minutes is dimmed and gets no exhaustion projection.
-    - On a narrow screen (a trend card would be under 12 columns) the two overview trend cards hide and the limits card widens.
-    - The limit and API-key levels carry a mark besides the color: ` !` from 80 % used (warn) and ` !!` from 95 % (critical); the cache hit line of the cache timer card marks ` !` below 80 % and ` !!` below 50 %.
-    - The models tab shows per-model stats (requests, sessions, agent types, tokens, cache hit ratio, wait p50/p90, estimated cost, last seen) with a detail card, the cache-break candidates, and a cache timer card built from the latest status line snapshot; the cache timer card is hidden when its card is too short, wherever it sits.
-    - The projects tab shows a project and branch table (requests, sessions, tokens, cache writes by 5-minute and 1-hour, estimated cost, last seen) with a detail card, and an attribution table of cost by skill, MCP server, plugin, agent, or model; `d` cycles the dimension and the choice is saved in the state file (see State file), and the table needs the OTLP metrics (see Connect Claude Code).
-    - The agents tab shows per-agent-type stats (runs, requests, sessions, tokens, estimated cost, wait p50/p90, tool calls and errors, top model, last seen) with a detail card; every agent defined in `~/.claude/agents` and every Claude Code built-in agent (`general-purpose`, `statusline-setup`, `claude-code-guide`, plus `Explore` and `Plan` unless `CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS` is `1` or `true` in the `settings.json` env) is listed, and one with no calls in the window shows 0.
+    - The overview stacks, from top to bottom: the server-status card; a row of five KPI cards (requests, tokens, cache hit, tools, hooks) plus the hook rewrite effect card, which shows the net effect (saved time today minus the estimated deny loss) in its first line and the saved time and the estimated loss in its second; a row of two per-minute sparkline cards (requests and output tokens); a row of three chart cards; and the live event feed with the event detail beside it.
+    - The chart row holds a line graph of requests, tool calls, and hook denials per minute over the last 60 minutes, a bar chart of the token mix (input, output, cache read, cache write) in the selected window, and a bar chart of the most-called tools with an `!N` error mark.
+    - Each graph line has a legend entry with its name and value, the bars scale to the largest row, and a legend that does not fit drops its values before its names.
+    - A row whose cards do not fit the width wraps onto the next line without dropping a card; when the height runs short the chart row hides first and then the trend row, and hidden rows keep their arrangement and return when the terminal grows.
+    - The cache hit line of the cache timer card marks ` !` below 80 % and ` !!` below 50 %, and the card dims a status line snapshot older than 30 minutes.
+    - The tools tab shows a per-tool table (Tool, Calls, Errors, Avg, Max, Total, Err %, Share) with a detail card (Calls / errors with the error rate, Avg / max, Total time, Share of time, and Share of calls).
+    - The hooks tab shows a per-route and guard table (Route, Guard, Verdict, Detail, Count, Avg, Total, Saved, Share) with a detail card (Route / guard, Verdict, Detail, Count with its share, Avg / max, Total time, and Time saved).
+    - The models tab shows a per-model table (model, requests, sessions, agent types, input, output, cache read and cache write tokens, cache hit ratio, average wait, total wait, estimated cost, last seen, tokens per request) with a detail card (counts, input and output tokens, cache read and write with the hit ratio, the 5-minute and 1-hour cache write split, wait average and maximum, total wait, total tokens and tokens per request, estimated cost, cost and output per request, share of the window, first and last request, and the agents by cost), the cache-break candidates, and a cache timer card built from the latest status line snapshot; the cache timer card is hidden when its card is too short, wherever it sits.
+    - The projects tab shows a project and branch table (project, branch, requests, sessions, input, output, cache read, cache writes by 5-minute and 1-hour, estimated cost, last seen, total wait, tokens per request) with a detail card (requests and sessions, input and output tokens, cache read and the two cache writes, estimated cost, cost and output per request, requests and cost per session, share of the window, first and last request, wait average and maximum, total wait, total tokens and tokens per request, and the models, agents, and sessions by cost), and an attribution table of cost by skill, MCP server, plugin, agent, or model; `d` cycles the dimension and the choice is saved in the state file (see State file), and the table needs the OTLP metrics (see Connect Claude Code).
+    - The agents tab shows a per-agent-type table (agent, runs, requests, sessions, input, output, cache read, estimated cost, average wait, total wait, tool calls, errors, top model, last seen) with a detail card (runs, requests, and sessions, requests and cost per run, input and output tokens, cache read and write with the hit ratio, the cache write split, wait average and maximum, total wait, total tokens and tokens per request, tool calls with errors and error rate, estimated cost, share of the window, configuration, top model and last seen, first seen, and the models by cost, tools by calls, and recent runs); every agent defined in `~/.claude/agents` and every Claude Code built-in agent (`general-purpose`, `statusline-setup`, `claude-code-guide`, plus `Explore` and `Plan` unless `CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS` is `1` or `true` in the `settings.json` env) is listed, and one with no calls in the window shows 0.
+    - The skills tab shows one skill table that merges the installed skills, the `Skill` tool calls, and the OTel cost by name (Skill, Inst, Calls, Errors, Sess, Caller, Cost, Desc, Last, In, Out) with a detail card (Calls / errors / sess with the error rate, Share of skill calls, First / last call, Installed at, Description length, Cost (OTel) with its input and output tokens, Per call (OTel), the callers, and the recent calls); the Cost, In, and Out cells and the Per call (OTel) line show `-` for a skill without OTel data, and the OTel values need the OTLP metrics (see Connect Claude Code).
     - The report view shows box tables verbatim and converts legacy pipe-table reports to box tables when displaying them.
     - The report tab opens on today's report, built live; `v` toggles between the daily and the weekly view, and the weekly view opens on the current week, also built live, with `Left` and `Right` moving by one week (not past the current week).
+    - The report tab follows the display language: the live report of today or this week is built in that language, `L` on the report tab reloads it in the new language, and `g` stores the generated report in that language; a stored report of a past day or week keeps the language it was generated in until it is generated again.
     - The dashboard's today follows the clock across midnight: a report view that showed today or this week moves to the new day or week and is built live there, while a past day or week stays.
     - The event feed also shows the stored OTLP events (compaction, subagent completion, API error, permission decision, and permission mode change) with their own tags.
     - The server-status card marks each port with a dot: a filled green dot when it listens, a hollow dot when it is turned off or unknown, and a hollow bold red dot when it should listen but does not; whole items drop from the right when the card is narrow.
@@ -369,32 +374,34 @@ cargo uninstall claude-monitor
 5. **Console**
     - In a classic console window the dashboard applies the `D2Coding ligature` font while it runs and restores the original font on exit.
 6. **Card order**
-    - It applies to every card group whose panes are single cards: the KPI, trend, and feed rows of the overview, and the tools, hooks, models, agents, settings, and report tabs.
+    - It applies to every card in every tab: each tab is a grid of rows of cards, a row holds at most six cards and a tab at most six rows, and the server status card moves like any other card.
     - Press and hold a card title for 400 ms to enter move mode; the lifted card gets a dashed accent border and its title shows a move mark.
-    - Drag to preview the new order and release to commit it; the slot sizes stay where they are and only the cards move between slots.
-    - `Esc`, a tab switch, or a terminal resize cancels the move and restores the previous order.
+    - Drag to preview the arrangement live: dropping inside a row joins that row at the pointer position, and dropping on a row's top or bottom border creates a new row there (the top border of the card's own row counts as inside it); a row left empty disappears.
+    - Release commits the move; a lost release or a new press also commits the preview.
+    - `Esc`, a tab switch, or a terminal resize cancels the move and restores the previous arrangement.
     - Releasing before 400 ms is an ordinary click, and dragging before 400 ms starts neither a move nor a resize.
-    - `Shift+arrow` moves the focused card one slot without a drag: `Up` and `Down` in a stacked group, `Left` and `Right` in a side-by-side group, and the other arrows do nothing.
-    - `l` resets the card sizes, the card order, and the dragged column widths of the current tab.
+    - `Shift+Left` and `Shift+Right` swap the focused card with its neighbor inside the row; `Shift+Up` and `Shift+Down` alternate between moving the card into its own new row and joining the adjacent row.
+    - `l` restores the default card arrangement of the current tab, together with its card sizes and dragged column widths.
+    - Row height boundaries and card width boundaries stay draggable, except the width boundaries of a row that wrapped.
 7. **Tab order**
     - Press a tab and drag it along the tab bar: the press switches to that tab, the drag previews the new order live, and the release commits and saves it.
     - A plain click without a drag only switches the tab and changes no order.
     - `Esc` during the drag restores the order from before the press; a release lost outside the window commits the shown order on the next move or press.
     - `<` and `>` move the current tab one slot without a drag and stop at either end.
-    - The tab numbers follow the shown order, so `1`-`8`, `Tab`, and `Shift-Tab` always follow the tab bar; `l` does not reset the tab order.
+    - The tab numbers follow the shown order, so `1`-`9`, `Tab`, and `Shift-Tab` always follow the tab bar; `l` does not reset the tab order.
 8. **Display language**
     - English is the default; `L` (Shift+l) switches between English and Korean at runtime and saves the choice.
     - The footer chip `[L] EN` or `[L] KO` shows the current language and is clickable; it sits after the other left chips and before help and quit, and it is the last left chip to drop, so it is still visible at the minimum size (60x16) while the other left chips disappear from the right.
-    - Tab names, labels, the help overlay, and notices follow the language; data values such as paths, model and tool names, and log text are not translated, and the report text follows `[report] language` instead.
+    - Tab names, labels, the help overlay, and notices follow the language; data values such as paths, model and tool names, and log text are not translated; the report tab shows reports in the display language, while the scheduled reports follow `[report] language`.
 9. **State file**
-    - `~/.config/claude-monitor/tui.toml`, next to `config.toml` (it stays there even when the data directory moves), holds `version = 1`, `language`, `attribution_dimension` (the projects tab dimension chosen with `d`, written only when it is not the default skill), `tab_order` (stable tab names such as `overview` and `tools`, written only when it differs from the default order), the card orders, the split ratios, and the table column widths, keyed by stable names such as `settings_rows`, `event_feed`, `tool_table`, and `settings_hooks`.
+    - `~/.config/claude-monitor/tui.toml`, next to `config.toml` (it stays there even when the data directory moves), holds `version = 1`, `language`, `attribution_dimension` (the projects tab dimension chosen with `d`, written only when it is not the default skill), `tab_order` (stable tab names such as `overview` and `tools`, written only when it differs from the default order; a list that lacks only `skills` gets it appended at the end), the card arrangement of each tab in `[grids]` (one key per tab, rows of card names), the split ratios in `[grid_ratios]`, and the table column widths, keyed by stable names such as `event_feed`, `tool_table`, and `settings_hooks`.
     - It is written atomically (a temporary file, then a rename) when a change is committed: the end of a card move, a tab move, or a boundary or column drag, `Shift+arrow`, `<`, `>`, `l`, `L`, and `d` on the projects tab.
     - The write runs on a dedicated writer thread that the input thread feeds through a channel: a burst of commits collapses into the latest state, the terminal guard flushes the last commit and joins the thread on every exit path but waits at most 5 seconds, after which it prints a warning on stderr and exits, and a failed write comes back as an error toast.
     - When `tui.toml` is a symbolic link (for example into a synced folder), the dashboard follows the whole link chain (up to 16 links), writes the temporary file next to the real file, and renames it over the real file, so every link in the chain stays in place; a chain deeper than 16 links fails the save with an error.
     - At start only stale temporary files are removed (not modified for 10 minutes and not owned by the running process), so the live temporary file of another running instance survives.
     - A missing file means the defaults (English and the default layout).
     - An unreadable file, an unsupported version, or an invalid entry (an unknown name or a wrong length or range) is skipped with one notice, and the other entries still apply; an unreadable or other-version file is first copied to `tui.toml.bak`.
-    - A layout saved before the 4th card in `overview_trend_cols` and `models_rows` loads without a notice: the order keeps, the new card is appended last with its boundary at the end, and the next save writes the 4-card form.
+    - A file written by an earlier build still loads: its `[orders]` and `[ratios]` entries for the tools, hooks, skills, models, agents, projects, settings, and report tabs are converted to the grid form and applied only for a tab that has no `[grids]` entry, the overview keeps only the order of its two trend cards and drops its other old keys silently, a legacy value that does not fit is dropped without a notice while an unknown old key counts as a skipped entry, the legacy tables are never written back, and one `.bak` copy of the original file is made whenever it holds `[orders]` or `[ratios]`; a retired card name in `[grids]` (`kpi_wait`, `limits_card`, `chart_limits`) is dropped silently; the file version stays `version = 1`, and column widths saved with the earlier column counts of the tool, hook, model, project, and skill tables load onto the same columns.
 
 ---
 
@@ -414,7 +421,7 @@ cargo uninstall claude-monitor
     - `GET /api/power` returns `enabled`, `keep_awake`, `holding` (the sleep postponement is active), and `gaps`, the last 32 standby gaps (they survive a `serve` restart) as `id`, `start_ms`, `end_ms` (Unix milliseconds), and `active` (Claude Code was active right before the standby).
 2. **Token-protected endpoints**
     - `POST /api/reindex` runs the transcript indexer once.
-    - `POST /api/report?date=YYYY-MM-DD` or `POST /api/report?week=YYYY-Www` generates and stores a daily or weekly report; the default is yesterday's daily report.
+    - `POST /api/report?date=YYYY-MM-DD` or `POST /api/report?week=YYYY-Www` generates and stores a daily or weekly report; the default is yesterday's daily report, and an optional `lang=ko` or `lang=en` sets the report language for that request instead of `[report] language` (another value returns `400`).
     - Every `POST` needs the token in the header `x-cm-token`; a missing or wrong token returns `401`.
 3. **Token**
     - The token is 32 random bytes from the OS, written as hex to `admin.token` in the data directory, and regenerated on every `serve` start.
@@ -532,7 +539,7 @@ cargo uninstall claude-monitor
     - `admin.token`: the admin token of the current `serve` run.
     - `serve.log`: the output of the detached `serve` that a no-command or `start` launch creates, recreated on each launch.
     - `reports\YYYY-MM-DD.md` and `reports\YYYY-Www.md`: daily and weekly reports (ISO week, for example `2026-W47`); each is also stored in the database.
-    - `tui.toml`: the dashboard state (display language, card order, card sizes, column widths); the dashboard writes it and a missing file means the defaults.
+    - `tui.toml`: the dashboard state (display language, card arrangement, card sizes, column widths); the dashboard writes it and a missing file means the defaults.
 3. **Creation**
     - The folder is created when the first command that writes needs it, such as `serve`, `start`, or `index`; `doctor` only warns when it is missing.
 
@@ -718,7 +725,7 @@ cargo fmt --check
     - When the OTLP or gateway port cannot bind, `serve` runs without that server and only prints a warning, so check `doctor` and the start-up log.
     - Once running, the end of OTLP, the indexer, the report scheduler, or the gateway is only announced; the end of admin or hooks stops `serve`.
 6. **Language and platform**
-    - The report text is Korean or English (`[report] language`, default Korean), and the dashboard text is English or Korean (`L`); the default data directory needs `USERPROFILE`, `HOME`, or `CM_DATA_DIR`.
+    - The report text is Korean or English (`[report] language`, default English), and the dashboard text is English or Korean (`L`); the default data directory needs `USERPROFILE`, `HOME`, or `CM_DATA_DIR`.
 7. **Cost estimate**
     - It uses a built-in per-model rate table (see Cost Estimate); an unknown model counts as zero, and the table is a comparison aid, not a bill.
     - A row stored without the 5-minute and 1-hour split (for example an older row) is priced with the whole cache write at the 5-minute rate.
@@ -731,7 +738,7 @@ cargo fmt --check
     - A wall-clock step forward of more than `power.gap_threshold_secs` (manual or NTP correction) is recorded as a gap; a step backward ends the sleep postponement until the next activity.
     - A gap is seen only when the whole process is paused; a network drop without standby is not detected.
 10. **Status line**
-    - The official 5-hour and 7-day values reach the database only through the `statusline` command, so without it the limits card shows a local token estimate.
+    - The official 5-hour and 7-day values reach the database only through the `statusline` command, so without it `status --once` reports unknown and the cache timer card shows its setup note.
     - Claude Code provides them only for Pro, Max, and Ultra subscriptions and only after the first API response of a session; this repository does not verify that condition.
 11. **Retention**
     - `limit_snapshots` and `ratelimit_snapshots` keep 30 days, pruned on insert; the cutoff counts back from the earlier of the recorded time and now, so one future timestamp erases nothing.

@@ -1,7 +1,7 @@
 //! tui/poller.rs
 //! 배경 집계 수집과 설정·리포트·관리 요청 스레드 (UI 스레드는 I/O 없음, panic 은 패널 상태로 변환).
 
-use crate::core::config::{AppConfig, DB_FILE_NAME, TOKEN_FILE_NAME};
+use crate::core::config::{AppConfig, DB_FILE_NAME, ReportLanguage, TOKEN_FILE_NAME};
 use crate::core::model::LiveEvent;
 use crate::inventory;
 use crate::net::admin;
@@ -9,10 +9,9 @@ use crate::report;
 use crate::serve::BUILD_ID;
 use crate::store::Store;
 use crate::store::metrics::{AttributionDimension, MetricAttributionRow};
-use crate::store::otel_events::CompactionStat;
 use crate::store::query::{
-    AgentStatsRow, CacheBreakRow, HookStatRow, ModelStatsRow, OverviewStats, ProjectStatsRow,
-    SkillStatsRow, ToolLatencyRow,
+    AgentStatsRow, CacheBreakRow, HookStatRow, ModelStatsRow, ProjectStatsRow, SkillStatsRow,
+    ToolLatencyRow,
 };
 use crate::tui::format::fit_display;
 use crate::tui::i18n::Failure;
@@ -35,11 +34,6 @@ const TOOL_ROW_LIMIT: usize = 200;
 const CACHE_BREAK_LIMIT: usize = 20;
 const MINUTE_SPAN_MINUTES: i64 = 60;
 const RESPONSE_PREVIEW_WIDTH: usize = 60;
-// 한도 카드: 소진 속도 계산용 스냅샷 기간(시간), 컴팩션 조회 기간(일), 로컬 추정 창(시간)
-const LIMIT_HISTORY_HOURS: i64 = 12;
-const COMPACTION_LOOKBACK_DAYS: i64 = 7;
-const ESTIMATE_FIVE_HOUR_HOURS: i64 = 5;
-const ESTIMATE_SEVEN_DAY_HOURS: i64 = 7 * 24;
 
 thread_local! {
     // 켜진 스레드의 panic 은 패널로 변환되므로 화면에 출력하지 않음
@@ -139,15 +133,6 @@ struct HeavyPanels {
     projects: Panel<Vec<ProjectStatsRow>>,
     skills: Panel<Vec<SkillStatsRow>>,
     attribution: Panel<Vec<(AttributionDimension, Vec<MetricAttributionRow>)>>,
-    limit_extras: LimitExtras,
-}
-
-// 한도 카드의 무거운 부분: 최신 세션 컴팩션과 5시간·7일 로컬 토큰 집계 (추정용)
-#[derive(Default)]
-struct LimitExtras {
-    compaction: Option<CompactionStat>,
-    estimate_5h: Option<OverviewStats>,
-    estimate_7d: Option<OverviewStats>,
 }
 
 // 무거운 패널 재조회 여부: 강제 요청, 첫 수집, 주기 경과
@@ -309,41 +294,12 @@ fn collect_snapshot(
     snapshot.skills = heavy.skills.clone();
     snapshot.attribution = heavy.attribution.clone();
 
-    // 5-1. 한도 카드 입력 (공식 스냅샷·소진 예상용 기록·API 키 헤더는 매번, 컴팩션·로컬 추정은 무거운 주기만)
-    let latest_limit = guard_panel(|| open_store.latest_limit_snapshot());
-    if refresh_heavy {
-        let session_id = match &latest_limit {
-            Panel::Ready(Some(latest)) => Some(latest.session_id.clone()),
-            _ => None,
-        };
-        heavy.limit_extras =
-            match guard_panel(|| load_limit_extras(open_store, now, &until, session_id.as_deref()))
-            {
-                Panel::Ready(extras) => extras,
-                _ => LimitExtras::default(),
-            };
-    }
-    snapshot.limits = match latest_limit {
-        Panel::Ready(latest) => guard_panel(|| {
-            let history_since = (now - ChronoDuration::hours(LIMIT_HISTORY_HOURS))
-                .to_rfc3339_opts(SecondsFormat::Millis, true);
-            Ok(LimitsData {
-                latest,
-                history: open_store.limit_snapshots_since(
-                    &history_since,
-                    crate::store::limits::LIMIT_HISTORY_MAX_ROWS,
-                )?,
-                api_key: open_store
-                    .latest_ratelimit_snapshot()?
-                    .filter(|row| row.ts >= since),
-                compaction: heavy.limit_extras.compaction.clone(),
-                estimate_5h: heavy.limit_extras.estimate_5h.clone(),
-                estimate_7d: heavy.limit_extras.estimate_7d.clone(),
-            })
-        }),
-        Panel::Failed(failure) => Panel::Failed(failure),
-        Panel::Pending => Panel::Pending,
-    };
+    // 5-1. 모델 탭 캐시 카드 입력 (공식 최신 스냅샷, 매번)
+    snapshot.limits = guard_panel(|| {
+        Ok(LimitsData {
+            latest: open_store.latest_limit_snapshot()?,
+        })
+    });
 
     // 6. 최근 이벤트 최신순 정렬 (조회 순서 가정 제거)
     if let Panel::Ready(events) = &mut snapshot.events {
@@ -351,34 +307,6 @@ fn collect_snapshot(
     }
 
     snapshot
-}
-
-// 7-0. 한도 카드의 무거운 입력 ------------------------------------------------
-// 컴팩션은 최신 공식 스냅샷 세션의 것만 취함, 로컬 토큰 집계는 공식 퍼센트가 없을 때의 추정용
-fn load_limit_extras(
-    store: &Store,
-    now: DateTime<Utc>,
-    until: &str,
-    session_id: Option<&str>,
-) -> anyhow::Result<LimitExtras> {
-    let stamp = |span: ChronoDuration| (now - span).to_rfc3339_opts(SecondsFormat::Millis, true);
-    let compaction = match session_id {
-        Some(id) => store
-            .compaction_stats(
-                &stamp(ChronoDuration::days(COMPACTION_LOOKBACK_DAYS)),
-                until,
-            )?
-            .into_iter()
-            .find(|stat| stat.session_id == id),
-        None => None,
-    };
-    let five_hours = stamp(ChronoDuration::hours(ESTIMATE_FIVE_HOUR_HOURS));
-    let seven_days = stamp(ChronoDuration::hours(ESTIMATE_SEVEN_DAY_HOURS));
-    Ok(LimitExtras {
-        compaction,
-        estimate_5h: Some(store.query_overview(&five_hours, until)?),
-        estimate_7d: Some(store.query_overview(&seven_days, until)?),
-    })
 }
 
 // 7-1. 구간 경계 --------------------------------------------------------------
@@ -475,7 +403,11 @@ pub fn spawn_weekly_report_load(
         .name("cm-tui-report-week".to_string())
         .spawn(move || {
             let body = load_weekly_report_body(&config, week_start, live);
-            let _ = ui_tx.send(UiMessage::WeeklyReport { week_start, body });
+            let _ = ui_tx.send(UiMessage::WeeklyReport {
+                week_start,
+                language: config.report.language,
+                body,
+            });
         });
 }
 
@@ -485,7 +417,11 @@ pub fn spawn_report_load(config: AppConfig, ui_tx: Sender<UiMessage>, date: Naiv
         .name("cm-tui-report".to_string())
         .spawn(move || {
             let body = load_report_body(&config, date, live);
-            let _ = ui_tx.send(UiMessage::Report { date, body });
+            let _ = ui_tx.send(UiMessage::Report {
+                date,
+                language: config.report.language,
+                body,
+            });
         });
 }
 
@@ -501,14 +437,24 @@ pub fn spawn_admin_action(
     let _ = thread::Builder::new()
         .name("cm-tui-admin".to_string())
         .spawn(move || {
-            // 1. 요청 경로
+            // 1. 요청 경로 (리포트는 설정의 리포트 언어를 lang 으로 실어 보냄: 호출 쪽이 화면 언어로 맞춘 값)
+            let lang_code = match config.report.language {
+                ReportLanguage::Ko => "ko",
+                ReportLanguage::En => "en",
+            };
             let request_path = match action {
                 AdminAction::Reindex => "/api/reindex".to_string(),
                 AdminAction::GenerateReport(date) => {
-                    format!("/api/report?date={}", date.format("%Y-%m-%d"))
+                    format!(
+                        "/api/report?date={}&lang={lang_code}",
+                        date.format("%Y-%m-%d")
+                    )
                 }
                 AdminAction::GenerateWeeklyReport(week_start) => {
-                    format!("/api/report?week={}", report::format_week_key(week_start))
+                    format!(
+                        "/api/report?week={}&lang={lang_code}",
+                        report::format_week_key(week_start)
+                    )
                 }
             };
 
@@ -546,12 +492,20 @@ pub fn spawn_admin_action(
             // 4. 리포트 생성 후 본문 갱신
             if let (true, AdminAction::GenerateReport(date)) = (succeeded, action) {
                 let body = load_report_body(&config, date, date == today);
-                let _ = ui_tx.send(UiMessage::Report { date, body });
+                let _ = ui_tx.send(UiMessage::Report {
+                    date,
+                    language: config.report.language,
+                    body,
+                });
             }
             if let (true, AdminAction::GenerateWeeklyReport(week_start)) = (succeeded, action) {
                 let live = week_start == report::week_start_of(today);
                 let body = load_weekly_report_body(&config, week_start, live);
-                let _ = ui_tx.send(UiMessage::WeeklyReport { week_start, body });
+                let _ = ui_tx.send(UiMessage::WeeklyReport {
+                    week_start,
+                    language: config.report.language,
+                    body,
+                });
             }
         });
 }
@@ -693,7 +647,7 @@ mod tests {
     }
 
     #[test]
-    fn limits_panel_carries_the_latest_snapshot_recent_history_and_cached_local_estimates() {
+    fn limits_panel_carries_the_latest_snapshot_on_every_poll() {
         use crate::store::limits::LimitSnapshot;
 
         let dir = std::env::temp_dir().join(format!("cm-limits-poll-{}", std::process::id()));
@@ -716,7 +670,7 @@ mod tests {
         let mut store = None;
         let mut heavy = HeavyPanels::default();
 
-        // 처음(무거운 주기): 공식 스냅샷·최근 기록·로컬 추정, API 키 기록 없음
+        // 처음(무거운 주기): 공식 최신 스냅샷
         let first = collect_snapshot(&config, WindowKind::Hour, &mut store, &mut heavy, true);
         let Panel::Ready(data) = &first.limits else {
             panic!("{:?}", first.limits);
@@ -725,16 +679,13 @@ mod tests {
             data.latest.as_ref().and_then(|latest| latest.five_hour_pct),
             Some(42.0)
         );
-        assert_eq!(data.history.len(), 1);
-        assert!(data.api_key.is_none());
-        assert!(data.estimate_5h.is_some() && data.estimate_7d.is_some());
 
-        // 무거운 주기가 아니면 추정은 캐시를 그대로 쓰고 스냅샷은 다시 읽음
+        // 무거운 주기가 아니어도 스냅샷은 다시 읽음
         let second = collect_snapshot(&config, WindowKind::Hour, &mut store, &mut heavy, false);
         let Panel::Ready(cached) = &second.limits else {
             panic!("{:?}", second.limits);
         };
-        assert!(cached.estimate_5h.is_some() && cached.latest.is_some());
+        assert!(cached.latest.is_some());
         let _ = fs::remove_dir_all(&dir);
     }
 

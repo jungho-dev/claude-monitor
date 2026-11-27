@@ -5,8 +5,8 @@ use crate::report::{format_week_key, week_start_of};
 use crate::tui::cards::{CardId, UiAction};
 use crate::tui::format::{outline_entries, prepare_report_markdown};
 use crate::tui::i18n::{self, Msg};
-use crate::tui::layout::{SplitAxis, SplitGroup};
-use crate::tui::state::{AppState, Panel};
+use crate::tui::layout::grid::{CardSlot, SlotHeight};
+use crate::tui::state::{ActiveTab, AppState, Panel};
 use crate::tui::theme;
 use crate::tui::views::common::{
     PanelNote, TextCard, panel_message, render_notice_card, render_text_card,
@@ -30,15 +30,42 @@ pub fn render_report_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
     render_date_bar(frame, state, bar_area);
 
     // 1. 목차 카드와 본문 카드 분할 (경계 드래그)
+    // 기본 폭은 weight 비례: 목차 o, 본문 W - 1 - o (사이 빈 칸 1열)
     let outline_width = ((u32::from(body_area.width) * 28 / 100) as u16).clamp(16, 36);
-    let panes = state.card_layout.split_cards(
-        &mut state.hit_areas,
-        SplitGroup::ReportCols,
-        SplitAxis::Columns,
-        body_area,
-        &[outline_width],
-        &[16, 20],
-    );
+    let body_weight = body_area
+        .width
+        .saturating_sub(1)
+        .saturating_sub(outline_width);
+    let slots = [
+        CardSlot {
+            card: CardId::ReportOutline,
+            min_w: 16,
+            min_h: 3,
+            height: SlotHeight::Fill,
+            weight: outline_width,
+            rank: 0,
+            reserve: 0,
+        },
+        CardSlot {
+            card: CardId::ReportBody,
+            min_w: 20,
+            min_h: 3,
+            height: SlotHeight::Fill,
+            weight: body_weight,
+            rank: 0,
+            reserve: 0,
+        },
+    ];
+    let layout = state.card_layout;
+    let panes = layout.arrange_tab(&mut state.hit_areas, ActiveTab::Report, body_area, &slots);
+    let pane_of = |card: CardId| {
+        panes
+            .iter()
+            .find(|(placed, _)| *placed == card)
+            .map(|(_, rect)| *rect)
+    };
+    let outline_pane = pane_of(CardId::ReportOutline);
+    let body_pane = pane_of(CardId::ReportBody);
 
     // 2. 본문 줄과 목차 (파이프 표는 박스 표로 바꾸고 울타리 줄은 숨긴 본문 기준)
     let lang = state.lang;
@@ -68,8 +95,10 @@ pub fn render_report_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
     };
     let entries = markdown.as_deref().map(outline_entries).unwrap_or_default();
 
-    // 3. 목차 카드 (제목이 없으면 안내 카드)
-    if entries.is_empty() {
+    // 3. 목차 카드 (제목이 없으면 안내 카드, 격자에 보일 때만)
+    if let Some(outline_rect) = outline_pane
+        && entries.is_empty()
+    {
         let outline_view = &mut state.card_views[CardId::ReportOutline as usize];
         outline_view.total = 0;
         outline_view.visible = 0;
@@ -82,11 +111,11 @@ pub fn render_report_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
             frame,
             state,
             CardId::ReportOutline,
-            panes[0],
+            outline_rect,
             i18n::text(lang, Msg::TitleOutline),
             note,
         );
-    } else {
+    } else if let Some(outline_rect) = outline_pane {
         let outline_lines: Vec<Line<'static>> = entries
             .iter()
             .map(|entry| {
@@ -101,7 +130,7 @@ pub fn render_report_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
         render_text_card(
             frame,
             state,
-            panes[0],
+            outline_rect,
             TextCard {
                 card: CardId::ReportOutline,
                 title: i18n::text(lang, Msg::TitleOutline).to_string(),
@@ -111,7 +140,11 @@ pub fn render_report_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
         );
     }
 
-    // 4. 본문 카드
+    // 4. 본문 카드 (격자에 없으면 줄 시작 위치 비움)
+    let Some(body_rect) = body_pane else {
+        state.report_row_starts.clear();
+        return;
+    };
     let body_title = if state.report_weekly {
         i18n::weekly_report_title(lang, &format_week_key(state.report_week))
     } else {
@@ -120,7 +153,7 @@ pub fn render_report_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
     state.report_row_starts = render_text_card(
         frame,
         state,
-        panes[1],
+        body_rect,
         TextCard {
             card: CardId::ReportBody,
             title: body_title,
@@ -403,6 +436,7 @@ pub fn style_report_lines(markdown: &str) -> Vec<Line<'static>> {
 mod tests {
     use super::*;
     use crate::tui::i18n::Lang;
+    use crate::tui::layout::grid::TabGrid;
     use crate::tui::state::{ActiveTab, Panel, UiCommand};
     use crate::tui::test_support::sample_state_with_tables;
     use crate::tui::views::render_frame;
@@ -460,6 +494,15 @@ mod tests {
             .iter()
             .find(|(action, _)| *action == wanted)
             .map(|(_, rect)| (rect.x + rect.width / 2, rect.y))
+    }
+
+    fn card_rect(state: &AppState, wanted: CardId) -> Option<Rect> {
+        state
+            .hit_areas
+            .card_rects
+            .iter()
+            .find(|(card, _)| *card == wanted)
+            .map(|(_, rect)| *rect)
     }
 
     #[test]
@@ -648,5 +691,44 @@ mod tests {
 
         let plain = style_markdown_line("본문 줄");
         assert_eq!(plain.spans[0].style, theme::STYLE_TEXT);
+    }
+
+    // 기본 격자: 목차와 본문이 한 줄에 지금의 폭으로, 사이 빈 칸 1열
+    #[test]
+    fn default_grid_puts_the_outline_beside_the_body_with_todays_widths_at_every_size() {
+        let sizes: [((u16, u16), (u16, u16)); 3] = [
+            ((60, 16), (16, 43)),
+            ((100, 30), (28, 71)),
+            ((130, 40), (36, 93)),
+        ];
+        for lang in [Lang::En, Lang::Ko] {
+            for ((width, height), widths) in sizes {
+                let case = format!("{lang:?} {width}x{height}");
+                let mut state = report_state(lang);
+                draw_rows(&mut state, width, height);
+                let outline = card_rect(&state, CardId::ReportOutline).unwrap();
+                let body = card_rect(&state, CardId::ReportBody).unwrap();
+                assert_eq!((outline.width, body.width), widths, "{case}");
+                assert_eq!((outline.y, outline.height), (body.y, body.height), "{case}");
+                assert_eq!(body.x, outline.right() + 1, "{case}");
+                assert_eq!((outline.x, body.right()), (0, width), "{case}");
+            }
+        }
+    }
+
+    // 따로 놓은 격자 줄: 목차 아래 본문, 둘 다 그림
+    #[test]
+    fn outline_and_body_in_separate_grid_rows_draw_stacked() {
+        let mut state = report_state(Lang::En);
+        let mut grid = TabGrid::default();
+        grid.rows[0][0] = Some(CardId::ReportOutline);
+        grid.rows[1][0] = Some(CardId::ReportBody);
+        state.card_layout.set_grid(ActiveTab::Report, grid);
+        let rows = draw_rows(&mut state, 130, 40);
+        let outline = card_rect(&state, CardId::ReportOutline).unwrap();
+        let body = card_rect(&state, CardId::ReportBody).unwrap();
+        assert_eq!((outline.x, outline.width), (body.x, body.width));
+        assert!(body.y >= outline.bottom(), "{outline:?} {body:?}");
+        assert!(rows.iter().any(|row| row.contains("Summary")));
     }
 }

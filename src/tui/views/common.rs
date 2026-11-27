@@ -1293,11 +1293,14 @@ mod tests {
             p50_ms: Some(18),
             p90_ms: Some(23),
             saved_ms: 8_400,
+            avg_ms: Some(18),
+            max_ms: Some(23),
+            total_ms: 22_212,
         }]);
         state
     }
 
-    // 버퍼를 줄 단위 문자열로 (넓은 글자 뒤 빈 칸은 건너뛀)
+    // 버퍼를 줄 단위 문자열로 (넓은 글자 뒤 빈 칸은 건너뜀)
     fn render_rows(state: &mut AppState, width: u16, height: u16) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| render_frame(frame, state)).unwrap();
@@ -1334,7 +1337,7 @@ mod tests {
             "git push origin main --force-with-lease",
             "1,234",
             "18ms",
-            "23ms",
+            "22.2s",
             "8.4s",
         ] {
             assert!(row.contains(text), "{text}: {row}");
@@ -1355,7 +1358,7 @@ mod tests {
             !row.contains("git push origin main --force-with-lease"),
             "{row}"
         );
-        for number in ["1,234", "18ms", "23ms", "8.4s"] {
+        for number in ["1,234", "18ms", "22.2s", "8.4s"] {
             assert!(row.contains(number), "{number}: {row}");
         }
         assert!(!state.hit_areas.column_hits.is_empty());

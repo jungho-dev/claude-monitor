@@ -81,7 +81,7 @@ const PROJECT_REQUESTS_SQL: &str = concat!(
     "SELECT COALESCE(NULLIF(r.project, ''), s.project, ''), r.git_branch, r.session_id, r.model, \
      r.input_tokens, r.output_tokens, r.cache_read_tokens, ",
     write_5m_sql!(),
-    ", r.cache_creation_1h_tokens, r.ts, r.agent FROM api_requests r \
+    ", r.cache_creation_1h_tokens, r.ts, r.agent, r.duration_ms FROM api_requests r \
      LEFT JOIN sessions s ON s.session_id = r.session_id \
      WHERE r.source = 'transcript' AND r.ts >= ?1 AND r.ts < ?2"
 );
@@ -129,6 +129,10 @@ pub struct ToolLatencyRow {
     pub p50_ms: Option<i64>,
     pub p90_ms: Option<i64>,
     pub total_ms: i64,
+    #[serde(default)]
+    pub avg_ms: Option<i64>,
+    #[serde(default)]
+    pub max_ms: Option<i64>,
 }
 
 // 3. 훅 집계 행 ---------------------------------------------------------------
@@ -142,6 +146,12 @@ pub struct HookStatRow {
     pub p50_ms: Option<i64>,
     pub p90_ms: Option<i64>,
     pub saved_ms: i64,
+    #[serde(default)]
+    pub avg_ms: Option<i64>,
+    #[serde(default)]
+    pub max_ms: Option<i64>,
+    #[serde(default)]
+    pub total_ms: i64,
 }
 
 // 4. 모델·에이전트 사용량 행 --------------------------------------------------
@@ -221,6 +231,12 @@ pub struct ModelStatsRow {
     pub cache_hit_ratio: f64,
     pub wait_p50_ms: Option<i64>,
     pub wait_p90_ms: Option<i64>,
+    #[serde(default)]
+    pub wait_avg_ms: Option<i64>,
+    #[serde(default)]
+    pub wait_max_ms: Option<i64>,
+    #[serde(default)]
+    pub wait_total_ms: i64,
     pub cost_usd_estimate: f64,
     pub last_ts: String,
     #[serde(default)]
@@ -288,6 +304,12 @@ pub struct AgentStatsRow {
     pub cache_hit_ratio: f64,
     pub wait_p50_ms: Option<i64>,
     pub wait_p90_ms: Option<i64>,
+    #[serde(default)]
+    pub wait_avg_ms: Option<i64>,
+    #[serde(default)]
+    pub wait_max_ms: Option<i64>,
+    #[serde(default)]
+    pub wait_total_ms: i64,
     pub cost_usd_estimate: f64,
     pub tool_calls: u64,
     pub tool_errors: u64,
@@ -320,6 +342,12 @@ pub struct ProjectStatsRow {
     pub cache_creation_5m_tokens: i64,
     pub cache_creation_1h_tokens: i64,
     pub cost_usd_estimate: f64,
+    #[serde(default)]
+    pub wait_avg_ms: Option<i64>,
+    #[serde(default)]
+    pub wait_max_ms: Option<i64>,
+    #[serde(default)]
+    pub wait_total_ms: i64,
     pub last_ts: String,
     #[serde(default)]
     pub first_ts: String,
@@ -397,6 +425,7 @@ struct ProjectStatsTotals {
     cache_creation_5m_tokens: i64,
     cache_creation_1h_tokens: i64,
     cost_usd_estimate: f64,
+    waits: Vec<i64>,
     first_ts: String,
     last_ts: String,
     models: BTreeMap<String, UsageShare>,
@@ -471,6 +500,24 @@ pub fn summarize_percentiles(values: &mut [i64]) -> (Option<i64>, Option<i64>) {
         values[index]
     };
     (Some(rank_at(50)), Some(rank_at(90)))
+}
+
+// 소요 평균·최대·합계 (평균은 정수 나눗셈, 빈 목록은 평균·최대 None)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DurationSummary {
+    pub avg_ms: Option<i64>,
+    pub max_ms: Option<i64>,
+    pub total_ms: i64,
+}
+
+fn summarize_durations(durations: &[i64]) -> DurationSummary {
+    let total_ms: i64 = durations.iter().sum();
+    let avg_ms = (!durations.is_empty()).then(|| total_ms / durations.len() as i64);
+    DurationSummary {
+        avg_ms,
+        max_ms: durations.iter().copied().max(),
+        total_ms,
+    }
 }
 
 // 11. 단가표 ------------------------------------------------------------------
@@ -812,6 +859,7 @@ impl Store {
             let mut summary: Vec<ToolLatencyRow> = Vec::new();
             for (tool_name, (calls, errors, mut durations)) in grouped {
                 let (p50_ms, p90_ms) = summarize_percentiles(&mut durations);
+                let duration_stats = summarize_durations(&durations);
                 summary.push(ToolLatencyRow {
                     tool_name,
                     calls,
@@ -819,6 +867,8 @@ impl Store {
                     p50_ms,
                     p90_ms,
                     total_ms: durations.iter().sum(),
+                    avg_ms: duration_stats.avg_ms,
+                    max_ms: duration_stats.max_ms,
                 });
             }
             summary.sort_by(|left, right| {
@@ -868,6 +918,7 @@ impl Store {
             let mut summary: Vec<HookStatRow> = Vec::new();
             for ((route, guard, outcome, detail), (count, mut durations, saved_ms)) in grouped {
                 let (p50_ms, p90_ms) = summarize_percentiles(&mut durations);
+                let duration_stats = summarize_durations(&durations);
                 summary.push(HookStatRow {
                     route,
                     guard,
@@ -877,6 +928,9 @@ impl Store {
                     p50_ms,
                     p90_ms,
                     saved_ms,
+                    avg_ms: duration_stats.avg_ms,
+                    max_ms: duration_stats.max_ms,
+                    total_ms: duration_stats.total_ms,
                 });
             }
             summary.sort_by_key(|row| std::cmp::Reverse(row.count));
@@ -1332,6 +1386,7 @@ impl Store {
                     cache_hit_ratio = totals.cache_read_tokens as f64 / context_total as f64;
                 }
                 let (wait_p50_ms, wait_p90_ms) = summarize_percentiles(&mut totals.waits);
+                let wait_stats = summarize_durations(&totals.waits);
                 stats.push(ModelStatsRow {
                     cost_usd_estimate: totals.cost_usd_estimate,
                     model,
@@ -1347,6 +1402,9 @@ impl Store {
                     cache_hit_ratio,
                     wait_p50_ms,
                     wait_p90_ms,
+                    wait_avg_ms: wait_stats.avg_ms,
+                    wait_max_ms: wait_stats.max_ms,
+                    wait_total_ms: wait_stats.total_ms,
                     last_ts: totals.last_ts,
                     first_ts: totals.first_ts,
                     agents: top_shares(totals.agents, SHARE_LIMIT),
@@ -1470,6 +1528,7 @@ impl Store {
                     cache_hit_ratio = totals.cache_read_tokens as f64 / context_total as f64;
                 }
                 let (wait_p50_ms, wait_p90_ms) = summarize_percentiles(&mut totals.waits);
+                let wait_stats = summarize_durations(&totals.waits);
                 let top_model = totals
                     .model_requests
                     .iter()
@@ -1490,6 +1549,9 @@ impl Store {
                     cache_hit_ratio,
                     wait_p50_ms,
                     wait_p90_ms,
+                    wait_avg_ms: wait_stats.avg_ms,
+                    wait_max_ms: wait_stats.max_ms,
+                    wait_total_ms: wait_stats.total_ms,
                     cost_usd_estimate: totals.cost_usd_estimate,
                     tool_calls: totals.tool_calls,
                     tool_errors: totals.tool_errors,
@@ -1582,6 +1644,9 @@ impl Store {
                 entry.cache_creation_5m_tokens += cache_creation_5m_tokens;
                 entry.cache_creation_1h_tokens += cache_creation_1h_tokens;
                 entry.cost_usd_estimate += cost;
+                if let Some(elapsed) = row.get::<_, Option<i64>>(11)? {
+                    entry.waits.push(elapsed);
+                }
                 if request_ts > entry.last_ts {
                     entry.last_ts = request_ts;
                 }
@@ -1590,6 +1655,7 @@ impl Store {
             // 2. 행 구성
             let mut stats: Vec<ProjectStatsRow> = Vec::new();
             for ((project, git_branch), totals) in grouped {
+                let wait_stats = summarize_durations(&totals.waits);
                 stats.push(ProjectStatsRow {
                     project,
                     git_branch,
@@ -1601,6 +1667,9 @@ impl Store {
                     cache_creation_5m_tokens: totals.cache_creation_5m_tokens,
                     cache_creation_1h_tokens: totals.cache_creation_1h_tokens,
                     cost_usd_estimate: totals.cost_usd_estimate,
+                    wait_avg_ms: wait_stats.avg_ms,
+                    wait_max_ms: wait_stats.max_ms,
+                    wait_total_ms: wait_stats.total_ms,
                     last_ts: totals.last_ts,
                     first_ts: totals.first_ts,
                     models: top_shares(totals.models, SHARE_LIMIT),
@@ -1757,6 +1826,26 @@ mod tests {
         assert_eq!(summarize_percentiles(&mut values), (Some(50), Some(90)));
         let mut empty: Vec<i64> = Vec::new();
         assert_eq!(summarize_percentiles(&mut empty), (None, None));
+    }
+
+    #[test]
+    fn durations_summarize_average_max_and_total() {
+        assert_eq!(
+            summarize_durations(&[]),
+            DurationSummary {
+                avg_ms: None,
+                max_ms: None,
+                total_ms: 0,
+            }
+        );
+        assert_eq!(
+            summarize_durations(&[10, 20, 60]),
+            DurationSummary {
+                avg_ms: Some(30),
+                max_ms: Some(60),
+                total_ms: 90,
+            }
+        );
     }
 
     // 토큰 다섯 칸 (입력, 출력, 캐시 읽기, 5분 쓰기, 1시간 쓰기) 각 1M 의 비용이 단가 합과 같은지 확인
@@ -2237,6 +2326,10 @@ mod tests {
             (opus.wait_p50_ms, opus.wait_p90_ms),
             (Some(3000), Some(6000))
         );
+        assert_eq!(
+            (opus.wait_avg_ms, opus.wait_max_ms, opus.wait_total_ms),
+            (Some(3000), Some(6000), 15_000)
+        );
         assert_eq!(opus.last_ts, "2026-11-10T13:00:00.000Z");
         let expected_cost = estimate_cost_usd("claude-opus-5-5", 500, 250, 4000, 500, 0);
         assert!((opus.cost_usd_estimate - expected_cost).abs() < 1e-12);
@@ -2250,6 +2343,10 @@ mod tests {
         assert_eq!(
             (sonnet.wait_p50_ms, sonnet.wait_p90_ms),
             (Some(2000), Some(5000))
+        );
+        assert_eq!(
+            (sonnet.wait_avg_ms, sonnet.wait_max_ms, sonnet.wait_total_ms),
+            (Some(3000), Some(5000), 9_000)
         );
         assert_eq!(sonnet.last_ts, "2026-11-10T13:01:00.000Z");
         drop(store);
@@ -2272,6 +2369,10 @@ mod tests {
             (main.wait_p50_ms, main.wait_p90_ms),
             (Some(1000), Some(3000))
         );
+        assert_eq!(
+            (main.wait_avg_ms, main.wait_max_ms, main.wait_total_ms),
+            (Some(1750), Some(3000), 7_000)
+        );
         assert_eq!(main.top_model, "claude-opus-5-5");
         assert_eq!((main.tool_calls, main.tool_errors), (2, 1));
         assert_eq!(main.input_tokens, 400);
@@ -2287,6 +2388,10 @@ mod tests {
             (worker.wait_p50_ms, worker.wait_p90_ms),
             (Some(4000), Some(6000))
         );
+        assert_eq!(
+            (worker.wait_avg_ms, worker.wait_max_ms, worker.wait_total_ms),
+            (Some(4250), Some(6000), 17_000)
+        );
         assert_eq!(worker.top_model, "claude-opus-5-5");
         assert_eq!((worker.tool_calls, worker.tool_errors), (1, 1));
 
@@ -2294,6 +2399,14 @@ mod tests {
         let explorer = &stats[2];
         assert_eq!((explorer.runs, explorer.requests), (1, 1));
         assert_eq!((explorer.wait_p50_ms, explorer.wait_p90_ms), (None, None));
+        assert_eq!(
+            (
+                explorer.wait_avg_ms,
+                explorer.wait_max_ms,
+                explorer.wait_total_ms
+            ),
+            (None, None, 0)
+        );
         assert_eq!(explorer.top_model, "claude-sonnet-5");
         assert_eq!((explorer.tool_calls, explorer.tool_errors), (2, 0));
         assert_eq!(explorer.last_ts, "2026-11-10T13:30:00.000Z");
@@ -2495,6 +2608,10 @@ mod tests {
             + estimate_cost_usd("claude-opus-5-5", 10, 50, 0, 1_000, 2_000);
         assert!((main.cost_usd_estimate - expected).abs() < 1e-12);
         assert_eq!(main.last_ts, "2026-11-10T12:10:00.000Z");
+        assert_eq!(
+            (main.wait_avg_ms, main.wait_max_ms, main.wait_total_ms),
+            (Some(1000), Some(1000), 3_000)
+        );
 
         // 4. 세션 없음·다른 브랜치·세션 폴더명 대체 (각 1건)
         for single in &stats[1..] {

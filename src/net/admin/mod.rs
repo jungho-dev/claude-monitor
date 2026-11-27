@@ -10,6 +10,7 @@ mod tests;
 
 pub use client::{fetch_status_blocking, post_admin_blocking};
 
+use crate::core::config::{AppConfig, ReportLanguage};
 use crate::core::context::AppContext;
 use crate::core::model::{PortStatus, StatusSnapshot};
 use crate::net::common::{
@@ -351,16 +352,33 @@ async fn respond_report_write(
         }
     };
 
-    // 2. 생성 실행 (블로킹 풀)
-    let written = run_blocking_job(move || match target {
-        ReportTarget::Day(date) => report::write_daily_report(&ctx.config, &ctx.store, date),
-        ReportTarget::Week(week_start) => {
-            report::write_weekly_report(&ctx.config, &ctx.store, week_start)
+    // 2. 본문 언어 (lang=ko|en, 없으면 설정값): TUI 가 화면 언어로 생성을 요청할 때 실어 보냄
+    let language = match find_query_param(query.as_deref(), "lang").as_deref() {
+        Some("ko") => ReportLanguage::Ko,
+        Some("en") => ReportLanguage::En,
+        Some(_) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({"error": "lang=ko 또는 lang=en 형식 오류"}),
+            );
+        }
+        None => ctx.config.report.language,
+    };
+
+    // 3. 생성 실행 (블로킹 풀, 설정 사본의 리포트 언어만 요청 값으로 바꿈)
+    let written = run_blocking_job(move || {
+        let mut config = AppConfig::clone(&ctx.config);
+        config.report.language = language;
+        match target {
+            ReportTarget::Day(date) => report::write_daily_report(&config, &ctx.store, date),
+            ReportTarget::Week(week_start) => {
+                report::write_weekly_report(&config, &ctx.store, week_start)
+            }
         }
     })
     .await;
 
-    // 3. 응답 분기
+    // 4. 응답 분기
     match written {
         Ok(path) => json_response(
             StatusCode::OK,

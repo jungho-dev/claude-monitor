@@ -5,12 +5,12 @@ use crate::inventory::{DoctorFinding, Inventory};
 use crate::tui::cards::CardId;
 use crate::tui::format::{format_count, replace_control_chars};
 use crate::tui::i18n::{self, Lang, Msg};
-use crate::tui::layout::{SplitAxis, SplitGroup};
+use crate::tui::layout::grid::{CardSlot, SlotHeight};
 use crate::tui::sort::{
     SortState, compare_agent_entry, compare_doctor_finding, compare_hook_entry, compare_mcp_entry,
     sort_rows,
 };
-use crate::tui::state::{AppState, Panel};
+use crate::tui::state::{ActiveTab, AppState, Panel};
 use crate::tui::theme;
 use crate::tui::views::common::{
     CardTable, ColumnFit, ColumnSpec, PanelNote, TableCell, panel_message, render_card_table,
@@ -82,15 +82,38 @@ pub fn render_settings_tab(frame: &mut Frame, area: Rect, state: &mut AppState) 
     let third_cut = ((height * 70 / 100) as u16)
         .max(second_cut + MIN_CARD_ROWS)
         .min(area.height.saturating_sub(MIN_CARD_ROWS));
-    let panes = state.card_layout.split_cards(
-        &mut state.hit_areas,
-        SplitGroup::SettingsRows,
-        SplitAxis::Rows,
-        area,
-        &[first_cut, second_cut, third_cut],
-        &[4, 4, 4, 4],
-    );
-    let agent_width = usize::from(panes[2].width.saturating_sub(CARD_CHROME_WIDTH));
+    let slot_of = |card: CardId, height: SlotHeight| CardSlot {
+        card,
+        min_w: 24,
+        min_h: MIN_CARD_ROWS,
+        height,
+        weight: 1,
+        rank: 0,
+        reserve: 0,
+    };
+    let slots = [
+        slot_of(CardId::SettingsHooks, SlotHeight::Fixed(first_cut)),
+        slot_of(
+            CardId::SettingsMcp,
+            SlotHeight::Fixed(second_cut.saturating_sub(first_cut)),
+        ),
+        slot_of(
+            CardId::SettingsAgents,
+            SlotHeight::Fixed(third_cut.saturating_sub(second_cut)),
+        ),
+        slot_of(CardId::SettingsDoctor, SlotHeight::Fill),
+    ];
+    let layout = state.card_layout;
+    let panes = layout.arrange_tab(&mut state.hit_areas, ActiveTab::Settings, area, &slots);
+    let pane_of = |card: CardId| {
+        panes
+            .iter()
+            .find(|(placed, _)| *placed == card)
+            .map(|(_, rect)| *rect)
+    };
+    let agent_width = pane_of(CardId::SettingsAgents).map_or(0, |pane| {
+        usize::from(pane.width.saturating_sub(CARD_CHROME_WIDTH))
+    });
 
     // 2. 카드 내용 (적재 전에는 안내 카드)
     let lang = state.lang;
@@ -136,53 +159,62 @@ pub fn render_settings_tab(frame: &mut Frame, area: Rect, state: &mut AppState) 
     let doctor_note = panel_message(lang, &state.doctor);
     let claude_home = state.config.claude_home.display().to_string();
 
-    // 3. 카드 그리기
+    // 3. 카드 그리기 (격자에 보이는 카드만)
+    if let Some(pane) = pane_of(CardId::SettingsHooks) {
+        render_settings_card(
+            frame,
+            state,
+            pane,
+            SettingsCard {
+                card: CardId::SettingsHooks,
+                title: format!(
+                    "{}{hook_count}",
+                    i18n::text(lang, Msg::TitleHooksRegistered)
+                ),
+                hint: claude_home,
+                columns: SETTINGS_HOOK_COLUMNS.to_vec(),
+                table: hook_table,
+                note: inventory_note.clone(),
+            },
+        );
+    }
+    if let Some(pane) = pane_of(CardId::SettingsMcp) {
+        render_settings_card(
+            frame,
+            state,
+            pane,
+            SettingsCard {
+                card: CardId::SettingsMcp,
+                title: format!("{}{mcp_count}", i18n::text(lang, Msg::TitleMcpServers)),
+                hint: String::new(),
+                columns: SETTINGS_MCP_COLUMNS.to_vec(),
+                table: mcp_table,
+                note: inventory_note.clone(),
+            },
+        );
+    }
+    if let Some(pane) = pane_of(CardId::SettingsAgents) {
+        render_settings_card(
+            frame,
+            state,
+            pane,
+            SettingsCard {
+                card: CardId::SettingsAgents,
+                title: format!("{}{agent_count}", i18n::text(lang, Msg::TitleAgentsSkills)),
+                hint: String::new(),
+                columns: SETTINGS_AGENT_COLUMNS.to_vec(),
+                table: agent_table,
+                note: inventory_note,
+            },
+        );
+    }
+    let Some(pane) = pane_of(CardId::SettingsDoctor) else {
+        return;
+    };
     render_settings_card(
         frame,
         state,
-        panes[0],
-        SettingsCard {
-            card: CardId::SettingsHooks,
-            title: format!(
-                "{}{hook_count}",
-                i18n::text(lang, Msg::TitleHooksRegistered)
-            ),
-            hint: claude_home,
-            columns: SETTINGS_HOOK_COLUMNS.to_vec(),
-            table: hook_table,
-            note: inventory_note.clone(),
-        },
-    );
-    render_settings_card(
-        frame,
-        state,
-        panes[1],
-        SettingsCard {
-            card: CardId::SettingsMcp,
-            title: format!("{}{mcp_count}", i18n::text(lang, Msg::TitleMcpServers)),
-            hint: String::new(),
-            columns: SETTINGS_MCP_COLUMNS.to_vec(),
-            table: mcp_table,
-            note: inventory_note.clone(),
-        },
-    );
-    render_settings_card(
-        frame,
-        state,
-        panes[2],
-        SettingsCard {
-            card: CardId::SettingsAgents,
-            title: format!("{}{agent_count}", i18n::text(lang, Msg::TitleAgentsSkills)),
-            hint: String::new(),
-            columns: SETTINGS_AGENT_COLUMNS.to_vec(),
-            table: agent_table,
-            note: inventory_note,
-        },
-    );
-    render_settings_card(
-        frame,
-        state,
-        panes[3],
+        pane,
         SettingsCard {
             card: CardId::SettingsDoctor,
             title: format!(
@@ -468,9 +500,20 @@ pub fn build_doctor_table(
 mod tests {
     use super::*;
     use crate::inventory::{AgentEntry, HookEntry, McpEntry, SkillEntry};
+    use crate::tui::layout::grid::TabGrid;
     use crate::tui::sort::sort_spec;
+    use crate::tui::test_support::sample_state_with_tables;
+    use crate::tui::views::render_frame;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     const KO: Lang = Lang::Ko;
+    const SETTINGS_CARDS: [CardId; 4] = [
+        CardId::SettingsHooks,
+        CardId::SettingsMcp,
+        CardId::SettingsAgents,
+        CardId::SettingsDoctor,
+    ];
 
     fn cell_text(cell: &TableCell) -> String {
         cell.iter().map(|span| span.content.as_ref()).collect()
@@ -554,6 +597,39 @@ mod tests {
                 fix_hint: "다른 포트로 변경".to_string(),
             },
         ]
+    }
+
+    fn settings_state(lang: Lang) -> AppState {
+        let mut state = sample_state_with_tables();
+        state.lang = lang;
+        state.tab = ActiveTab::Settings;
+        state
+    }
+
+    fn draw_tab(state: &mut AppState, width: u16, height: u16) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| render_frame(frame, state)).unwrap();
+    }
+
+    // 그린 설정 카드 영역 (그린 순서)
+    fn settings_rects(state: &AppState) -> Vec<(CardId, Rect)> {
+        state
+            .hit_areas
+            .card_rects
+            .iter()
+            .filter(|(card, _)| SETTINGS_CARDS.contains(card))
+            .copied()
+            .collect()
+    }
+
+    fn grid_from(rows: &[&[CardId]]) -> TabGrid {
+        let mut grid = TabGrid::default();
+        for (row, cards) in rows.iter().enumerate() {
+            for (column, card) in cards.iter().enumerate() {
+                grid.rows[row][column] = Some(*card);
+            }
+        }
+        grid
     }
 
     #[test]
@@ -711,5 +787,70 @@ mod tests {
         assert_eq!(row_texts(&hooks)[0][3], "a b c");
         let mcp = build_mcp_table(KO, &inventory, default_sort(CardId::SettingsMcp));
         assert_eq!(aux_texts(&mcp), ["! x y"]);
+    }
+
+    // 기본 격자: 네 카드가 지금의 높이로 위에서 아래로 빈틈 없이 쌓임
+    #[test]
+    fn default_grid_stacks_the_four_cards_with_todays_heights_at_every_size_in_both_languages() {
+        let sizes: [((u16, u16), [u16; 4]); 3] = [
+            ((60, 16), [3, 3, 3, 3]),
+            ((100, 30), [7, 6, 5, 8]),
+            ((130, 40), [10, 8, 7, 11]),
+        ];
+        for lang in [Lang::En, Lang::Ko] {
+            for ((width, height), heights) in sizes {
+                let case = format!("{lang:?} {width}x{height}");
+                let mut state = settings_state(lang);
+                draw_tab(&mut state, width, height);
+                let rects = settings_rects(&state);
+                let cards: Vec<CardId> = rects.iter().map(|(card, _)| *card).collect();
+                assert_eq!(cards, SETTINGS_CARDS, "{case}");
+                let shown: Vec<u16> = rects.iter().map(|(_, rect)| rect.height).collect();
+                assert_eq!(shown, heights, "{case}");
+                assert_eq!(rects[0].1.width, width, "{case}");
+                for pair in rects.windows(2) {
+                    let (above, below) = (pair[0].1, pair[1].1);
+                    assert_eq!((below.x, below.width), (above.x, above.width), "{case}");
+                    assert_eq!(below.y, above.bottom(), "{case}");
+                }
+            }
+        }
+    }
+
+    // 한 격자 줄의 두 카드는 같은 y, 네 장 한 줄은 60열에서 두 화면 줄로 넘김 (빠지는 카드 없음)
+    #[test]
+    fn settings_cards_share_a_row_and_wrap_onto_two_lines_when_placed_in_one_grid_row() {
+        let mut state = settings_state(Lang::En);
+        state.card_layout.set_grid(
+            ActiveTab::Settings,
+            grid_from(&[
+                &[CardId::SettingsHooks, CardId::SettingsMcp],
+                &[CardId::SettingsAgents],
+                &[CardId::SettingsDoctor],
+            ]),
+        );
+        draw_tab(&mut state, 130, 40);
+        let paired = settings_rects(&state);
+        let y_of = |card: CardId| {
+            paired
+                .iter()
+                .find(|(placed, _)| *placed == card)
+                .map(|(_, rect)| rect.y)
+        };
+        assert_eq!(paired.len(), 4);
+        assert!(y_of(CardId::SettingsHooks).is_some());
+        assert_eq!(y_of(CardId::SettingsHooks), y_of(CardId::SettingsMcp));
+        assert!(y_of(CardId::SettingsAgents) > y_of(CardId::SettingsHooks));
+
+        let mut state = settings_state(Lang::En);
+        state
+            .card_layout
+            .set_grid(ActiveTab::Settings, grid_from(&[&SETTINGS_CARDS]));
+        draw_tab(&mut state, 60, 16);
+        let wrapped = settings_rects(&state);
+        assert_eq!(wrapped.len(), 4);
+        let mut line_tops: Vec<u16> = wrapped.iter().map(|(_, rect)| rect.y).collect();
+        line_tops.dedup();
+        assert_eq!(line_tops.len(), 2, "{wrapped:?}");
     }
 }

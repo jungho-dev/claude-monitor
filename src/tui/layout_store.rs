@@ -5,7 +5,8 @@ use crate::core::config::TUI_STATE_FILE_NAME;
 use crate::store::metrics::AttributionDimension;
 use crate::tui::cards::{CARD_COUNT, CardId, MAX_COLUMN_WIDTH, MAX_TABLE_COLUMNS};
 use crate::tui::i18n::{self, Lang, StateIssue};
-use crate::tui::layout::{CardLayout, SplitGroup};
+use crate::tui::layout::grid::{TabGrid, card_from_key, card_key, default_rows};
+use crate::tui::layout::{CardLayout, MAX_SLOTS};
 use crate::tui::state::{ATTRIBUTION_DIMENSIONS, ActiveTab, AppState, TAB_COUNT, ToastLevel};
 use crate::tui::state_writer::StateSave;
 use crate::tui::views::feed::FEED_COLUMNS;
@@ -45,11 +46,81 @@ const TABLE_CARDS: [CardId; 13] = [
     CardId::AttributionTable,
     CardId::SkillTable,
 ];
+// 예전 한 축 그룹 키 -> 탭과 예전 칸 번호 순서의 카드 (리포트만 목차·본문이 한 줄), 읽기만 하고 다시 쓰지 않음
+const LEGACY_GROUPS: [(&str, ActiveTab, &[CardId]); 8] = [
+    (
+        "tools_rows",
+        ActiveTab::Tools,
+        &[CardId::ToolTable, CardId::ToolDetail],
+    ),
+    (
+        "hooks_rows",
+        ActiveTab::Hooks,
+        &[CardId::HookTable, CardId::HookDetail],
+    ),
+    (
+        "models_rows",
+        ActiveTab::Models,
+        &[
+            CardId::ModelTable,
+            CardId::ModelDetail,
+            CardId::CacheBreaks,
+            CardId::CacheTimer,
+        ],
+    ),
+    (
+        "agents_rows",
+        ActiveTab::Agents,
+        &[CardId::AgentTable, CardId::AgentDetail],
+    ),
+    (
+        "settings_rows",
+        ActiveTab::Settings,
+        &[
+            CardId::SettingsHooks,
+            CardId::SettingsMcp,
+            CardId::SettingsAgents,
+            CardId::SettingsDoctor,
+        ],
+    ),
+    (
+        "report_cols",
+        ActiveTab::Report,
+        &[CardId::ReportOutline, CardId::ReportBody],
+    ),
+    (
+        "projects_rows",
+        ActiveTab::Projects,
+        &[
+            CardId::ProjectTable,
+            CardId::ProjectDetail,
+            CardId::AttributionTable,
+        ],
+    ),
+    (
+        "skills_rows",
+        ActiveTab::Skills,
+        &[CardId::SkillTable, CardId::SkillDetail],
+    ),
+];
+// 예전 개요 그룹 키 (추이 순서만 이어받고 나머지는 알림 없이 버림)
+const LEGACY_OVERVIEW_KEYS: [&str; 7] = [
+    "overview_rows",
+    "overview_compact_rows",
+    "overview_kpi_cols",
+    "overview_trend_cols",
+    "overview_feed_cols",
+    "overview_chart_rows",
+    "overview_chart_cols",
+];
+// 없앤 카드 이름 ([grids] 에서 알림 없이 빼고 검사)
+const RETIRED_CARD_KEYS: [&str; 3] = ["kpi_wait", "limits_card", "chart_limits"];
 
 // 1. 파일 형식 ----------------------------------------------------------------
 // 언어·귀속 차원은 최상위 문자열 (알 수 없는 값만 무시, 차원은 기본값이면 기록하지 않음)
 // 탭 순서는 최상위 고정 이름 배열 (기본 순서면 기록하지 않고, 탭을 한 번씩 담지 않으면 무시, 나중에 더한 탭만 빠지면 뒤에 붙임)
 // 그룹·카드는 고정 이름 키, 값은 정수 배열 (항목마다 길이·범위를 검사해 맞지 않는 항목만 무시)
+// 격자는 탭 이름 키, 값은 줄별 카드 이름 배열 (기본 격자면 기록 안 함)
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct LayoutFile {
     version: i64,
@@ -59,12 +130,16 @@ struct LayoutFile {
     attribution_dimension: Option<toml::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tab_order: Option<toml::Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     orders: BTreeMap<String, Vec<i64>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     ratios: BTreeMap<String, Vec<i64>>,
     #[serde(default)]
     column_widths: BTreeMap<String, Vec<i64>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    grids: BTreeMap<String, toml::Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    grid_ratios: BTreeMap<String, Vec<i64>>,
 }
 
 // 읽기 결과: 파일 없음, 읽은 내용, 읽을 수 없는 파일 (사유)
@@ -94,6 +169,17 @@ fn table_card_columns(card: CardId) -> Option<(&'static str, usize)> {
     }
 }
 
+fn legacy_column_count(card: CardId) -> Option<usize> {
+    match card {
+        CardId::ToolTable => Some(6),
+        CardId::HookTable => Some(8),
+        CardId::ModelTable => Some(13),
+        CardId::ProjectTable => Some(11),
+        CardId::SkillTable => Some(9),
+        _ => None,
+    }
+}
+
 // 3. 현재 배치 -> 파일 내용 ---------------------------------------------------
 // 기본 배치와 다른 항목만 기록
 fn build_layout_file(
@@ -118,16 +204,6 @@ fn build_layout_file(
             .collect();
         file.tab_order = Some(toml::Value::Array(keys));
     }
-    for group in SplitGroup::ALL {
-        if let Some(order) = layout.custom_order(group) {
-            let values = order.iter().map(|card| i64::from(*card)).collect();
-            file.orders.insert(group.group_key().to_string(), values);
-        }
-        if let Some(ratios) = layout.custom_ratios(group) {
-            let values = ratios.iter().map(|ratio| i64::from(*ratio)).collect();
-            file.ratios.insert(group.group_key().to_string(), values);
-        }
-    }
     for card in TABLE_CARDS {
         let Some((key, columns)) = table_card_columns(card) else {
             continue;
@@ -142,6 +218,32 @@ fn build_layout_file(
             .collect();
         file.column_widths.insert(key.to_string(), values);
     }
+    for tab in ActiveTab::ALL {
+        let grid = layout.grid_of(tab);
+        if grid == default_rows(tab) {
+            continue;
+        }
+        let rows: Vec<toml::Value> = grid
+            .rows
+            .iter()
+            .filter(|cells| cells.iter().any(Option::is_some))
+            .map(|cells| {
+                toml::Value::Array(
+                    cells
+                        .iter()
+                        .flatten()
+                        .map(|card| toml::Value::String(card_key(*card).to_string()))
+                        .collect(),
+                )
+            })
+            .collect();
+        file.grids
+            .insert(tab.tab_key().to_string(), toml::Value::Array(rows));
+    }
+    for (key, ratios) in layout.grid_ratio_entries() {
+        let values = ratios.iter().map(|ratio| i64::from(*ratio)).collect();
+        file.grid_ratios.insert(key, values);
+    }
     file
 }
 
@@ -152,24 +254,110 @@ fn apply_layout_file(
     layout: &mut CardLayout,
     column_widths: &mut [[Option<u16>; MAX_TABLE_COLUMNS]; CARD_COUNT],
 ) -> usize {
-    let mut skipped = 0usize;
-    for (key, values) in &file.orders {
-        let group = SplitGroup::ALL
+    // 예전 한 축 그룹 순서 -> 격자 (줄 i = 카드 order[i], 리포트만 한 줄), 카드 번호의 순열이 아니면 None
+    let legacy_grid = |key: &str, cards: &[CardId], values: &[i64]| -> Option<TabGrid> {
+        let parsed: Option<Vec<usize>> = values
             .iter()
-            .find(|group| group.group_key() == key.as_str());
-        match group {
-            Some(group) if layout.restore_order(*group, values) => {}
-            _ => skipped += 1,
+            .map(|value| usize::try_from(*value).ok())
+            .collect();
+        let mut order = parsed?;
+        // 타이머가 생기기 전(3칸) 모델 순서는 타이머를 마지막 줄로
+        if key == "models_rows" && order.len() == 3 {
+            order.push(3);
+        }
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        if !sorted.iter().copied().eq(0..cards.len()) {
+            return None;
+        }
+        let mut grid = TabGrid::default();
+        for (line, card) in order.iter().enumerate() {
+            let (row, column) = if key == "report_cols" {
+                (0, line)
+            } else {
+                (line, 0)
+            };
+            grid.rows[row][column] = Some(cards[*card]);
+        }
+        Some(grid)
+    };
+
+    let mut skipped = 0usize;
+    // 예전 [orders]: [grids] 에 그 탭이 없을 때만 탭 격자로, 맞지 않는 값과 개요 키는 알림 없이 버림 (모르는 키만 건너뜀)
+    for (key, values) in &file.orders {
+        let legacy = LEGACY_GROUPS
+            .iter()
+            .find(|(name, _, _)| *name == key.as_str());
+        let Some((_, tab, cards)) = legacy else {
+            skipped += usize::from(!LEGACY_OVERVIEW_KEYS.contains(&key.as_str()));
+            continue;
+        };
+        if file.grids.contains_key(tab.tab_key()) {
+            continue;
+        }
+        if let Some(grid) = legacy_grid(key, cards, values) {
+            layout.set_grid(*tab, grid);
         }
     }
-    for (key, values) in &file.ratios {
-        let group = SplitGroup::ALL
+    // 예전 개요 추이 순서: 예전 카드 1(요청 추이)·2(토큰 추이)가 적힌 순서로 추이 줄의 두 칸을 채움
+    let trend_cards: Vec<CardId> = file
+        .orders
+        .get("overview_trend_cols")
+        .into_iter()
+        .flatten()
+        .filter_map(|value| match *value {
+            1 => Some(CardId::TrendRequests),
+            2 => Some(CardId::TrendTokens),
+            _ => None,
+        })
+        .collect();
+    if trend_cards.len() == 2
+        && trend_cards[0] != trend_cards[1]
+        && !file.grids.contains_key(ActiveTab::Overview.tab_key())
+    {
+        let mut grid = layout.grid_of(ActiveTab::Overview);
+        let trend_cells: Vec<(usize, usize)> = grid
+            .rows
             .iter()
-            .find(|group| group.group_key() == key.as_str());
-        match group {
-            Some(group) if layout.restore_ratios(*group, values) => {}
-            _ => skipped += 1,
+            .enumerate()
+            .flat_map(|(row, cells)| {
+                cells
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, cell)| {
+                        matches!(cell, Some(CardId::TrendRequests | CardId::TrendTokens))
+                    })
+                    .map(move |(column, _)| (row, column))
+            })
+            .collect();
+        for ((row, column), card) in trend_cells.iter().zip(&trend_cards) {
+            grid.rows[*row][*column] = Some(*card);
         }
+        layout.set_grid(ActiveTab::Overview, grid);
+    }
+    // 예전 [ratios]: <탭>_rows_<줄 수> (리포트는 report_cols_0) 격자 비율로 값 그대로, 맞지 않는 값과 개요 키는 알림 없이 버림
+    for (key, values) in &file.ratios {
+        let legacy = LEGACY_GROUPS
+            .iter()
+            .find(|(name, _, _)| *name == key.as_str());
+        let Some((_, tab, cards)) = legacy else {
+            skipped += usize::from(!LEGACY_OVERVIEW_KEYS.contains(&key.as_str()));
+            continue;
+        };
+        if file.grids.contains_key(tab.tab_key()) {
+            continue;
+        }
+        let mut ratios = values.clone();
+        // 타이머가 생기기 전(3칸) 모델 비율은 새 경계를 구간 끝에
+        if key == "models_rows" && ratios.len() == 2 {
+            ratios.push(10_000);
+        }
+        let grid_key = if key == "report_cols" {
+            "report_cols_0".to_string()
+        } else {
+            format!("{}_rows_{}", tab.tab_key(), cards.len())
+        };
+        layout.restore_grid_ratios(&grid_key, &ratios);
     }
     for (key, values) in &file.column_widths {
         let card = TABLE_CARDS
@@ -188,16 +376,103 @@ fn apply_layout_file(
                 _ => None,
             })
             .collect();
+        let legacy = legacy_column_count(*card);
         match parsed {
-            Some(widths) if widths.len() == columns => {
+            Some(widths) if widths.len() == columns || Some(widths.len()) == legacy => {
                 let slot = &mut column_widths[*card as usize];
                 *slot = [None; MAX_TABLE_COLUMNS];
-                slot[..columns].copy_from_slice(&widths);
+                slot[..widths.len()].copy_from_slice(&widths);
             }
             _ => skipped += 1,
         }
     }
+    // 격자 먼저 (격자 비율 길이가 복원한 격자 기준)
+    for (key, value) in &file.grids {
+        let restored = ActiveTab::ALL
+            .into_iter()
+            .find(|tab| tab.tab_key() == key.as_str())
+            .and_then(|tab| parse_stored_grid(tab, value).map(|grid| (tab, grid)));
+        match restored {
+            Some((tab, grid)) => layout.set_grid(tab, grid),
+            None => skipped += 1,
+        }
+    }
+    for (key, values) in &file.grid_ratios {
+        if !layout.restore_grid_ratios(key, values) {
+            skipped += 1;
+        }
+    }
     skipped
+}
+
+// [grids] 탭 항목 -> 격자, 모양이 틀리면 None (기본 격자에만 있는 카드는 기본 줄 끝에)
+fn parse_stored_grid(tab: ActiveTab, value: &toml::Value) -> Option<TabGrid> {
+    // 1. 줄별 카드 이름
+    let stored_rows = value.as_array()?;
+    if stored_rows.len() > MAX_SLOTS {
+        return None;
+    }
+    let tab_cards = default_rows(tab);
+    let mut rows: Vec<Vec<CardId>> = Vec::with_capacity(MAX_SLOTS);
+    for stored_row in stored_rows {
+        let mut row = stored_row
+            .as_array()?
+            .iter()
+            .filter(|key| {
+                !key.as_str()
+                    .is_some_and(|name| RETIRED_CARD_KEYS.contains(&name))
+            })
+            .map(|key| key.as_str().and_then(card_from_key))
+            .collect::<Option<Vec<CardId>>>()?;
+        row.retain(|card| {
+            tab_cards
+                .rows
+                .iter()
+                .any(|cells| cells.contains(&Some(*card)))
+        });
+        if row.len() > MAX_SLOTS {
+            return None;
+        }
+        if !row.is_empty() {
+            rows.push(row);
+        }
+    }
+
+    // 2. 중복 카드
+    let mut seen = [false; CARD_COUNT];
+    for card in rows.iter().flatten() {
+        if seen[*card as usize] {
+            return None;
+        }
+        seen[*card as usize] = true;
+    }
+
+    // 3. 빠진 기본 카드 (그 줄이 없으면 새 마지막 줄)
+    let missing: Vec<(usize, CardId)> = default_rows(tab)
+        .rows
+        .iter()
+        .enumerate()
+        .flat_map(|(row, cells)| cells.iter().flatten().map(move |card| (row, *card)))
+        .filter(|(_, card)| !seen[*card as usize])
+        .collect();
+    for (default_row, card) in missing {
+        match rows.get_mut(default_row) {
+            Some(row) => row.push(card),
+            None => rows.push(vec![card]),
+        }
+    }
+
+    // 4. 상한 확인 후 격자로
+    if rows.len() > MAX_SLOTS || rows.iter().any(|row| row.len() > MAX_SLOTS) {
+        return None;
+    }
+    let mut grid = TabGrid::default();
+    for (row, cards) in rows.iter().enumerate() {
+        for (column, card) in cards.iter().enumerate() {
+            grid.rows[row][column] = Some(*card);
+        }
+    }
+    Some(grid)
 }
 
 // 5. 파일 읽기·쓰기 -----------------------------------------------------------
@@ -214,7 +489,7 @@ fn read_layout_file(path: &Path) -> LayoutRead {
     }
 }
 
-// 읽을 수 없는 원본을 같은 폴더의 tui.toml.bak 으로 복사 (이전 .bak 덕어쓰기, 실패는 무시)
+// 읽을 수 없는 원본을 같은 폴더의 tui.toml.bak 으로 복사 (이전 .bak 덮어쓰기, 실패는 무시)
 fn backup_state_file(path: &Path) {
     let Some(file_name) = path.file_name() else {
         return;
@@ -346,6 +621,10 @@ impl AppState {
                 );
             }
             LayoutRead::Loaded(file) => {
+                // 예전 [orders]·[ratios] 는 이관 뒤 다시 쓰지 않으므로 첫 저장이 덮기 전에 원본 보존
+                if !file.orders.is_empty() || !file.ratios.is_empty() {
+                    backup_state_file(&self.state_file);
+                }
                 let mut skipped =
                     apply_layout_file(&file, &mut self.card_layout, &mut self.column_widths);
                 match file
@@ -423,7 +702,7 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::layout::IDENTITY_ORDER;
+    use crate::tui::layout::grid::{DropTarget, apply_drop};
     use crate::tui::test_support::sample_config;
     use chrono::NaiveDate;
     use std::path::PathBuf;
@@ -478,24 +757,55 @@ mod tests {
     }
 
     fn customize(state: &mut AppState) {
-        state
-            .card_layout
-            .move_card_to_slot(SplitGroup::SettingsRows, &IDENTITY_ORDER, 3, 0);
-        state
-            .card_layout
-            .move_card_to_slot(SplitGroup::ReportCols, &IDENTITY_ORDER, 0, 1);
+        let settings = apply_drop(
+            &default_rows(ActiveTab::Settings),
+            CardId::SettingsDoctor,
+            DropTarget::RowAbove(CardId::SettingsHooks),
+        )
+        .unwrap();
+        state.card_layout.set_grid(ActiveTab::Settings, settings);
+        let report = apply_drop(
+            &default_rows(ActiveTab::Report),
+            CardId::ReportOutline,
+            DropTarget::After(CardId::ReportBody),
+        )
+        .unwrap();
+        state.card_layout.set_grid(ActiveTab::Report, report);
         assert!(
             state
                 .card_layout
-                .restore_ratios(SplitGroup::ToolsRows, &[6_000])
+                .restore_grid_ratios("tools_rows_2", &[6_000])
         );
-        assert!(state.card_layout.restore_ratios(
-            SplitGroup::OverviewKpiCols,
-            &[1_000, 3_000, 5_000, 7_000, 9_000]
-        ));
+        assert!(
+            state
+                .card_layout
+                .restore_grid_ratios("overview_cols_1", &[1_000, 3_000, 5_000, 7_000, 9_000])
+        );
         state.column_widths[CardId::ToolTable as usize][1] = Some(14);
         state.column_widths[CardId::ToolTable as usize][3] = Some(9);
         state.column_widths[CardId::AgentTable as usize][13] = Some(21);
+    }
+
+    // 탭 격자의 줄별 카드 (빈 줄 제외)
+    fn grid_rows(state: &AppState, tab: ActiveTab) -> Vec<Vec<CardId>> {
+        state
+            .card_layout
+            .grid_of(tab)
+            .rows
+            .iter()
+            .map(|cells| cells.iter().flatten().copied().collect::<Vec<CardId>>())
+            .filter(|row| !row.is_empty())
+            .collect()
+    }
+
+    // 바꾼 설정 격자 (예전 settings_rows = [3, 0, 1, 2])
+    fn doctor_first() -> Vec<Vec<CardId>> {
+        vec![
+            vec![CardId::SettingsDoctor],
+            vec![CardId::SettingsHooks],
+            vec![CardId::SettingsMcp],
+            vec![CardId::SettingsAgents],
+        ]
     }
 
     #[test]
@@ -508,7 +818,7 @@ mod tests {
 
         let text = fs::read_to_string(dir.0.join(TUI_STATE_FILE_NAME)).unwrap();
         assert!(text.contains("version = 1"), "{text}");
-        assert!(text.contains("settings_rows"), "{text}");
+        assert!(text.contains("settings_doctor"), "{text}");
         assert!(text.contains("tool_table"), "{text}");
 
         let mut loaded = state_in(&dir);
@@ -516,16 +826,11 @@ mod tests {
         assert!(loaded.toast.is_none(), "복원 알림: {:?}", loaded.toast);
         assert_eq!(loaded.card_layout, saved.card_layout);
         assert_eq!(loaded.column_widths, saved.column_widths);
-        assert_eq!(
-            loaded.card_layout.order_of(SplitGroup::SettingsRows)[..4],
-            [3, 0, 1, 2]
-        );
-        assert_eq!(
-            loaded
-                .card_layout
-                .custom_ratios(SplitGroup::OverviewKpiCols),
-            Some(vec![1_000, 3_000, 5_000, 7_000, 9_000])
-        );
+        assert_eq!(grid_rows(&loaded, ActiveTab::Settings), doctor_first());
+        assert!(loaded.card_layout.grid_ratio_entries().contains(&(
+            "overview_cols_1".to_string(),
+            vec![1_000, 3_000, 5_000, 7_000, 9_000]
+        )));
         assert_eq!(
             loaded.column_widths[CardId::ToolTable as usize][..4],
             [None, Some(14), None, Some(9)]
@@ -542,17 +847,17 @@ mod tests {
         let expected = "version = 1\n\
             language = \"ko\"\n\
             \n\
-            [orders]\n\
-            report_cols = [1, 0]\n\
-            settings_rows = [3, 0, 1, 2]\n\
-            \n\
-            [ratios]\n\
-            overview_kpi_cols = [1000, 3000, 5000, 7000, 9000]\n\
-            tools_rows = [6000]\n\
-            \n\
             [column_widths]\n\
             agent_table = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 21]\n\
-            tool_table = [0, 14, 0, 9, 0, 0]\n";
+            tool_table = [0, 14, 0, 9, 0, 0, 0, 0]\n\
+            \n\
+            [grids]\n\
+            report = [[\"report_body\", \"report_outline\"]]\n\
+            settings = [[\"settings_doctor\"], [\"settings_hooks\"], [\"settings_mcp\"], [\"settings_agents\"]]\n\
+            \n\
+            [grid_ratios]\n\
+            overview_cols_1 = [1000, 3000, 5000, 7000, 9000]\n\
+            tools_rows_2 = [6000]\n";
         assert_eq!(text, expected);
     }
 
@@ -563,12 +868,14 @@ mod tests {
         customize(&mut state);
         state.save_tui_state();
 
-        state.card_layout.reset_groups(&SplitGroup::ALL);
+        for tab in ActiveTab::ALL {
+            state.card_layout.reset_tab(tab);
+        }
         state.column_widths = [[None; MAX_TABLE_COLUMNS]; CARD_COUNT];
         state.save_tui_state();
         let text = fs::read_to_string(dir.0.join(TUI_STATE_FILE_NAME)).unwrap();
         assert!(text.contains("version = 1"), "{text}");
-        assert!(!text.contains("settings_rows"), "{text}");
+        assert!(!text.contains("settings_doctor"), "{text}");
         assert!(!text.contains("tool_table"), "{text}");
 
         let mut loaded = state_in(&dir);
@@ -592,7 +899,10 @@ mod tests {
         let text = fs::read_to_string(dir.0.join(TUI_STATE_FILE_NAME)).unwrap();
         let expected = "tab_order = [\"projects\", \"tools\", \"hooks\", \"models\", \"agents\", \"settings\", \"report\", \"overview\", \"skills\"]";
         assert!(text.contains(expected), "{text}");
-        assert!(text.find("tab_order") < text.find("[orders]"), "{text}");
+        assert!(
+            text.find("tab_order") < text.find("[column_widths]"),
+            "{text}"
+        );
 
         let mut loaded = state_in(&dir);
         loaded.load_tui_state();
@@ -661,7 +971,7 @@ mod tests {
         }
     }
 
-    // 카드가 늘기 전(3칸) 배치 파일: 저장한 순서·비율을 잃지 않고 새 카드를 맨 뒤 칸에 붙여 이어받고, 다음 저장은 4칸 형식
+    // 카드가 늘기 전(3칸) 배치 파일: 모델 순서는 타이머를 마지막 줄로, 비율은 새 경계를 구간 끝에 둔 격자 비율로, 다음 저장은 격자 형식
     #[test]
     fn a_three_card_file_from_before_the_new_cards_migrates_without_a_skip_toast() {
         let dir = TempDir::new();
@@ -677,29 +987,40 @@ mod tests {
         state.load_tui_state();
 
         assert!(state.toast.is_none(), "{:?}", state.toast);
-        let layout = &state.card_layout;
         assert_eq!(
-            layout.custom_order(SplitGroup::ModelsRows),
-            Some(vec![2, 0, 1, 3])
+            grid_rows(&state, ActiveTab::Models),
+            vec![
+                vec![CardId::CacheBreaks],
+                vec![CardId::ModelTable],
+                vec![CardId::ModelDetail],
+                vec![CardId::CacheTimer],
+            ]
+        );
+        // 추이 순서 [1, 0, 2] 는 요청 추이·토큰 추이 순서라 기본 격자, 개요 비율은 버림
+        assert_eq!(
+            state.card_layout.grid_of(ActiveTab::Overview),
+            default_rows(ActiveTab::Overview)
         );
         assert_eq!(
-            layout.custom_order(SplitGroup::OverviewTrendCols),
-            Some(vec![1, 0, 2, 3])
-        );
-        assert_eq!(
-            layout.custom_ratios(SplitGroup::ModelsRows),
-            Some(vec![2_000, 6_000, 10_000])
-        );
-        assert_eq!(
-            layout.custom_ratios(SplitGroup::OverviewTrendCols),
-            Some(vec![3_000, 6_500, 10_000])
+            state.card_layout.grid_ratio_entries(),
+            [("models_rows_4".to_string(), vec![2_000, 6_000, 10_000])]
         );
 
-        // 다음 저장은 4칸 형식으로 올려 쓰고, 다시 읽어도 같음
+        // 다음 저장은 격자 형식으로 쓰고, 다시 읽어도 같음
         state.save_tui_state();
         let text = fs::read_to_string(&state.state_file).unwrap();
-        assert!(text.contains("models_rows = [2, 0, 1, 3]"), "{text}");
-        assert!(text.contains("models_rows = [2000, 6000, 10000]"), "{text}");
+        assert!(
+            text.contains("models = [[\"cache_breaks\"], [\"model_table\"], [\"model_detail\"], [\"cache_timer\"]]"),
+            "{text}"
+        );
+        assert!(
+            text.contains("models_rows_4 = [2000, 6000, 10000]"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("[orders]") && !text.contains("[ratios]"),
+            "{text}"
+        );
         let mut reloaded = state_in(&dir);
         reloaded.load_tui_state();
         assert!(reloaded.toast.is_none(), "{:?}", reloaded.toast);
@@ -721,7 +1042,7 @@ mod tests {
             tools_rows = [6000]\n\
             [column_widths]\n\
             tool_table = [0, 12]\n\
-            hook_table = [0, 0, 0, 0, 0, 0, 0, 20]\n\
+            hook_table = [0, 0, 0, 0, 0, 0, 0, 20, 0]\n\
             agent_table = [-5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]\n\
             overview_chart = [1]\n";
         fs::write(dir.0.join(TUI_STATE_FILE_NAME), body).unwrap();
@@ -729,27 +1050,17 @@ mod tests {
         state.load_tui_state();
 
         // 맞는 항목만 반영: 설정 순서, 도구 비율, 훅 열 폭
+        assert_eq!(grid_rows(&state, ActiveTab::Settings), doctor_first());
         assert_eq!(
-            state.card_layout.custom_order(SplitGroup::SettingsRows),
-            Some(vec![3, 0, 1, 2])
-        );
-        assert_eq!(
-            state.card_layout.custom_ratios(SplitGroup::ToolsRows),
-            Some(vec![6_000])
+            state.card_layout.grid_ratio_entries(),
+            [("tools_rows_2".to_string(), vec![6_000])]
         );
         assert_eq!(state.column_widths[CardId::HookTable as usize][7], Some(20));
 
-        // 길이·범위·중복·모르는 이름·줄 그룹 순서는 무시
-        assert_eq!(state.card_layout.custom_order(SplitGroup::ToolsRows), None);
-        assert_eq!(state.card_layout.custom_order(SplitGroup::ReportCols), None);
-        assert_eq!(
-            state.card_layout.custom_order(SplitGroup::OverviewRows),
-            None
-        );
-        assert_eq!(
-            state.card_layout.custom_ratios(SplitGroup::ModelsRows),
-            None
-        );
+        // 예전 키의 길이·중복이 맞지 않는 값과 개요 키는 알림 없이 버림
+        for tab in [ActiveTab::Tools, ActiveTab::Report, ActiveTab::Overview] {
+            assert_eq!(state.card_layout.grid_of(tab), default_rows(tab), "{tab:?}");
+        }
         assert!(
             state.column_widths[CardId::ToolTable as usize]
                 .iter()
@@ -761,9 +1072,155 @@ mod tests {
                 .all(Option::is_none)
         );
 
-        // 알림은 한 번, 건너뛴 항목 수 표시
+        // 알림은 한 번, 건너뛴 항목 수 표시 (모르는 그룹 키와 열 폭 세 항목)
         let toast = state.toast.as_ref().unwrap();
-        assert!(toast.text.contains("일부 항목 무시 8건"), "{}", toast.text);
+        assert!(toast.text.contains("일부 항목 무시 4건"), "{}", toast.text);
+    }
+
+    // 예전 [orders]·[ratios] 만 있는 파일: 격자·격자 비율로 이관, 알림 없음, 다시 쓰지 않음, .bak 은 첫 저장 전 한 번
+    #[test]
+    fn a_legacy_orders_and_ratios_file_migrates_into_grids_with_one_backup() {
+        let dir = TempDir::new();
+        let path = dir.0.join(TUI_STATE_FILE_NAME);
+        let body = r#"version = 1
+language = "ko"
+attribution_dimension = "agent"
+tab_order = ["overview", "tools", "hooks", "skills", "models", "agents", "projects", "settings", "report"]
+[orders]
+models_rows = [0, 2, 1, 3]
+overview_trend_cols = [0, 3, 2, 1]
+settings_rows = [2, 0, 3, 1]
+[ratios]
+agents_rows = [3929]
+hooks_rows = [6923]
+models_rows = [2321, 5893, 7679]
+overview_rows = [702, 1579, 3333]
+overview_trend_cols = [1107, 4760, 7159]
+projects_rows = [3929, 6250]
+report_cols = [959]
+settings_rows = [3077, 4615, 7692]
+skills_rows = [6607]
+tools_rows = [8036]
+[column_widths]
+event_feed = [18, 20, 46, 0, 0, 21, 8, 0]
+hook_table = [14, 0, 0, 0, 0, 0, 0, 0]
+model_table = [17, 0, 0, 0, 0, 12, 0, 172, 0, 65, 10, 26, 0]
+tool_table = [0, 7, 0, 0, 0, 0]
+"#;
+        fs::write(&path, body).unwrap();
+        let mut state = fresh_state_in(&dir);
+        state.load_tui_state();
+
+        // 1. 알림 없음, 언어·귀속 차원·탭 순서·열 폭 유지
+        assert!(state.toast.is_none(), "{:?}", state.toast);
+        assert_eq!(state.lang, Lang::Ko);
+        assert_eq!(
+            Some(state.attribution_dimension),
+            AttributionDimension::parse("agent")
+        );
+        assert_eq!(
+            state.tab_order,
+            [
+                ActiveTab::Overview,
+                ActiveTab::Tools,
+                ActiveTab::Hooks,
+                ActiveTab::Skills,
+                ActiveTab::Models,
+                ActiveTab::Agents,
+                ActiveTab::Projects,
+                ActiveTab::Settings,
+                ActiveTab::Report,
+            ]
+        );
+        for (card, expected) in [
+            (CardId::EventFeed, &[18, 20, 46, 0, 0, 21, 8, 0][..]),
+            (CardId::HookTable, &[14, 0, 0, 0, 0, 0, 0, 0][..]),
+            (
+                CardId::ModelTable,
+                &[17, 0, 0, 0, 0, 12, 0, 172, 0, 65, 10, 26, 0][..],
+            ),
+            (CardId::ToolTable, &[0, 7, 0, 0, 0, 0][..]),
+        ] {
+            let widths: Vec<u16> = state.column_widths[card as usize][..expected.len()]
+                .iter()
+                .map(|width| width.unwrap_or(0))
+                .collect();
+            assert_eq!(widths, expected, "{card:?}");
+        }
+
+        // 2. 격자: 줄 i = 예전 카드 order[i], 추이 줄은 토큰 추이·요청 추이 순서
+        assert_eq!(
+            grid_rows(&state, ActiveTab::Models),
+            vec![
+                vec![CardId::ModelTable],
+                vec![CardId::CacheBreaks],
+                vec![CardId::ModelDetail],
+                vec![CardId::CacheTimer],
+            ]
+        );
+        assert_eq!(
+            grid_rows(&state, ActiveTab::Settings),
+            vec![
+                vec![CardId::SettingsAgents],
+                vec![CardId::SettingsHooks],
+                vec![CardId::SettingsDoctor],
+                vec![CardId::SettingsMcp],
+            ]
+        );
+        let trend_row = grid_rows(&state, ActiveTab::Overview)
+            .into_iter()
+            .find(|row| row.contains(&CardId::TrendRequests))
+            .unwrap();
+        assert_eq!(trend_row, [CardId::TrendTokens, CardId::TrendRequests]);
+
+        // 3. 격자 비율: 값 그대로, 개요 비율은 버림
+        let mut entries = state.card_layout.grid_ratio_entries();
+        entries.sort();
+        let mut expected: Vec<(String, Vec<u16>)> = [
+            ("tools_rows_2", vec![8036]),
+            ("hooks_rows_2", vec![6923]),
+            ("skills_rows_2", vec![6607]),
+            ("agents_rows_2", vec![3929]),
+            ("projects_rows_3", vec![3929, 6250]),
+            ("models_rows_4", vec![2321, 5893, 7679]),
+            ("settings_rows_4", vec![3077, 4615, 7692]),
+            ("report_cols_0", vec![959]),
+        ]
+        .into_iter()
+        .map(|(key, values)| (key.to_string(), values))
+        .collect();
+        expected.sort();
+        assert_eq!(entries, expected);
+
+        // 4. 첫 저장: 예전 표·키 없음, .bak 은 원본
+        state.save_tui_state();
+        assert!(state.toast.is_none(), "{:?}", state.toast);
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("[orders]"), "{text}");
+        assert!(!text.contains("[ratios]"), "{text}");
+        for key in [
+            "tools_rows",
+            "hooks_rows",
+            "models_rows",
+            "agents_rows",
+            "settings_rows",
+            "report_cols",
+            "projects_rows",
+            "skills_rows",
+            "overview_rows",
+            "overview_trend_cols",
+        ] {
+            assert!(!text.contains(&format!("{key} = ")), "{key}: {text}");
+        }
+        assert_eq!(fs::read_to_string(backup_of(&dir)).unwrap(), body);
+
+        // 5. 두 번째 읽기·저장: 같은 배치, .bak 그대로
+        let mut next_run = fresh_state_in(&dir);
+        next_run.load_tui_state();
+        assert!(next_run.toast.is_none(), "{:?}", next_run.toast);
+        assert_eq!(next_run.card_layout, state.card_layout);
+        next_run.save_tui_state();
+        assert_eq!(fs::read_to_string(backup_of(&dir)).unwrap(), body);
     }
 
     // 언어 저장·복원 테스트용: 기본 언어(영어)로 만든 상태
@@ -861,12 +1318,14 @@ mod tests {
         state.save_tui_state();
 
         // 배치 초기화 뒤 저장해도 언어 키는 유지
-        state.card_layout.reset_groups(&SplitGroup::ALL);
+        for tab in ActiveTab::ALL {
+            state.card_layout.reset_tab(tab);
+        }
         state.column_widths = [[None; MAX_TABLE_COLUMNS]; CARD_COUNT];
         state.save_tui_state();
         let text = fs::read_to_string(dir.0.join(TUI_STATE_FILE_NAME)).unwrap();
         assert!(text.contains("language = \"ko\""), "{text}");
-        assert!(!text.contains("settings_rows"), "{text}");
+        assert!(!text.contains("settings_doctor"), "{text}");
 
         let mut loaded = fresh_state_in(&dir);
         loaded.load_tui_state();
@@ -886,10 +1345,7 @@ mod tests {
         state.load_tui_state();
         assert_eq!(state.lang, Lang::En);
         assert!(state.toast.is_none(), "{:?}", state.toast);
-        assert_eq!(
-            state.card_layout.custom_order(SplitGroup::SettingsRows),
-            Some(vec![3, 0, 1, 2])
-        );
+        assert_eq!(grid_rows(&state, ActiveTab::Settings), doctor_first());
     }
 
     #[test]
@@ -915,8 +1371,8 @@ mod tests {
             );
             // 다른 항목은 그대로 적용
             assert_eq!(
-                state.card_layout.custom_order(SplitGroup::SettingsRows),
-                Some(vec![3, 0, 1, 2]),
+                grid_rows(&state, ActiveTab::Settings),
+                doctor_first(),
                 "{value}"
             );
         }
@@ -1089,7 +1545,7 @@ mod tests {
             fs::canonicalize(&target).unwrap()
         );
         let saved = fs::read_to_string(&target).unwrap();
-        assert!(saved.contains("settings_rows"), "{saved}");
+        assert!(saved.contains("settings_doctor"), "{saved}");
         assert_eq!(fs::read_to_string(&link).unwrap(), saved);
         assert_eq!(file_names_in(&synced), [TUI_STATE_FILE_NAME.to_string()]);
         assert_eq!(file_names_in(&home), [TUI_STATE_FILE_NAME.to_string()]);
@@ -1129,7 +1585,7 @@ mod tests {
         assert!(
             fs::read_to_string(&target)
                 .unwrap()
-                .contains("settings_rows")
+                .contains("settings_doctor")
         );
         assert_eq!(file_names_in(&synced), [TUI_STATE_FILE_NAME.to_string()]);
     }
@@ -1182,7 +1638,7 @@ mod tests {
         assert!(
             fs::read_to_string(&target)
                 .unwrap()
-                .contains("settings_rows")
+                .contains("settings_doctor")
         );
         assert_eq!(file_names_in(&synced), [TUI_STATE_FILE_NAME.to_string()]);
         assert_eq!(file_names_in(&links).len(), chain.len());
@@ -1211,8 +1667,8 @@ mod tests {
         let dir = TempDir::new();
         let body = "version = 1\n\
             [column_widths]\n\
-            tool_table = [0, 65535, 0, 0, 0, 0]\n\
-            hook_table = [0, 0, 0, 0, 0, 0, 0, 20]\n";
+            tool_table = [0, 65535, 0, 0, 0, 0, 0, 0]\n\
+            hook_table = [0, 0, 0, 0, 0, 0, 0, 20, 0]\n";
         fs::write(dir.0.join(TUI_STATE_FILE_NAME), body).unwrap();
         let mut state = state_in(&dir);
         state.load_tui_state();
@@ -1237,7 +1693,7 @@ mod tests {
                 ..LayoutFile::default()
             };
             file.column_widths
-                .insert("tool_table".to_string(), vec![0, value, 0, 0, 0, 0]);
+                .insert("tool_table".to_string(), vec![0, value, 0, 0, 0, 0, 0, 0]);
             file
         };
         let cap = i64::from(MAX_COLUMN_WIDTH);
@@ -1459,7 +1915,7 @@ mod tests {
         let save = state.build_state_save().unwrap();
         assert_eq!(save.path, dir.0.join(TUI_STATE_FILE_NAME));
         assert!(save.text.starts_with("version = 1\nlanguage = \"ko\"\n"));
-        assert!(save.text.contains("settings_rows"), "{}", save.text);
+        assert!(save.text.contains("settings_doctor"), "{}", save.text);
         // 요청을 만드는 것만으로는 파일을 쓰지 않음
         assert!(!dir.0.join(TUI_STATE_FILE_NAME).exists());
     }
@@ -1493,17 +1949,19 @@ mod tests {
         let mut saved = state_in(&dir);
         saved.column_widths[CardId::ProjectTable as usize][1] = Some(24);
         saved.column_widths[CardId::AttributionTable as usize][0] = Some(30);
-        saved
-            .card_layout
-            .set_order(SplitGroup::ProjectsRows, [2, 0, 1, 3, 4, 5]);
+        let mut projects = TabGrid::default();
+        projects.rows[0][0] = Some(CardId::AttributionTable);
+        projects.rows[1][0] = Some(CardId::ProjectTable);
+        projects.rows[2][0] = Some(CardId::ProjectDetail);
+        saved.card_layout.set_grid(ActiveTab::Projects, projects);
         saved.save_tui_state();
         assert!(saved.toast.is_none(), "저장 실패 알림: {:?}", saved.toast);
 
         let text = fs::read_to_string(dir.0.join(TUI_STATE_FILE_NAME)).unwrap();
         for entry in [
-            "project_table = [0, 24, 0, 0, 0, 0, 0, 0, 0, 0, 0]",
+            "project_table = [0, 24, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]",
             "attribution_table = [30, 0, 0, 0, 0, 0]",
-            "projects_rows = [2, 0, 1]",
+            "projects = [[\"attribution_table\"], [\"project_table\"], [\"project_detail\"]]",
         ] {
             assert!(text.contains(entry), "{entry}: {text}");
         }
@@ -1530,5 +1988,178 @@ mod tests {
                 "{card:?}"
             );
         }
+    }
+
+    #[test]
+    fn column_widths_of_the_old_column_counts_load_as_a_prefix_without_a_notice() {
+        let dir = TempDir::new();
+        let body = "version = 1\n\
+            [column_widths]\n\
+            tool_table = [0, 7, 0, 0, 0, 0]\n\
+            hook_table = [14, 0, 0, 0, 0, 0, 0, 0]\n\
+            model_table = [17, 0, 0, 0, 0, 12, 0, 172, 0, 65, 10, 26, 0]\n";
+        fs::write(dir.0.join(TUI_STATE_FILE_NAME), body).unwrap();
+        let mut state = state_in(&dir);
+        state.load_tui_state();
+
+        assert!(state.toast.is_none(), "{:?}", state.toast);
+        let tool = &state.column_widths[CardId::ToolTable as usize];
+        assert_eq!(tool[1], Some(7));
+        assert_eq!(tool[6..8], [None, None]);
+        assert_eq!(state.column_widths[CardId::HookTable as usize][0], Some(14));
+        let model = &state.column_widths[CardId::ModelTable as usize];
+        assert_eq!(model[0], Some(17));
+        assert_eq!(model[13], None);
+    }
+
+    #[test]
+    fn grids_and_grid_ratios_round_trip_and_a_default_grid_writes_neither_table() {
+        // 1. 기본 격자는 두 표 모두 없음
+        let dir = TempDir::new();
+        let mut state = state_in(&dir);
+        state.save_tui_state();
+        let text = fs::read_to_string(dir.0.join(TUI_STATE_FILE_NAME)).unwrap();
+        assert!(!text.contains("[grids]"), "{text}");
+        assert!(!text.contains("[grid_ratios]"), "{text}");
+
+        // 2. 바꾼 격자와 비율
+        let moved = apply_drop(
+            &default_rows(ActiveTab::Overview),
+            CardId::EventDetail,
+            DropTarget::After(CardId::ChartTools),
+        )
+        .unwrap();
+        state.card_layout.set_grid(ActiveTab::Overview, moved);
+        assert!(
+            state
+                .card_layout
+                .restore_grid_ratios("overview_cols_3", &[2_000, 4_000, 6_000])
+        );
+        assert!(
+            state
+                .card_layout
+                .restore_grid_ratios("overview_rows_5", &[1_000, 2_000, 4_000, 6_000])
+        );
+        state.save_tui_state();
+        assert!(state.toast.is_none(), "{:?}", state.toast);
+        let text = fs::read_to_string(dir.0.join(TUI_STATE_FILE_NAME)).unwrap();
+        for entry in [
+            "[grids]\noverview = [[\"server_status\"], [\"kpi_requests\", \"kpi_tokens\", \"kpi_cache\", \"kpi_tools\", \"kpi_hooks\", \"savings_effect\"], [\"trend_requests\", \"trend_tokens\"], [\"chart_activity\", \"chart_tokens\", \"chart_tools\", \"event_detail\"], [\"event_feed\"]]\n",
+            "[grid_ratios]\noverview_cols_3 = [2000, 4000, 6000]\noverview_rows_5 = [1000, 2000, 4000, 6000]\n",
+        ] {
+            assert!(text.contains(entry), "{entry}: {text}");
+        }
+
+        // 3. 복원
+        let mut loaded = state_in(&dir);
+        loaded.load_tui_state();
+        assert!(loaded.toast.is_none(), "{:?}", loaded.toast);
+        assert_eq!(loaded.card_layout, state.card_layout);
+    }
+
+    #[test]
+    fn grid_ratios_apply_after_grids_and_missing_cards_join_their_default_row() {
+        // 1. 새 표 없는 파일은 지금과 같게 적재
+        let dir = TempDir::new();
+        let path = dir.0.join(TUI_STATE_FILE_NAME);
+        fs::write(
+            &path,
+            "version = 1\n[orders]\nsettings_rows = [3, 0, 1, 2]\n",
+        )
+        .unwrap();
+        let mut plain = state_in(&dir);
+        plain.load_tui_state();
+        assert!(plain.toast.is_none(), "{:?}", plain.toast);
+        assert_eq!(
+            plain.card_layout.grid_of(ActiveTab::Overview),
+            default_rows(ActiveTab::Overview)
+        );
+        assert_eq!(grid_rows(&plain, ActiveTab::Settings), doctor_first());
+
+        // 2. 비율 표가 앞에 적혀도 격자 뒤에 적용, 빠진 두 카드는 기본 줄 끝과 새 마지막 줄
+        let body = "version = 1\n\
+            [grid_ratios]\n\
+            overview_cols_3 = [2000, 4000, 6000]\n\
+            \n\
+            [grids]\n\
+            overview = [[\"server_status\"], [\"kpi_requests\", \"kpi_tokens\", \"kpi_cache\", \"kpi_tools\", \"kpi_hooks\"], [\"trend_requests\", \"trend_tokens\"], [\"chart_activity\", \"chart_tokens\", \"chart_tools\", \"event_feed\"]]\n";
+        fs::write(&path, body).unwrap();
+        let mut state = state_in(&dir);
+        state.load_tui_state();
+        assert!(state.toast.is_none(), "{:?}", state.toast);
+        let grid = state.card_layout.grid_of(ActiveTab::Overview);
+        let rows: Vec<Vec<CardId>> = grid
+            .rows
+            .iter()
+            .map(|cells| cells.iter().flatten().copied().collect::<Vec<CardId>>())
+            .filter(|row| !row.is_empty())
+            .collect();
+        assert_eq!(
+            rows[1],
+            [
+                CardId::KpiRequests,
+                CardId::KpiTokens,
+                CardId::KpiCache,
+                CardId::KpiTools,
+                CardId::KpiHooks,
+                CardId::SavingsEffect,
+            ]
+        );
+        assert_eq!(rows[3].last(), Some(&CardId::EventFeed));
+        assert_eq!(rows[4], [CardId::EventDetail]);
+        assert_eq!(rows.len(), 5);
+        assert!(
+            state
+                .card_layout
+                .grid_ratio_entries()
+                .contains(&("overview_cols_3".to_string(), vec![2_000, 4_000, 6_000]))
+        );
+    }
+
+    #[test]
+    fn each_invalid_grid_entry_is_skipped_with_exactly_one_notice() {
+        let dir = TempDir::new();
+        let notice = i18n::state_entries_skipped(Lang::Ko, TUI_STATE_FILE_NAME, 1);
+        for entry in [
+            "[grids]\noverview = [[\"no_such_card\"]]\n",
+            "[grids]\noverview = [[\"server_status\"], [\"server_status\"]]\n",
+            "[grids]\noverview = [[\"kpi_requests\"], [\"kpi_tokens\"], [\"kpi_cache\"], [\"savings_effect\"], [\"kpi_tools\"], [\"kpi_hooks\"], [\"server_status\"]]\n",
+            "[grids]\noverview = [[\"server_status\", \"kpi_requests\", \"kpi_tokens\", \"kpi_cache\", \"savings_effect\", \"kpi_tools\", \"kpi_hooks\"]]\n",
+            "[grids]\nnowhere = [[\"server_status\"]]\n",
+            "[grids]\noverview = \"server_status\"\n",
+            "[grids]\noverview = [\"server_status\"]\n",
+            "[grids]\noverview = [[1]]\n",
+            "[grid_ratios]\noverview_cols_1 = [5000]\n",
+        ] {
+            fs::write(
+                dir.0.join(TUI_STATE_FILE_NAME),
+                format!("version = 1\n{entry}"),
+            )
+            .unwrap();
+            let mut state = state_in(&dir);
+            state.load_tui_state();
+            let toast = state
+                .toast
+                .as_ref()
+                .unwrap_or_else(|| panic!("no notice: {entry}"));
+            assert_eq!(toast.text, notice, "{entry}");
+            assert_eq!(state.card_layout, CardLayout::default(), "{entry}");
+        }
+    }
+
+    #[test]
+    fn a_card_of_another_tab_in_a_stored_grid_is_dropped_without_a_notice() {
+        let dir = TempDir::new();
+        fs::write(
+            dir.0.join(TUI_STATE_FILE_NAME),
+            "version = 1\n[grids]\ntools = [[\"model_table\", \"tool_table\"]]\n",
+        )
+        .unwrap();
+        let mut state = state_in(&dir);
+        state.load_tui_state();
+        assert!(state.toast.is_none(), "{:?}", state.toast);
+        let rows = grid_rows(&state, ActiveTab::Tools);
+        assert!(!rows.concat().contains(&CardId::ModelTable), "{rows:?}");
+        assert!(rows.concat().contains(&CardId::ToolTable), "{rows:?}");
     }
 }

@@ -1,6 +1,7 @@
 //! tui/i18n.rs
 //! 화면 문구 카탈로그: 영어·한국어 두 벌, 기본 영어, 값이 들어가는 문구는 형식 함수.
 
+use crate::core::config::ReportLanguage;
 use crate::tui::layout::SplitAxis;
 use crate::tui::poller::{AdminAction, AdminOutcome};
 use crate::tui::state::ToastLevel;
@@ -27,6 +28,14 @@ impl Lang {
             "en" => Some(Self::En),
             "ko" => Some(Self::Ko),
             _ => None,
+        }
+    }
+
+    // 리포트 탭이 화면 언어로 요청하는 리포트 본문 언어
+    pub fn report_language(self) -> ReportLanguage {
+        match self {
+            Self::En => ReportLanguage::En,
+            Self::Ko => ReportLanguage::Ko,
         }
     }
 }
@@ -186,10 +195,6 @@ define_messages! {
     KpiOutput => ("Out", "출력"),
     KpiCache => ("Cache hit rate", "캐시 적중률"),
     KpiCacheShort => ("Cache hit", "캐시 적중률"),
-    KpiWait => ("Model wait", "모델 대기"),
-    KpiWaitShort => ("Wait", "모델 대기"),
-    KpiWaitDetail => ("Model reply wait", "모델 응답 대기"),
-    KpiWaitDetailShort => ("Reply wait", "응답 대기"),
     KpiTools => ("Tool calls/errors", "도구 호출/오류"),
     KpiToolsShort => ("Tools", "도구"),
     KpiCalls => ("Calls", "호출"),
@@ -202,7 +207,10 @@ define_messages! {
     SavingsSaved => ("Saved today", "오늘 절약 시간"),
     SavingsLoss => ("Est. deny loss", "거부 손실 추정"),
     SavingsNet => ("Net effect", "순효과"),
-    TitleTrend => ("Per-minute trend", "분당 추이"),
+    TitleSavingsShort => ("Hook effect", "훅 효과"),
+    SavingsNetShort => ("Net", "순효과"),
+    SavingsSavedShort => ("Saved", "절약"),
+    SavingsLossShort => ("Loss", "손실"),
     TitleRequestsPerMin => ("Requests/min", "분당 요청"),
     TitleTokensPerMin => ("Output tokens/min", "분당 출력 토큰"),
     TrendMinutesAgo => ("60 min ago", "60분 전"),
@@ -259,8 +267,6 @@ define_messages! {
     ContextSameGuard => ("Same guard", "같은 가드"),
 
     // 표 열 머리글
-    ColP50 => ("p50", "p50"),
-    ColP90 => ("p90", "p90"),
     ColTool => ("Tool", "도구"),
     ColCalls => ("Calls", "호출"),
     ColErrors => ("Errors", "오류"),
@@ -297,10 +303,6 @@ define_messages! {
     TitleToolDetail => ("Tool detail", "도구 상세"),
     NoToolSelected => ("No tool selected", "선택한 도구 없음"),
     ToolCallsErrors => ("Calls / errors", "호출 / 오류"),
-    LatencyP50P90 => ("Latency p50/p90", "지연 p50 / p90"),
-    ToolTotalTime => ("Total time", "합계 시간"),
-    ToolAvgPerCall => ("Avg per call", "호출당 평균"),
-    ToolShare => ("Share of total", "전체 대비"),
     TitleHookVerdicts => ("Hook verdicts", "훅 판정"),
     TitleHookDetail => ("Hook detail", "훅 상세"),
     NoHookSelected => ("No hook selected", "선택한 훅 없음"),
@@ -315,7 +317,6 @@ define_messages! {
     ModelCounts => ("Reqs / sess / kinds", "요청 / 세션 / 종류"),
     InOut => ("Input / output", "입력 / 출력"),
     CacheReadWrite => ("Cache read / write", "캐시 읽기 / 생성"),
-    WaitP50P90 => ("Wait p50 / p90", "대기 p50 / p90"),
     CostEstimate => ("Cost (est.)", "비용 (추정)"),
     LastRequest => ("Last request", "마지막 요청"),
     NoAgentSelected => ("No agent selected", "선택한 에이전트 없음"),
@@ -489,29 +490,41 @@ define_messages! {
     HintReportWeek => ("←→ Week", "←→ 주"),
     HelpReportView => ("Daily / weekly report (← → then moves by week)", "일간·주간 리포트 전환 (주간에서 ← → 는 주 이동)"),
 
-    // 한도 카드 (개요 탭), 캐시 타이머 카드 (모델 탭)
-    TitleLimits => ("Limits", "한도"),
+    // 캐시 타이머 카드 (모델 탭)
     TitleCacheTimer => ("Cache timer", "캐시 타이머"),
-    LimitsLabelFiveHour => ("5h", "5h"),
-    LimitsLabelSevenDay => ("7d", "7d"),
-    LimitsLabelContext => ("ctx", "ctx"),
-    LimitsLabelApiKey => ("API", "API"),
-    LimitsPaceAhead => ("ahead", "빠름"),
-    LimitsPaceOn => ("on pace", "적정"),
-    LimitsPaceBehind => ("behind", "느림"),
     LimitsOfficial => ("official", "공식"),
-    LimitsEstimate => ("estimate", "추정"),
-    LimitsTokensUnit => ("tok", "tok"),
-    LimitsRequestsShort => ("req", "req"),
-    LimitsEmpty => ("No official limit data", "공식 한도 값 없음"),
     LimitsEmptyHint => ("Set statusLine to `claude-monitor statusline`", "statusLine 에 `claude-monitor statusline` 설정"),
-    LimitsResetDue => ("reset due", "리셋 예정"),
     CacheWarm => ("warm", "유지"),
     CacheCold => ("cold", "만료"),
     CacheUnknown => ("not observed", "관측 없음"),
     CacheHit => ("hit", "적중"),
     CacheNoMiss => ("no miss recorded", "기록된 미스 없음"),
     CacheEmpty => ("No cache data", "캐시 값 없음"),
+
+    // 탭별 평균·최대·비중 열과 상세 줄
+    ColAvg => ("Avg", "평균"),
+    ColMax => ("Max", "최대"),
+    ColErrorRate => ("Err %", "오류율"),
+    ColShare => ("Share", "비중"),
+    ColAvgWait => ("Avg wait", "평균대기"),
+    ColTotalWait => ("Tot wait", "대기합계"),
+    ColTokPerReq => ("Tok/req", "토큰/요청"),
+    DetailAvgMax => ("Avg / max", "평균 / 최대"),
+    ToolCallShare => ("Share of calls", "호출 비중"),
+    WaitAvgMax => ("Wait avg / max", "대기 평균 / 최대"),
+    WaitTotal => ("Wait total", "대기 합계"),
+    DetailTokensPerReq => ("Tokens total / req", "토큰 합계 / 요청당"),
+    DetailTotalTime => ("Total time", "총 시간"),
+    DetailTimeShare => ("Share of time", "시간 비중"),
+    SkillPerCall => ("Per call (OTel)", "호출당 (OTel)"),
+
+    // 개요 탭 차트 줄
+    TitleChartActivity => ("Activity/min", "분당 활동"),
+    TitleChartTokens => ("Token mix", "토큰 구성"),
+    TitleChartTools => ("Top tools", "도구 호출 상위"),
+    ChartCacheRead => ("Cache read", "캐시 읽기"),
+    ChartCacheWrite => ("Cache write", "캐시 쓰기"),
+    ChartMinutesAgo => ("-60m", "-60분"),
 }
 
 // 3. 값이 들어가는 문구 -------------------------------------------------------
@@ -573,6 +586,13 @@ pub fn trend_title(lang: Lang, title: &str, peak: &str) -> String {
     match lang {
         Lang::En => format!("{title} (peak {peak})"),
         Lang::Ko => format!("{title} (최대 {peak})"),
+    }
+}
+
+pub fn chart_peak(lang: Lang, peak: &str) -> String {
+    match lang {
+        Lang::En => format!("peak {peak}"),
+        Lang::Ko => format!("최대 {peak}"),
     }
 }
 
@@ -1081,20 +1101,6 @@ pub fn limits_hint(lang: Lang, source: &str, age: &str, stale: bool) -> String {
     }
 }
 
-pub fn limits_reset_in(lang: Lang, countdown: &str) -> String {
-    match lang {
-        Lang::En => format!("in {countdown}"),
-        Lang::Ko => format!("{countdown} 후"),
-    }
-}
-
-pub fn limits_compactions(lang: Lang, count: u64) -> String {
-    match lang {
-        Lang::En => format!("compact {count}"),
-        Lang::Ko => format!("압축 {count}회"),
-    }
-}
-
 pub fn cache_left(lang: Lang, countdown: &str) -> String {
     match lang {
         Lang::En => format!("{countdown} left"),
@@ -1327,7 +1333,6 @@ mod tests {
             Msg::ModelCounts,
             Msg::InOut,
             Msg::CacheReadWrite,
-            Msg::WaitP50P90,
             Msg::CostEstimate,
             Msg::LastRequest,
             Msg::AgentCounts,
@@ -1350,10 +1355,6 @@ mod tests {
         ];
         let mid_labels = [
             Msg::ToolCallsErrors,
-            Msg::LatencyP50P90,
-            Msg::ToolTotalTime,
-            Msg::ToolAvgPerCall,
-            Msg::ToolShare,
             Msg::HookRouteGuard,
             Msg::HookTimeSaved,
         ];

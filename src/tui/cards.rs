@@ -1,12 +1,12 @@
 //! tui/cards.rs
 //! 카드 식별자·종류, 카드별 스크롤·선택 상태, 클릭 동작, 마우스 적중 영역 모음.
 
-use crate::tui::layout::{MAX_SLOTS, SplitAxis, SplitGroup, SplitHit};
+use crate::tui::layout::{SplitGroup, SplitHit};
 use crate::tui::state::ActiveTab;
 use ratatui::layout::{Position, Rect};
 use std::time::{Duration, Instant};
 
-pub const CARD_COUNT: usize = CardId::SkillDetail as usize + 1;
+pub const CARD_COUNT: usize = CardId::ChartTools as usize + 1;
 // 카드 제목을 누른 채 이 시간이 지나면 이동 모드
 pub const CARD_HOLD_TIME: Duration = Duration::from_millis(400);
 
@@ -18,7 +18,6 @@ pub enum CardId {
     KpiRequests,
     KpiTokens,
     KpiCache,
-    KpiWait,
     KpiTools,
     KpiHooks,
     SavingsEffect,
@@ -46,12 +45,15 @@ pub enum CardId {
     ProjectTable,
     ProjectDetail,
     AttributionTable,
-    // 개요 한도 카드, 모델 탭 캐시 타이머 카드
-    LimitsCard,
+    // 모델 탭 캐시 타이머 카드
     CacheTimer,
     // 스킬 탭 표와 상세
     SkillTable,
     SkillDetail,
+    // 개요 차트 줄: 분당 활동, 토큰 구성, 도구 호출 상위
+    ChartActivity,
+    ChartTokens,
+    ChartTools,
 }
 
 // 휠·키 동작 구분: 고정, 화면 위치만 이동, 선택 행과 화면 위치 함께 이동
@@ -85,46 +87,6 @@ impl CardId {
             Self::ProjectTable | Self::AttributionTable | Self::SkillTable => CardKind::Selectable,
             Self::ProjectDetail | Self::SkillDetail => CardKind::Scrollable,
             _ => CardKind::Static,
-        }
-    }
-
-    // 순서를 바꿀 수 있는 카드의 (그룹, 카드 번호), 번호 = 뷰가 분할 결과에서 쓰는 위치
-    pub fn reorder_slot(self) -> Option<(SplitGroup, usize)> {
-        match self {
-            Self::KpiRequests => Some((SplitGroup::OverviewKpiCols, 0)),
-            Self::KpiTokens => Some((SplitGroup::OverviewKpiCols, 1)),
-            Self::KpiCache => Some((SplitGroup::OverviewKpiCols, 2)),
-            Self::KpiWait => Some((SplitGroup::OverviewKpiCols, 3)),
-            Self::KpiTools => Some((SplitGroup::OverviewKpiCols, 4)),
-            Self::KpiHooks => Some((SplitGroup::OverviewKpiCols, 5)),
-            Self::SavingsEffect => Some((SplitGroup::OverviewTrendCols, 0)),
-            Self::TrendRequests => Some((SplitGroup::OverviewTrendCols, 1)),
-            Self::TrendTokens => Some((SplitGroup::OverviewTrendCols, 2)),
-            Self::EventFeed => Some((SplitGroup::OverviewFeedCols, 0)),
-            Self::EventDetail => Some((SplitGroup::OverviewFeedCols, 1)),
-            Self::ToolTable => Some((SplitGroup::ToolsRows, 0)),
-            Self::ToolDetail => Some((SplitGroup::ToolsRows, 1)),
-            Self::HookTable => Some((SplitGroup::HooksRows, 0)),
-            Self::HookDetail => Some((SplitGroup::HooksRows, 1)),
-            Self::ModelTable => Some((SplitGroup::ModelsRows, 0)),
-            Self::ModelDetail => Some((SplitGroup::ModelsRows, 1)),
-            Self::CacheBreaks => Some((SplitGroup::ModelsRows, 2)),
-            Self::AgentTable => Some((SplitGroup::AgentsRows, 0)),
-            Self::AgentDetail => Some((SplitGroup::AgentsRows, 1)),
-            Self::SettingsHooks => Some((SplitGroup::SettingsRows, 0)),
-            Self::SettingsMcp => Some((SplitGroup::SettingsRows, 1)),
-            Self::SettingsAgents => Some((SplitGroup::SettingsRows, 2)),
-            Self::SettingsDoctor => Some((SplitGroup::SettingsRows, 3)),
-            Self::ReportOutline => Some((SplitGroup::ReportCols, 0)),
-            Self::ReportBody => Some((SplitGroup::ReportCols, 1)),
-            Self::LimitsCard => Some((SplitGroup::OverviewTrendCols, 3)),
-            Self::CacheTimer => Some((SplitGroup::ModelsRows, 3)),
-            Self::ServerStatus | Self::Gate => None,
-            Self::ProjectTable => Some((SplitGroup::ProjectsRows, 0)),
-            Self::ProjectDetail => Some((SplitGroup::ProjectsRows, 1)),
-            Self::AttributionTable => Some((SplitGroup::ProjectsRows, 2)),
-            Self::SkillTable => Some((SplitGroup::SkillsRows, 0)),
-            Self::SkillDetail => Some((SplitGroup::SkillsRows, 1)),
         }
     }
 }
@@ -242,13 +204,13 @@ pub struct TitleHit {
     pub rect: Rect,
 }
 
-// 순서를 바꿀 수 있는 그룹의 이번 프레임 칸 배치 (slots = 칸 영역, cards[칸] = 그 칸에 놓인 카드 번호)
+// 격자로 그린 탭의 이번 프레임 화면 줄 (row = 격자 줄 번호, cards = 줄 안 카드 영역)
 #[derive(Debug, Clone)]
-pub struct SlotGroupHit {
-    pub group: SplitGroup,
-    pub axis: SplitAxis,
-    pub slots: Vec<Rect>,
-    pub cards: Vec<usize>,
+pub struct GridLineHit {
+    pub tab: ActiveTab,
+    pub row: usize,
+    pub rect: Rect,
+    pub cards: Vec<(CardId, Rect)>,
 }
 
 // 카드 제목을 누른 채 대기 중 (started = 누른 시각, cell = 누른 칸, 시간이 차기 전 다른 칸으로 끌면 취소)
@@ -261,14 +223,10 @@ pub struct CardPress {
     pub cell: Position,
 }
 
-// 진행 중 카드 이동 (baseline = 누르기 전 칸별 카드 번호, target = 지금 미리보기 중인 칸)
+// 진행 중 카드 이동 (격자와 놓을 자리는 GridMove)
 #[derive(Debug, Clone, Copy)]
 pub struct CardMove {
     pub card: CardId,
-    pub group: SplitGroup,
-    pub index: usize,
-    pub baseline: [u8; MAX_SLOTS],
-    pub target: usize,
 }
 
 // 매 프레임 그리기에서 다시 채우는 클릭 영역
@@ -283,7 +241,7 @@ pub struct UiHitAreas {
     pub scroll_hits: Vec<ScrollHit>,
     pub card_rects: Vec<(CardId, Rect)>,
     pub title_hits: Vec<TitleHit>,
-    pub slot_groups: Vec<SlotGroupHit>,
+    pub grid_lines: Vec<GridLineHit>,
 }
 
 // 5. 스크롤바 썸 --------------------------------------------------------------
@@ -338,65 +296,6 @@ pub fn scroll_for_thumb(total: usize, visible: usize, track: u16, thumb_start: u
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn reorder_slots_cover_every_reorderable_group_exactly_once() {
-        let cards = [
-            CardId::ServerStatus,
-            CardId::KpiRequests,
-            CardId::KpiTokens,
-            CardId::KpiCache,
-            CardId::KpiWait,
-            CardId::KpiTools,
-            CardId::KpiHooks,
-            CardId::SavingsEffect,
-            CardId::TrendRequests,
-            CardId::TrendTokens,
-            CardId::EventFeed,
-            CardId::EventDetail,
-            CardId::Gate,
-            CardId::ToolTable,
-            CardId::ToolDetail,
-            CardId::HookTable,
-            CardId::HookDetail,
-            CardId::ModelTable,
-            CardId::ModelDetail,
-            CardId::CacheBreaks,
-            CardId::AgentTable,
-            CardId::AgentDetail,
-            CardId::SettingsHooks,
-            CardId::SettingsMcp,
-            CardId::SettingsAgents,
-            CardId::SettingsDoctor,
-            CardId::ReportBody,
-            CardId::ReportOutline,
-            CardId::ProjectTable,
-            CardId::ProjectDetail,
-            CardId::AttributionTable,
-            CardId::LimitsCard,
-            CardId::CacheTimer,
-            CardId::SkillTable,
-            CardId::SkillDetail,
-        ];
-        assert_eq!(cards.len(), CARD_COUNT);
-        for group in SplitGroup::ALL {
-            let mut indices: Vec<usize> = cards
-                .iter()
-                .filter_map(|card| card.reorder_slot())
-                .filter(|(owner, _)| *owner == group)
-                .map(|(_, index)| index)
-                .collect();
-            indices.sort_unstable();
-            if group.is_reorderable() {
-                let expected: Vec<usize> = (0..group.card_count()).collect();
-                assert_eq!(indices, expected, "{group:?}");
-            } else {
-                assert!(indices.is_empty(), "{group:?}");
-            }
-        }
-        assert_eq!(CardId::ServerStatus.reorder_slot(), None);
-        assert_eq!(CardId::Gate.reorder_slot(), None);
-    }
 
     #[test]
     fn scroll_thumb_matches_proportion_and_hits_both_ends() {

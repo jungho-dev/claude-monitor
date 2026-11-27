@@ -42,9 +42,6 @@ pub const LIMIT_SNAPSHOT_MIN_GAP_SECS: i64 = 60;
 // 스냅샷 보관 일수 (limit_snapshots·ratelimit_snapshots 공통, 기록할 때 이보다 오래된 행 삭제)
 pub const LIMIT_SNAPSHOT_RETENTION_DAYS: i64 = 30;
 
-// 조회 상한 중 TUI 한도 카드의 12시간 이력용 (세션 1개가 분당 1건이면 12시간 720건)
-pub const LIMIT_HISTORY_MAX_ROWS: usize = 5000;
-
 const LIMIT_COLUMNS: &str = "ts, session_id, model, five_hour_pct, five_hour_resets_at, \
      seven_day_pct, seven_day_resets_at, context_pct, context_window_size, context_input_tokens, \
      context_cache_read_tokens, context_cache_write_tokens, cache_warm, cache_caching_observed, \

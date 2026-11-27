@@ -7,16 +7,16 @@ use crate::store::query::UsageShare;
 use crate::tui::cards::CardId;
 use crate::tui::format::{fit_display, format_clock_time, format_compact, format_count};
 use crate::tui::i18n::{self, Lang, Msg};
-use crate::tui::layout::{SplitAxis, SplitGroup};
+use crate::tui::layout::grid::{CardSlot, SlotHeight};
 use crate::tui::sort::{compare_skill_row, sort_rows};
-use crate::tui::state::{AppState, DashboardSnapshot, Panel};
+use crate::tui::state::{ActiveTab, AppState, DashboardSnapshot, Panel};
 use crate::tui::theme;
 use crate::tui::views::common::{
     CardTable, ColumnFit, ColumnSpec, PanelNote, TableCell, TextCard, panel_message,
     render_card_table, render_db_gate, render_notice_card, render_text_card,
 };
 use crate::tui::views::detail::{
-    DETAIL_LABEL_WIDTH, ShareBasis, pair_line, percent, section_line, share_lines,
+    DETAIL_LABEL_WIDTH, ShareBasis, pair_line, per_request, percent, section_line, share_lines,
 };
 use crate::tui::views::projects::attribution_rows;
 use ratatui::Frame;
@@ -24,13 +24,13 @@ use ratatui::layout::{Alignment, Rect};
 use ratatui::text::{Line, Span};
 use std::collections::BTreeMap;
 
-// 상세 카드 기본 높이 (항목 6줄 + 호출 에이전트·최근 호출 구역 + 테두리), 표는 머리글과 몇 행을 남김
-const SKILL_DETAIL_HEIGHT: u16 = 16;
+// 상세 카드 기본 높이 (항목 7줄 + 호출 에이전트·최근 호출 구역 + 테두리), 표는 머리글과 몇 행을 남김
+const SKILL_DETAIL_HEIGHT: u16 = 17;
 const SKILL_TABLE_MIN: u16 = 5;
 const SKILL_DETAIL_MIN: u16 = 3;
 
 // 스킬 표 열 (정렬 열 번호와 순서 일치: sort.rs)
-pub const SKILL_COLUMNS: [ColumnSpec; 9] = [
+pub const SKILL_COLUMNS: [ColumnSpec; 11] = [
     (Msg::ColSkill, 18, ColumnFit::Grow, Alignment::Left),
     (Msg::ColInstalled, 4, ColumnFit::Fixed, Alignment::Left),
     (Msg::ColCalls, 6, ColumnFit::Fixed, Alignment::Right),
@@ -40,6 +40,8 @@ pub const SKILL_COLUMNS: [ColumnSpec; 9] = [
     (Msg::ColCost, 8, ColumnFit::Fixed, Alignment::Right),
     (Msg::ColDescChars, 6, ColumnFit::Fixed, Alignment::Right),
     (Msg::ColLast, 8, ColumnFit::Fixed, Alignment::Right),
+    (Msg::ColInput, 6, ColumnFit::Fixed, Alignment::Right),
+    (Msg::ColOutput, 6, ColumnFit::Fixed, Alignment::Right),
 ];
 
 // 1. 스킬 행 ------------------------------------------------------------------
@@ -55,8 +57,8 @@ pub struct SkillRow {
     pub sessions: u64,
     pub top_caller: String,
     pub cost_usd: Option<f64>,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
     pub first_ts: String,
     pub last_ts: String,
     pub callers: Vec<UsageShare>,
@@ -144,8 +146,8 @@ pub fn skill_rows(
         }
         if let Some(cost) = costs.iter().find(|cost| cost.name == row.name) {
             row.cost_usd = Some(cost.cost_usd);
-            row.input_tokens = cost.input_tokens;
-            row.output_tokens = cost.output_tokens;
+            row.input_tokens = Some(cost.input_tokens);
+            row.output_tokens = Some(cost.output_tokens);
         }
     }
     Some(rows)
@@ -158,14 +160,40 @@ pub fn render_skills_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
         return;
     }
     let detail_height = SKILL_DETAIL_HEIGHT.min(area.height.saturating_sub(SKILL_TABLE_MIN));
-    let panes = state.card_layout.split_cards(
+    let layout = state.card_layout;
+    let placed = layout.arrange_tab(
         &mut state.hit_areas,
-        SplitGroup::SkillsRows,
-        SplitAxis::Rows,
+        ActiveTab::Skills,
         area,
-        &[area.height.saturating_sub(detail_height)],
-        &[SKILL_TABLE_MIN, SKILL_DETAIL_MIN],
+        &[
+            CardSlot {
+                card: CardId::SkillTable,
+                min_w: 24,
+                min_h: SKILL_TABLE_MIN,
+                height: SlotHeight::Fill,
+                weight: 3,
+                rank: 0,
+                reserve: 0,
+            },
+            CardSlot {
+                card: CardId::SkillDetail,
+                min_w: 20,
+                min_h: SKILL_DETAIL_MIN,
+                height: SlotHeight::Fixed(detail_height),
+                weight: 2,
+                rank: 0,
+                reserve: 0,
+            },
+        ],
     );
+    let table_area = placed
+        .iter()
+        .find(|(card, _)| *card == CardId::SkillTable)
+        .map(|(_, rect)| *rect);
+    let detail_area = placed
+        .iter()
+        .find(|(card, _)| *card == CardId::SkillDetail)
+        .map(|(_, rect)| *rect);
     let lang = state.lang;
     let inventory_ready = matches!(state.inventory, Panel::Ready(_));
 
@@ -181,8 +209,9 @@ pub fn render_skills_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let total_calls: u64 = rows
         .as_ref()
         .map_or(0, |rows| rows.iter().map(|row| row.calls).sum());
-    match &rows {
-        Some(sorted) if !sorted.is_empty() => {
+    match (&rows, table_area) {
+        (_, None) => {}
+        (Some(sorted), Some(table_area)) if !sorted.is_empty() => {
             let installed = match &state.inventory {
                 Panel::Ready(inventory) => Some(inventory.skills.len()),
                 _ => None,
@@ -193,7 +222,7 @@ pub fn render_skills_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
             render_card_table(
                 frame,
                 state,
-                panes[0],
+                table_area,
                 CardTable {
                     card: CardId::SkillTable,
                     title: i18n::skill_table_title(lang, installed, used, total_calls),
@@ -204,30 +233,33 @@ pub fn render_skills_tab(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 },
             );
         }
-        Some(_) => {
+        (Some(_), Some(table_area)) => {
             let note = PanelNote {
                 message: i18n::text(lang, Msg::SkillsEmpty).to_string(),
                 color: theme::FG_DIM,
                 hint: Some(Msg::SkillsEmptyHint),
             };
             let title = i18n::text(lang, Msg::TitleSkillsPending);
-            render_notice_card(frame, state, CardId::SkillTable, panes[0], title, note);
+            render_notice_card(frame, state, CardId::SkillTable, table_area, title, note);
         }
-        None => {
+        (None, Some(table_area)) => {
             let note = panel_message(lang, &state.snapshot.skills).unwrap_or_default();
             let title = i18n::text(lang, Msg::TitleSkillsPending);
-            render_notice_card(frame, state, CardId::SkillTable, panes[0], title, note);
+            render_notice_card(frame, state, CardId::SkillTable, table_area, title, note);
         }
     }
 
     // 2. 선택 스킬 상세
+    let Some(detail_area) = detail_area else {
+        return;
+    };
     let selected = state.card_views[CardId::SkillTable as usize].selected;
     let selected_row = rows.as_ref().and_then(|sorted| sorted.get(selected));
     let (title, lines) = build_skill_detail(lang, selected_row, total_calls, inventory_ready);
     render_text_card(
         frame,
         state,
-        panes[1],
+        detail_area,
         TextCard {
             card: CardId::SkillDetail,
             title,
@@ -298,6 +330,14 @@ fn skill_cells(lang: Lang, row: &SkillRow) -> Vec<TableCell> {
                 format_clock_time(&row.last_ts),
                 theme::STYLE_DIM,
             )]
+        },
+        match row.input_tokens {
+            Some(tokens) => vec![Span::raw(format_compact(tokens))],
+            None => dash(),
+        },
+        match row.output_tokens {
+            Some(tokens) => vec![Span::raw(format_compact(tokens))],
+            None => dash(),
         },
     ]
 }
@@ -381,18 +421,33 @@ fn build_skill_detail(
     ));
 
     // 3. OTel 비용
-    let cost = match row.cost_usd {
-        Some(cost) => i18n::otel_cost_value(
-            lang,
-            cost,
-            &format_compact(row.input_tokens),
-            &format_compact(row.output_tokens),
-        ),
-        None => i18n::text(lang, Msg::SkillNoOtel).to_string(),
+    let cost = match (row.cost_usd, row.input_tokens, row.output_tokens) {
+        (Some(cost), Some(input), Some(output)) => {
+            i18n::otel_cost_value(lang, cost, &format_compact(input), &format_compact(output))
+        }
+        _ => i18n::text(lang, Msg::SkillNoOtel).to_string(),
     };
     lines.push(pair_line(i18n::text(lang, Msg::SkillCostOtel), cost));
 
-    // 4. 호출 에이전트와 최근 호출
+    // 4. 호출당 OTel 비용·출력 (OTel 지표가 없거나 호출이 없으면 흐린 -)
+    let per_call_label = i18n::text(lang, Msg::SkillPerCall);
+    match (row.cost_usd, row.output_tokens) {
+        (Some(cost), Some(output)) if row.calls > 0 => {
+            lines.push(pair_line(
+                per_call_label,
+                per_request(cost, output, row.calls),
+            ));
+        }
+        _ => lines.push(Line::from(vec![
+            Span::styled(
+                fit_display(per_call_label, DETAIL_LABEL_WIDTH),
+                theme::STYLE_DIM,
+            ),
+            Span::styled("-", theme::STYLE_DIM),
+        ])),
+    }
+
+    // 5. 호출 에이전트와 최근 호출
     lines.extend(share_lines(
         lang,
         Msg::SectionCallers,
@@ -443,8 +498,9 @@ mod tests {
     use super::*;
     use crate::store::query::SkillStatsRow;
     use crate::tui::cards::HeaderHit;
+    use crate::tui::layout::grid::TabGrid;
     use crate::tui::sort::{SortChange, SortState, sort_spec};
-    use crate::tui::state::{ActiveTab, UiCommand};
+    use crate::tui::state::UiCommand;
     use crate::tui::test_support::sample_state_with_tables;
     use crate::tui::views::render_frame;
     use crossterm::event::{
@@ -522,6 +578,32 @@ mod tests {
             .collect()
     }
 
+    fn skill_header_hits(state: &AppState) -> Vec<HeaderHit> {
+        state
+            .hit_areas
+            .header_cells
+            .iter()
+            .filter(|hit| hit.card == CardId::SkillTable)
+            .copied()
+            .collect()
+    }
+
+    // 한 줄 안 x 구간 글자 (넓은 글자 뒤 칸은 건너뜀), 앞뒤 공백 제거
+    fn span_text(buffer: &Buffer, rect: Rect, y: u16) -> String {
+        let mut text = String::new();
+        let mut skip = 0usize;
+        for x in rect.x..rect.right() {
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
+            let symbol = buffer.cell((x, y)).map_or(" ", |cell| cell.symbol());
+            skip = Span::raw(symbol).width().saturating_sub(1);
+            text.push_str(symbol);
+        }
+        text.trim().to_string()
+    }
+
     #[test]
     fn rows_merge_calls_installed_skills_and_otel_names_once_each() {
         let state = sample_state_with_tables();
@@ -593,6 +675,44 @@ mod tests {
                     assert!(text.contains(detail_title), "{case}\n{text}");
                     assert!(text.contains("skills/frontend-tui/SKILL.md"), "{case}");
                 }
+            }
+        }
+    }
+
+    // 기본 격자: 표 위, 상세 아래로 본문을 빈틈없이 나눔 (예전 두 카드 분할과 같은 높이)
+    #[test]
+    fn default_grid_keeps_table_over_detail_heights_at_the_size_matrix() {
+        let heights = [(5, 7), (9, 17), (19, 17)];
+        for lang in BOTH {
+            for ((width, height), (table_h, detail_h)) in SIZES.into_iter().zip(heights) {
+                let case = format!("{lang:?} {width}x{height}");
+                let mut state = skills_state(lang);
+                draw(&mut state, width, height);
+                let table = card_rect(&state, CardId::SkillTable);
+                let detail = card_rect(&state, CardId::SkillDetail);
+                assert_eq!((table.height, detail.height), (table_h, detail_h), "{case}");
+                assert_eq!(table.bottom(), detail.y, "{case}");
+                assert_eq!((table.x, table.width), (detail.x, detail.width), "{case}");
+            }
+        }
+    }
+
+    // 두 카드를 한 줄에 두면 같은 y, 최소 크기에서도 둘 다 그림
+    #[test]
+    fn table_and_detail_share_one_row_when_the_grid_joins_them() {
+        for (width, height) in SIZES {
+            let case = format!("{width}x{height}");
+            let mut state = skills_state(Lang::En);
+            let mut grid = TabGrid::default();
+            grid.rows[0][0] = Some(CardId::SkillTable);
+            grid.rows[0][1] = Some(CardId::SkillDetail);
+            state.card_layout.set_grid(ActiveTab::Skills, grid);
+            draw(&mut state, width, height);
+            let table = card_rect(&state, CardId::SkillTable);
+            let detail = card_rect(&state, CardId::SkillDetail);
+            assert!(!table.intersects(detail), "{case}");
+            if width >= 100 {
+                assert_eq!(table.y, detail.y, "{case}");
             }
         }
     }
@@ -739,6 +859,105 @@ mod tests {
             }]);
             let text = screen_text(&draw(&mut unnamed, 130, 40));
             assert!(text.contains(i18n::text(lang, Msg::SkillUnnamed)), "{text}");
+        }
+    }
+
+    #[test]
+    fn otel_token_columns_show_their_headers_and_hide_right_most_first() {
+        for lang in BOTH {
+            for (width, height) in [(60, 16), (100, 30), (130, 40), (200, 40)] {
+                let case = format!("{lang:?} {width}x{height}");
+                let mut state = skills_state(lang);
+                let buffer = draw(&mut state, width, height);
+                let hits = skill_header_hits(&state);
+                let mut columns: Vec<usize> = hits.iter().map(|hit| hit.column).collect();
+                columns.sort_unstable();
+                // 보이는 열은 0 번부터 이어지고 (오른쪽 열부터 숨김) 스킬 열은 항상 남음
+                let prefix: Vec<usize> = (0..columns.len()).collect();
+                assert_eq!(columns, prefix, "{case}");
+                assert!(columns.contains(&0), "{case}");
+                if width >= 130 {
+                    assert_eq!(columns.len(), SKILL_COLUMNS.len(), "{case}");
+                }
+                if width == 60 {
+                    assert!(columns.len() < SKILL_COLUMNS.len(), "{case}");
+                    assert!(!columns.contains(&10), "{case}");
+                }
+                for (column, msg) in [(9, Msg::ColInput), (10, Msg::ColOutput)] {
+                    if let Some(hit) = hits.iter().find(|hit| hit.column == column) {
+                        let label = span_text(&buffer, hit.rect, hit.rect.y);
+                        assert_eq!(label, i18n::text(lang, msg), "{case}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn otel_token_cells_show_compact_values_or_a_dim_dash() {
+        for lang in BOTH {
+            let mut state = skills_state(lang);
+            let buffer = draw(&mut state, 130, 40);
+            let hits = skill_header_hits(&state);
+            let input = hits.iter().find(|hit| hit.column == 9).expect("입력 열");
+            let output = hits.iter().find(|hit| hit.column == 10).expect("출력 열");
+            let row_y = |name: &str| {
+                (input.rect.y + 1..buffer.area.height)
+                    .find(|y| row_text(&buffer, *y).contains(name))
+                    .unwrap_or_else(|| panic!("{name} 행 없음"))
+            };
+
+            // OTel 행: 입력 40K, 출력 9K
+            let tui_y = row_y("frontend-tui");
+            assert_eq!(span_text(&buffer, input.rect, tui_y), "40.0K", "{lang:?}");
+            assert_eq!(span_text(&buffer, output.rect, tui_y), "9.0K", "{lang:?}");
+
+            // OTel 없는 행: 흐린 -
+            let core_y = row_y("core-response");
+            for hit in [input, output] {
+                assert_eq!(span_text(&buffer, hit.rect, core_y), "-", "{lang:?}");
+                let dash_cell = buffer.cell((hit.rect.right() - 1, core_y)).unwrap();
+                assert_eq!(dash_cell.fg, theme::STYLE_DIM.fg.unwrap(), "{lang:?}");
+            }
+
+            // 상세 카드의 호출당 줄: 1.25 / 6 호출, 9K / 6 호출
+            let text = screen_text(&buffer);
+            let label = i18n::text(lang, Msg::SkillPerCall);
+            assert!(text.contains(label), "{lang:?}\n{text}");
+            assert!(text.contains("$0.2083 / 1.5K"), "{lang:?}\n{text}");
+        }
+    }
+
+    #[test]
+    fn per_call_detail_line_follows_the_cost_line_or_shows_a_dim_dash() {
+        let state = sample_state_with_tables();
+        let rows = skill_rows(&state.snapshot, &state.inventory).unwrap();
+        assert_eq!(
+            (rows[0].input_tokens, rows[0].output_tokens),
+            (Some(40_000), Some(9_000))
+        );
+        assert_eq!((rows[2].input_tokens, rows[2].output_tokens), (None, None));
+        for lang in BOTH {
+            let label = i18n::text(lang, Msg::SkillPerCall);
+            let cost_label = i18n::text(lang, Msg::SkillCostOtel);
+            let (_, lines) = build_skill_detail(lang, Some(&rows[0]), 9, true);
+            let text: Vec<String> = lines.iter().map(line_text).collect();
+            let cost_at = text.iter().position(|line| line.starts_with(cost_label));
+            let per_call_at = text.iter().position(|line| line.starts_with(label));
+            assert_eq!(per_call_at, cost_at.map(|at| at + 1), "{text:?}");
+            assert!(text[per_call_at.unwrap()].ends_with("$0.2083 / 1.5K"));
+
+            // OTel 없는 스킬, OTel 은 있으나 호출이 없는 스킬
+            for row in [&rows[2], &rows[3]] {
+                let (_, lines) = build_skill_detail(lang, Some(row), 9, true);
+                let line = lines
+                    .iter()
+                    .find(|line| line_text(line).starts_with(label))
+                    .expect("호출당 줄");
+                let value = line.spans.last().unwrap();
+                assert_eq!(value.content, "-", "{}", row.name);
+                assert_eq!(value.style, theme::STYLE_DIM, "{}", row.name);
+            }
         }
     }
 }

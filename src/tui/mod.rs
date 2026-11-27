@@ -24,7 +24,7 @@ use crate::tui::cards::CardId;
 use crate::tui::i18n::Msg;
 use crate::tui::layout::SplitGroup;
 use crate::tui::poller::{AdminAction, PollCommand, QUIET_PANIC};
-use crate::tui::state::{AppState, ToastLevel, UiCommand, UiMessage};
+use crate::tui::state::{ActiveTab, AppState, ToastLevel, UiCommand, UiMessage};
 use crate::tui::state_writer::{StateWriter, spawn_state_writer};
 use anyhow::Context;
 use chrono::Local;
@@ -284,6 +284,13 @@ fn dispatch_ui_command(
     poll_tx: &Sender<PollCommand>,
     writer: &StateWriter,
 ) {
+    // 0. 리포트용 설정 사본: 리포트 탭은 화면 언어를 따르므로 리포트 언어만 화면 언어로 바꿈 (자정 예약 생성은 config.toml 값 그대로)
+    let build_report_config = |app: &AppState| {
+        let mut config = app.config.clone();
+        config.report.language = app.lang.report_language();
+        config
+    };
+
     match command {
         UiCommand::None => {}
         UiCommand::RefreshNow => {
@@ -306,7 +313,8 @@ fn dispatch_ui_command(
         UiCommand::LoadReport(date) => {
             // 실시간 여부는 UI 가 지금 오늘로 보는 날 기준 (수집 스레드가 시계를 다시 읽지 않음)
             let live = date == app.today;
-            poller::spawn_report_load(app.config.clone(), ui_tx.clone(), date, live);
+            app.report_lang = app.lang;
+            poller::spawn_report_load(build_report_config(app), ui_tx.clone(), date, live);
         }
         UiCommand::GenerateReport(date) => {
             app.show_toast(
@@ -314,7 +322,7 @@ fn dispatch_ui_command(
                 ToastLevel::Info,
             );
             poller::spawn_admin_action(
-                app.config.clone(),
+                build_report_config(app),
                 ui_tx.clone(),
                 AdminAction::GenerateReport(date),
                 app.today,
@@ -322,7 +330,13 @@ fn dispatch_ui_command(
         }
         UiCommand::LoadWeeklyReport(week_start) => {
             let live = week_start == crate::report::week_start_of(app.today);
-            poller::spawn_weekly_report_load(app.config.clone(), ui_tx.clone(), week_start, live);
+            app.report_lang = app.lang;
+            poller::spawn_weekly_report_load(
+                build_report_config(app),
+                ui_tx.clone(),
+                week_start,
+                live,
+            );
         }
         UiCommand::GenerateWeeklyReport(week_start) => {
             app.show_toast(
@@ -330,7 +344,7 @@ fn dispatch_ui_command(
                 ToastLevel::Info,
             );
             poller::spawn_admin_action(
-                app.config.clone(),
+                build_report_config(app),
                 ui_tx.clone(),
                 AdminAction::GenerateWeeklyReport(week_start),
                 app.today,
@@ -353,24 +367,36 @@ fn dispatch_ui_command(
             win_ctrl::set_terminal_topmost(enabled);
         }
         // 확정 이벤트에서는 파일 내용만 만들어 저장 스레드로 보냄 (쓰기와 실패 알림은 저장 스레드와 UiMessage 가 맡아 입력 스레드는 기다리지 않음)
-        UiCommand::SaveState => match app.build_state_save() {
-            Ok(save) => {
-                if writer.queue_state_save(save).is_err() {
-                    let text = i18n::state_save_failed(app.lang, "state writer stopped");
+        UiCommand::SaveState => {
+            match app.build_state_save() {
+                Ok(save) => {
+                    if writer.queue_state_save(save).is_err() {
+                        let text = i18n::state_save_failed(app.lang, "state writer stopped");
+                        app.show_toast(&text, ToastLevel::Error);
+                    }
+                }
+                Err(detail) => {
+                    let text = i18n::state_save_failed(app.lang, &detail);
                     app.show_toast(&text, ToastLevel::Error);
                 }
             }
-            Err(detail) => {
-                let text = i18n::state_save_failed(app.lang, &detail);
-                app.show_toast(&text, ToastLevel::Error);
+            // 리포트 탭에서 화면 언어를 바꿨으면 보고 있는 본문도 새 언어로 다시 적재
+            if app.tab == ActiveTab::Report && app.report_lang != app.lang {
+                let reload = if app.report_weekly {
+                    UiCommand::LoadWeeklyReport(app.report_week)
+                } else {
+                    UiCommand::LoadReport(app.report_date)
+                };
+                dispatch_ui_command(app, reload, ui_tx, poll_tx, writer);
             }
-        },
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::i18n::Lang;
     use crate::tui::poller::AdminOutcome;
     use crate::tui::test_support::sample_config;
     use chrono::NaiveDate;
@@ -419,7 +445,9 @@ mod tests {
 
     #[test]
     fn dispatch_save_state_queues_the_write_on_the_writer_thread_and_reports_failures() {
-        use crate::tui::layout::{IDENTITY_ORDER, SplitGroup};
+        use crate::tui::cards::CardId;
+        use crate::tui::layout::grid::{DropTarget, apply_drop, default_rows};
+        use crate::tui::state::ActiveTab;
 
         let dir = std::env::temp_dir().join(format!("cm-tui-save-layout-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -428,8 +456,13 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 11, 15).unwrap(),
         );
         app.state_file = dir.join("tui.toml");
-        app.card_layout
-            .move_card_to_slot(SplitGroup::ToolsRows, &IDENTITY_ORDER, 0, 1);
+        let swapped = apply_drop(
+            &default_rows(ActiveTab::Tools),
+            CardId::ToolTable,
+            DropTarget::RowBelow(CardId::ToolDetail),
+        )
+        .unwrap();
+        app.card_layout.set_grid(ActiveTab::Tools, swapped);
         let (ui_tx, ui_rx) = mpsc::channel::<UiMessage>();
         let (poll_tx, _poll_rx) = mpsc::channel::<PollCommand>();
         let mut writer = spawn_state_writer(ui_tx.clone()).unwrap();
@@ -439,7 +472,10 @@ mod tests {
         assert!(app.toast.is_none(), "{:?}", app.toast);
         assert_eq!(writer.finish_state_saves(), None);
         let text = std::fs::read_to_string(dir.join("tui.toml")).unwrap();
-        assert!(text.contains("tools_rows = [1, 0]"), "{text}");
+        assert!(
+            text.contains("tools = [[\"tool_detail\"], [\"tool_table\"]]"),
+            "{text}"
+        );
         assert!(ui_rx.try_recv().is_err());
 
         // 저장할 수 없는 위치(파일이 폴더 자리를 차지)는 UiMessage 로 돌아와 오류 알림이 됨
@@ -593,7 +629,7 @@ mod tests {
             &poll_tx,
             &writer,
         );
-        let UiMessage::Report { date, body } = next() else {
+        let UiMessage::Report { date, body, .. } = next() else {
             panic!("report message");
         };
         assert_eq!(date, today);
@@ -636,6 +672,37 @@ mod tests {
             panic!("weekly message");
         };
         assert!(matches!(body, state::Panel::Ready(None)));
+
+        // 본문 언어는 화면 언어를 따름 (설정의 리포트 언어 en 과 무관): 한국어 화면은 한국어 본문
+        app.lang = Lang::Ko;
+        dispatch_ui_command(
+            &mut app,
+            UiCommand::LoadReport(today),
+            &ui_tx,
+            &poll_tx,
+            &writer,
+        );
+        let UiMessage::Report { body, .. } = next() else {
+            panic!("report message");
+        };
+        let state::Panel::Ready(Some(korean)) = body else {
+            panic!("korean report body");
+        };
+        assert!(!korean.contains("Daily Agent Report"), "{korean}");
+        assert_eq!(app.report_lang, Lang::Ko);
+
+        // 리포트 탭에서 언어를 바꿔 저장하면 보던 본문을 새 언어로 다시 적재, 다른 탭에서는 적재하지 않음
+        app.tab = ActiveTab::Report;
+        app.report_date = today;
+        app.lang = Lang::En;
+        dispatch_ui_command(&mut app, UiCommand::SaveState, &ui_tx, &poll_tx, &writer);
+        let UiMessage::Report { body, .. } = next() else {
+            panic!("report message");
+        };
+        assert!(
+            matches!(&body, state::Panel::Ready(Some(text)) if text.contains("Daily Agent Report"))
+        );
+        assert_eq!(app.report_lang, Lang::En);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
